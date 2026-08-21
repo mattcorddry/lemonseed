@@ -1,0 +1,3 @@
+# Keep this directory for optional local/test signing keys.
+# Private keys matching *.key / *.pem / *.priv are gitignored.
+# Enable signing with: SIGN=1 make build-production

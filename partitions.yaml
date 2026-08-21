@@ -1,0 +1,40 @@
+# Partition layout source of truth (applied from M3 via systemd-repart).
+# See DESIGN.md §4–§5.
+#
+# Installer creates partitions only. user-data is an LVM PV; the appliance
+# first-boot provisioner creates VG/LV + btrfs + subvolumes.
+
+table: gpt
+firmware: efi
+
+partitions:
+  - name: esp
+    role: esp
+    size: 1G
+    type: ef00
+    filesystem: vfat
+    label: ESP
+    mount:
+      path: /boot
+      policy: on-demand
+
+  - name: root-a
+    role: squashfs-root
+    size: 4G
+    label: root-a
+    content: raw-squashfs
+
+  - name: root-b
+    role: squashfs-root
+    size: 4G
+    label: root-b
+    content: raw-squashfs
+
+  - name: user-data
+    role: lvm-pv
+    size: grow
+    type: 8e00
+    label: lemonseed-user-data
+    # Formatted at first boot by appliance-storage-provision (not the installer):
+    #   VG: appliance  LV: user-data  FS: btrfs
+    #   subvolumes @etc → /etc, @var → /var

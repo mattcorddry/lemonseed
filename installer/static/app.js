@@ -1,0 +1,267 @@
+(() => {
+  const disksEl = document.getElementById("disks");
+  const warnEl = document.getElementById("warn");
+  const startBtn = document.getElementById("start");
+  const diskPanel = document.getElementById("disk-panel");
+  const preserveRow = document.getElementById("preserve-row");
+  const preserveCheck = document.getElementById("preserve-user-data");
+  const progressPanel = document.getElementById("progress-panel");
+  const phaseTitle = document.getElementById("phase-title");
+  const phaseMsg = document.getElementById("phase-msg");
+  const phasePct = document.getElementById("phase-pct");
+  const barFill = document.getElementById("bar-fill");
+  const rebootBox = document.getElementById("reboot-box");
+  const rebootBtn = document.getElementById("reboot");
+  const waitBox = document.getElementById("wait-box");
+  const errEl = document.getElementById("err");
+  const barEl = document.querySelector(".bar");
+
+  let selected = null;
+  let selectedDisk = null;
+  let pollTimer = null;
+  let waitTimer = null;
+
+  function fmtSize(bytes) {
+    const g = bytes / (1024 ** 3);
+    return g >= 10 ? `${g.toFixed(0)} GB` : `${g.toFixed(1)} GB`;
+  }
+
+  function updateWarn(disk) {
+    if (!disk) {
+      warnEl.classList.add("hidden");
+      return;
+    }
+    if (disk.preservable_user_data) {
+      warnEl.classList.remove("hidden");
+      warnEl.textContent =
+        "This disk has an existing Lemonseed install, which will be overwritten with a fresh install.";
+    } else if (disk.wipe_warning || disk.existing_os) {
+      warnEl.classList.remove("hidden");
+      warnEl.textContent =
+        "This disk already has data or an operating system. Installing Lemonseed will erase everything on it.";
+    } else {
+      warnEl.classList.add("hidden");
+    }
+  }
+
+  function updatePreserve(disk) {
+    const available = Boolean(disk && disk.preservable_user_data);
+    preserveRow.classList.toggle("hidden", !available);
+    preserveCheck.checked = available;
+  }
+
+  function renderDisks(payload) {
+    disksEl.innerHTML = "";
+    const eligible = (payload.disks || []).filter((d) => d.eligible);
+    const blocked = (payload.disks || []).filter((d) => !d.eligible);
+
+    if (!eligible.length) {
+      disksEl.innerHTML =
+        '<p class="lede">No suitable internal disk found. USB and eMMC devices cannot be used.</p>';
+      startBtn.disabled = true;
+      return;
+    }
+
+    selected = (payload.default && payload.default.path) || eligible[0].path;
+    selectedDisk = eligible.find((d) => d.path === selected) || eligible[0];
+
+    for (const d of eligible) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "disk" + (d.path === selected ? " selected" : "");
+      btn.innerHTML = `<div class="title">${d.model || d.name}</div>
+        <div class="meta">${d.path} · ${fmtSize(d.size_bytes)}${d.serial ? " · " + d.serial : ""}</div>`;
+      btn.addEventListener("click", () => {
+        selected = d.path;
+        selectedDisk = d;
+        updateWarn(d);
+        updatePreserve(d);
+        [...disksEl.querySelectorAll(".disk")].forEach((el) =>
+          el.classList.toggle("selected", el === btn)
+        );
+        startBtn.disabled = false;
+      });
+      disksEl.appendChild(btn);
+      if (d.path === selected) {
+        updateWarn(d);
+        updatePreserve(d);
+      }
+    }
+
+    if (blocked.length) {
+      const note = document.createElement("p");
+      note.className = "lede";
+      note.style.marginTop = "0.75rem";
+      note.textContent = `${blocked.length} other disk(s) hidden (USB, eMMC, too small, or installer medium).`;
+      disksEl.appendChild(note);
+    }
+
+    startBtn.disabled = !selected;
+  }
+
+  function showProgress() {
+    diskPanel.classList.add("hidden");
+    progressPanel.classList.remove("hidden");
+  }
+
+  function applyStatus(st) {
+    phaseTitle.textContent =
+      st.phase === "await_usb"
+        ? "Almost done"
+        : st.phase === "error"
+          ? "Install failed"
+          : "Installing";
+    phaseMsg.textContent = st.message || "";
+    const pct = Math.max(0, Math.min(100, st.progress || 0));
+    barFill.style.width = pct + "%";
+    phasePct.textContent = pct + "%";
+    if (st.error) {
+      errEl.classList.remove("hidden");
+      errEl.textContent = st.error;
+    } else {
+      errEl.classList.add("hidden");
+    }
+    if (st.can_reboot) rebootBox.classList.remove("hidden");
+    else rebootBox.classList.add("hidden");
+  }
+
+  function applianceOrigins() {
+    const origins = new Set(["", window.location.origin, "http://lemonseed.local"]);
+    if (window.location.protocol === "https:") {
+      origins.add("https://lemonseed.local");
+    }
+    return [...origins];
+  }
+
+  async function probeAppliance(origin) {
+    const base = origin || "";
+    const res = await fetch(base + "/api/status", { cache: "no-store" });
+    if (!res.ok) return null;
+    const st = await res.json();
+    if (st && st.role === "control-plane") return st;
+    return null;
+  }
+
+  function startWaitingForAppliance() {
+    if (waitTimer) return;
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    rebootBox.classList.add("hidden");
+    waitBox.classList.remove("hidden");
+    if (barEl) barEl.classList.add("hidden");
+    phasePct.classList.add("hidden");
+    errEl.classList.add("hidden");
+    phaseTitle.textContent = "Waiting for the Lemon Seed appliance to boot";
+    phaseMsg.textContent =
+      "Leave this page open. Setup will appear automatically once the appliance is ready.";
+
+    const tick = async () => {
+      let sawInstaller = false;
+      for (const origin of applianceOrigins()) {
+        try {
+          const st = await probeAppliance(origin);
+          if (st) {
+            let slug = (st.setup && st.setup.mdns_name) || "";
+            if (!slug && typeof st.portal_url === "string") {
+              const match = st.portal_url.match(/^https?:\/\/([a-z0-9-]+)\.local\/?$/i);
+              if (match) slug = match[1];
+            }
+            if (slug && slug !== "lemonseed") {
+              // Named appliances: leave lemonseed.local and open the real portal.
+              window.location.replace("http://" + slug + ".local/");
+            } else {
+              const next = (origin || window.location.origin) + "/";
+              window.location.replace(next);
+            }
+            return;
+          }
+        } catch (_) {
+          /* down, still booting, or CORS/mDNS not ready */
+        }
+        if (!origin || origin === window.location.origin) {
+          try {
+            const res = await fetch("/api/status", { cache: "no-store" });
+            if (res.ok) {
+              const st = await res.json();
+              if (st.role === "installer") sawInstaller = true;
+            }
+          } catch (_) {
+            /* expected while the machine is restarting */
+          }
+        }
+      }
+      phaseMsg.textContent = sawInstaller
+        ? "Still seeing the installer. Remove the USB, then wait — this page will keep checking."
+        : "Waiting for the Lemon Seed appliance to boot. Setup will appear automatically.";
+    };
+
+    waitTimer = setInterval(tick, 2000);
+    tick();
+  }
+
+  async function poll() {
+    try {
+      const st = await fetch("/api/status").then((r) => r.json());
+      applyStatus(st);
+      if (st.phase === "error" || st.can_reboot) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    } catch (_) {
+      /* keep polling */
+    }
+  }
+
+  startBtn.addEventListener("click", async () => {
+    if (!selected) return;
+    startBtn.disabled = true;
+    showProgress();
+    applyStatus({ phase: "starting", progress: 1, message: "Starting…" });
+    const res = await fetch("/api/install", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        disk: selected,
+        preserve_user_data: Boolean(
+          selectedDisk && selectedDisk.preservable_user_data && preserveCheck.checked
+        ),
+      }),
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      applyStatus({
+        phase: "error",
+        progress: 0,
+        message: "Could not start",
+        error: body.error || res.statusText,
+      });
+      return;
+    }
+    pollTimer = setInterval(poll, 500);
+    poll();
+  });
+
+  rebootBtn.addEventListener("click", async () => {
+    rebootBtn.disabled = true;
+    phaseMsg.textContent = "Rebooting…";
+    try {
+      await fetch("/api/reboot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+    } catch (_) {
+      /* host will drop mid-request once sysrq-b fires */
+    }
+    startWaitingForAppliance();
+  });
+
+  fetch("/api/disks")
+    .then((r) => r.json())
+    .then(renderDisks)
+    .catch(() => {
+      disksEl.innerHTML = '<p class="err">Could not list disks.</p>';
+    });
+})();

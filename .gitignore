@@ -1,9 +1,25 @@
-# Ignore build outputs from performing a nix-build or `nix build` command
+# Nix build outputs
 result
 result-*
+/out/
 
-# Ignore automatically generated direnv output
+# Local versioning / caches
+/.build-counter
 .direnv
-
-# Ignore NixOS interactive test driver history
 **/.nixos-test-history
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Signing keys (local/test) — keep directory placeholder
+/keys/*.key
+/keys/*.pem
+/keys/*.priv
+/keys/ed25519.priv
+/keys/ed25519.pub
+!/keys/.gitkeep
+
+# Editor / OS
+*.swp
+*~
+.DS_Store
