@@ -8,26 +8,7 @@
 }:
 
 let
-  abHelper =
-    pkgs.runCommand "lemonseed-ab"
-      {
-        nativeBuildInputs = [ pkgs.makeWrapper ];
-      }
-      ''
-        mkdir -p "$out/bin"
-        cp ${../../scripts/lemonseed-ab.sh} "$out/bin/lemonseed-ab"
-        chmod 0755 "$out/bin/lemonseed-ab"
-        wrapProgram "$out/bin/lemonseed-ab" \
-          --prefix PATH : ${
-            lib.makeBinPath [
-              pkgs.coreutils
-              pkgs.util-linux
-              pkgs.gnugrep
-              pkgs.gnused
-              pkgs.grub2_efi
-            ]
-          }
-      '';
+  abHelper = import ../packages/lemonseed-ab.nix { inherit pkgs lib; };
 
   # Soft readiness probes used before promoting boot_default. Failure leaves
   # boot_attempted set so the next cold boot falls back to the previous slot.

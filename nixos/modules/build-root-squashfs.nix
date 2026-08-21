@@ -5,6 +5,7 @@
   closureInfo,
   toplevel,
   version,
+  usrBinLinks ? { },
   comp ? "zstd -Xcompression-level 10",
 }:
 
@@ -30,6 +31,17 @@ stdenv.mkDerivation {
     ln -s "${toplevel}" root/nix/var/nix/gcroots/current-system
 
     cp "$closure/registration" root/nix-path-registration
+
+    # FHS-compat tools for binaries that hardcode /usr/bin or a tiny PATH.
+    ${lib.concatStrings (
+      lib.mapAttrsToList (name: path: ''
+        ln -s ${lib.escapeShellArg path} "root/usr/bin/${name}"
+        ${lib.optionalString (builtins.elem name [
+          "sh"
+          "bash"
+        ]) ''ln -s ${lib.escapeShellArg path} "root/bin/${name}"''}
+      '') usrBinLinks
+    )}
 
     # shellcheck disable=SC2086
     SOURCE_DATE_EPOCH=0 mksquashfs root "$out" \

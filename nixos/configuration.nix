@@ -8,6 +8,7 @@
     ./modules/artifacts.nix
     ./modules/storage.nix
     ./modules/nvidia.nix
+    ./modules/fhs-compat.nix
     ./modules/lemond.nix
     ./modules/control-plane.nix
     ./modules/gateway.nix

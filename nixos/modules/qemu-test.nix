@@ -17,6 +17,9 @@
   # No GPU in the smoke VM — keep the image small and skip NVIDIA modules.
   services.xserver.videoDrivers = lib.mkForce [ ];
 
+  # CUDA llama-server is useless without a GPU; keep lemond on CPU for QEMU.
+  lemonseed.lemond.llamacppBackend = "cpu";
+
   # Allow serial login for interactive debugging in QEMU.
   services.getty.autologinUser = "root";
   users.users.root.hashedPassword = lib.mkForce ""; # empty password in qemu only

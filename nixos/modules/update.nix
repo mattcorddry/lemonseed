@@ -14,26 +14,7 @@ let
   scripts = ../../scripts;
   pythonEnv = pkgs.python3;
 
-  abHelper =
-    pkgs.runCommand "lemonseed-ab"
-      {
-        nativeBuildInputs = [ pkgs.makeWrapper ];
-      }
-      ''
-        mkdir -p "$out/bin"
-        cp ${scripts}/lemonseed-ab.sh "$out/bin/lemonseed-ab"
-        chmod 0755 "$out/bin/lemonseed-ab"
-        wrapProgram "$out/bin/lemonseed-ab" \
-          --prefix PATH : ${
-            lib.makeBinPath [
-              pkgs.coreutils
-              pkgs.util-linux
-              pkgs.gnugrep
-              pkgs.gnused
-              pkgs.grub2_efi
-            ]
-          }
-      '';
+  abHelper = import ../packages/lemonseed-ab.nix { inherit pkgs lib; };
 
   updater = pkgs.writeShellApplication {
     name = "lemonseed-update";

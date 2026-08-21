@@ -21,6 +21,7 @@ in
 
   system.build.applianceRootSquashfs = pkgs.callPackage ./build-root-squashfs.nix {
     inherit toplevel version;
+    usrBinLinks = config.lemonseed.fhsBinLinks;
   };
 
   system.build.applianceKernel = pkgs.runCommand "vmlinuz-${version}" { } ''
