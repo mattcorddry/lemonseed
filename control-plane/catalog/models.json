@@ -1,0 +1,29 @@
+{
+    "catalog_version": 2,
+  "models": [
+    {
+      "id": "Gemma-4-E2B-it-GGUF",
+      "display_name": "Gemma 4 E2B",
+      "backend": "llamacpp:cuda",
+      "recipe": "llamacpp",
+      "checkpoint": "unsloth/gemma-4-E2B-it-GGUF:Q4_K_M",
+      "min_vram_gb": 4.0,
+      "min_ram_gb": 6.0,
+      "weights_gb": 4.1,
+      "rank": 100,
+      "license": "Gemma Terms of Use"
+    },
+    {
+      "id": "Gemma-4-E4B-it-GGUF",
+      "display_name": "Gemma 4 E4B",
+      "backend": "llamacpp:cuda",
+      "recipe": "llamacpp",
+      "checkpoint": "unsloth/gemma-4-E4B-it-GGUF:Q4_K_M",
+      "min_vram_gb": 8.0,
+      "min_ram_gb": 12.0,
+      "weights_gb": 6.0,
+      "rank": 90,
+      "license": "Gemma Terms of Use"
+    }
+  ]
+}

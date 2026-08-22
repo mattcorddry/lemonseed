@@ -18,6 +18,10 @@ That prints the available targets. Common ones:
 | `make build-qemu` | QEMU smoke profile → `out/latest-qemu` |
 | `make run-qemu` | Build QEMU image if needed, then boot a serial console |
 | `make build-installer` | EFI/USB installer ISO → `out/latest-installer` |
+| `make test` | Unit tests — update, repart, control-plane (no root) |
+| `make test-qemu` | QEMU boot + HTTP API smoke (`/healthz`, `/api/status`) |
+| `sudo make repart-test` | Loopback GPT/repart smoke (requires root) |
+| `sudo make update-test` | Loopback A/B updater smoke (requires root) |
 
 You need [Nix](https://nixos.org/download/) with flakes enabled. See `nix-install.sh` if you are setting up a build host from scratch.
 

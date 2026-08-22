@@ -22,6 +22,10 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 from zoneinfo import available_timezones
 
+import chat_ready
+import hardware
+from catalog import plan_model
+
 
 HOST = os.environ.get("APPLIANCE_CP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("APPLIANCE_CP_PORT", "8080"))
@@ -285,8 +289,9 @@ def boot_snapshot() -> dict[str, Any]:
                 ["systemctl", "is-active", unit],
                 text=True,
                 stderr=subprocess.DEVNULL,
+                timeout=3,
             ).strip()
-        except (subprocess.CalledProcessError, FileNotFoundError):
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
             out = "unknown"
         status[unit] = out
     lemond = lemond_snapshot()
@@ -537,6 +542,45 @@ if (timezoneSelect && !{json.dumps(bool(saved_timezone))}) {{
 def page_ready(snap: dict[str, Any]) -> bytes:
     setup = load_setup()
     name = escape(str(setup.get("name") or "Lemonseed"))
+    chat = snap.get("chat") or chat_ready.chat_snapshot()
+    chat_state = str(chat.get("state") or "idle")
+    display = escape(str(chat.get("display_name") or chat.get("model_id") or "—"))
+    reason = escape(str(chat.get("reason") or chat.get("error") or chat.get("message") or ""))
+    progress = int(chat.get("progress") or 0)
+    if chat_state == "ready":
+        chat_label = "ready"
+        chat_class = "ok"
+        chat_lede = f"{display} is loaded for local chat."
+    elif chat_state == "preparing":
+        chat_label = f"preparing ({progress}%)"
+        chat_class = "wait"
+        chat_lede = escape(str(chat.get("message") or "Preparing local chat…"))
+    elif chat_state == "not-ready":
+        chat_label = "not ready"
+        chat_class = "bad"
+        chat_lede = reason or "No suitable local model for this hardware."
+    elif chat_state == "error":
+        chat_label = "error"
+        chat_class = "bad"
+        chat_lede = reason or "Local chat failed to prepare."
+    else:
+        chat_label = chat_state
+        chat_class = "wait"
+        chat_lede = "Waiting to prepare local chat…"
+
+    gpus = (snap.get("hardware") or {}).get("gpus") or []
+    gpu_rows = ""
+    for gpu in gpus:
+        if not isinstance(gpu, dict):
+            continue
+        gpu_rows += (
+            f'<div class="row"><span class="name">gpu {escape(str(gpu.get("index", 0)))}</span>'
+            f'<span class="state ok">{escape(str(gpu.get("name")))} · '
+            f'{escape(str(gpu.get("vram_gb")))} GiB</span></div>'
+        )
+    if not gpu_rows:
+        gpu_rows = '<div class="row"><span class="name">gpu</span><span class="state wait">none detected</span></div>'
+
     body = f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -544,17 +588,55 @@ def page_ready(snap: dict[str, Any]) -> bytes:
 </head><body><main class="shell">
 <p class="wordmark">Lemonseed</p>
 <h1>{name}</h1>
-<p class="lede">Appliance is online. User login and module panels (Open WebUI, etc.) will attach here after the gateway auth config lands.</p>
+<p class="lede">Appliance is online. Local inference runs on this machine; a household chat UI comes in a later milestone.</p>
+<section class="panel">
+<h2>Local chat</h2>
+<div class="row"><span class="name">status</span><span class="state {chat_class}" id="chat-state">{chat_label}</span></div>
+<div class="row"><span class="name">model</span><span class="state ok" id="chat-model">{display}</span></div>
+<p class="lede" id="chat-lede">{chat_lede}</p>
+</section>
 <section class="panel">
 <h2>Status</h2>
 <div class="row"><span class="name">version</span><span class="state ok">{snap.get("version","unknown")}</span></div>
 <div class="row"><span class="name">setup</span><span class="state ok">complete</span></div>
 <div class="row"><span class="name">timezone</span><span class="state ok">{setup.get("timezone","UTC")}</span></div>
+{gpu_rows}
 </section>
 <section class="panel">
-<h2>Health</h2>
-<p class="lede"><a style="color:var(--accent)" href="/healthz">/healthz</a> · <a style="color:var(--accent)" href="/api/status">/api/status</a></p>
+<details>
+<summary style="cursor:pointer;color:var(--muted)">Diagnostics</summary>
+<p class="lede" id="chat-reason">{reason}</p>
+<p class="lede"><a style="color:var(--accent)" href="/api/hardware">/api/hardware</a> ·
+<a style="color:var(--accent)" href="/api/chat">/api/chat</a> ·
+<a style="color:var(--accent)" href="/api/status">/api/status</a></p>
+</details>
 </section>
+<script>
+async function refreshChat() {{
+  try {{
+    const response = await fetch('/api/chat', {{cache: 'no-store'}});
+    if (!response.ok) return;
+    const chat = await response.json();
+    const state = chat.state || 'idle';
+    const model = chat.display_name || chat.model_id || '—';
+    const progress = chat.progress || 0;
+    let label = state;
+    let cls = 'wait';
+    let lede = chat.message || '';
+    if (state === 'ready') {{ label = 'ready'; cls = 'ok'; lede = model + ' is loaded for local chat.'; }}
+    else if (state === 'preparing') {{ label = 'preparing (' + progress + '%)'; cls = 'wait'; }}
+    else if (state === 'not-ready') {{ label = 'not ready'; cls = 'bad'; lede = chat.reason || lede; }}
+    else if (state === 'error') {{ label = 'error'; cls = 'bad'; lede = chat.error || chat.reason || lede; }}
+    const stateEl = document.getElementById('chat-state');
+    stateEl.textContent = label;
+    stateEl.className = 'state ' + cls;
+    document.getElementById('chat-model').textContent = model;
+    document.getElementById('chat-lede').textContent = lede;
+    document.getElementById('chat-reason').textContent = chat.reason || chat.error || '';
+  }} catch (_err) {{}}
+}}
+setInterval(refreshChat, 3000);
+</script>
 </main></body></html>"""
     return body.encode()
 
@@ -639,10 +721,11 @@ def complete_setup(name: str, timezone: str) -> None:
     marker = SETUP_COMPLETE_FILE.with_suffix(".tmp")
     marker.write_text(payload["completed_at"] + "\n", encoding="utf-8")
     marker.replace(SETUP_COMPLETE_FILE)
+    chat_ready.ensure_chat_worker()
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "LemonseedCP/0.2"
+    server_version = "LemonseedCP/0.3"
 
     def _send(self, code: int, body: bytes, content_type: str) -> None:
         self.send_response(code)
@@ -667,8 +750,22 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/boot":
             self._json(200, boot_snapshot())
             return
+        if path == "/api/hardware":
+            report = hardware.collect_hardware()
+            hardware.persist_hardware(report)
+            self._json(200, report)
+            return
+        if path == "/api/chat":
+            chat_ready.ensure_chat_worker()
+            self._json(200, chat_ready.chat_snapshot())
+            return
+        if path == "/api/plan":
+            report = hardware.collect_hardware()
+            self._json(200, plan_model(report))
+            return
         if path == "/api/status":
             maybe_complete_mdns_handoff(self)
+            chat_ready.ensure_chat_worker()
             boot = boot_snapshot()
             setup = load_setup()
             self._json(
@@ -678,6 +775,7 @@ class Handler(BaseHTTPRequestHandler):
                     "role": "control-plane",
                     **boot,
                     "setup": setup,
+                    "chat": chat_ready.chat_snapshot(),
                     "portal_url": f"http://{primary_mdns_slug()}.local/",
                 },
             )
@@ -686,12 +784,15 @@ class Handler(BaseHTTPRequestHandler):
             if redirect_off_factory_mdns(self, path if path != "/index.html" else "/"):
                 return
             snap = boot_snapshot()
+            snap["chat"] = chat_ready.chat_snapshot()
+            snap["hardware"] = hardware.collect_hardware()
             setup = load_setup()
             review_required = (
                 not setup_complete()
                 or setup.get("confirmed_version") != appliance_version()
             )
             if setup_complete() and snap["startup_ready"] and not review_required:
+                chat_ready.ensure_chat_worker()
                 self._send(200, page_ready(snap), "text/html; charset=utf-8")
             else:
                 self._send(
@@ -738,6 +839,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    chat_ready.ensure_chat_worker()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"appliance-control-plane listening on http://{HOST}:{PORT}", flush=True)
     server.serve_forever()

@@ -201,6 +201,8 @@ class UpdateApplyTests(unittest.TestCase):
             ), mock.patch.object(
                 update, "umount_esp"
             ), mock.patch.object(
+                update, "require_root"
+            ), mock.patch.object(
                 artifacts.subprocess,
                 "check_output",
                 side_effect=lambda cmd, text=True: str(Path(cmd[-1]).stat().st_size),

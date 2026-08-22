@@ -23,7 +23,8 @@ SIGN ?= 0
 DISK ?=
 
 .PHONY: help build-production build-qemu build-installer run-qemu qemu-clean clean keys \
-	repart-generate disk-repart grub-cfg repart-test update-test test-update-unit nix-gc
+	repart-generate disk-repart grub-cfg repart-test update-test test test-qemu \
+	test-update-unit nix-gc
 
 help:
 	@echo "Lemonseed image build pipeline"
@@ -43,7 +44,9 @@ help:
 	@echo "  make grub-cfg          Install boot/grub.cfg into out/grub/grub.cfg"
 	@echo "  make repart-test       Loopback systemd-repart smoke test (sudo)"
 	@echo "  make update-test       Loopback A/B updater smoke test (sudo)"
-	@echo "  make test-update-unit  Unit tests for lemonseed-update (no root)"
+	@echo "  make test              Unit tests (no root / no hypervisor)"
+	@echo "  make test-qemu         QEMU boot + HTTP API smoke (needs build-qemu)"
+	@echo "  make test-update-unit  Alias for update unit tests only"
 	@echo "  make nix-gc            Soft Nix GC (drop stale build roots; no -d)"
 	@echo "  make clean             Remove out/"
 	@echo "  make keys              Generate local ed25519 test keys under keys/"
@@ -57,7 +60,7 @@ help:
 	@echo ""
 	@echo "Notes:"
 	@echo "  A/B helpers: lemonseed-ab / lemonseed-update (on appliance)"
-	@echo "  make test-update-unit | make update-test (sudo loopback)"
+	@echo "  make test-update-unit | make test (unit) | make test-qemu (HTTP boot)"
 	@echo "  Installer UI: http://lemonseed.local/ (Avahi) on port 80"
 
 build-production:
@@ -108,6 +111,12 @@ repart-test:
 
 update-test:
 	sudo "$(ROOT)/scripts/update-smoke-test.sh"
+
+test:
+	"$(ROOT)/scripts/run-unit-tests.sh"
+
+test-qemu:
+	"$(ROOT)/scripts/qemu-api-smoke-test.sh"
 
 test-update-unit:
 	python3 "$(ROOT)/scripts/test_lemonseed_update.py"

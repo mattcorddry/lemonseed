@@ -1,6 +1,6 @@
 # Lemonseed Appliance — Design
 
-Status: **living design** (M1–M3 done; M4 nearly closed; M5 next)  
+Status: **living design** (M1–M4.1 done; M5 done; M6 next — primary UX undecided)  
 Related: [Concept.md](./Concept.md) (product vision), [Requirements.md](./Requirements.md)
 
 This document captures architectural decisions. It is the source of truth for implementation milestones. Product intent lives in Concept.md; this file translates that intent into buildable decisions.
@@ -20,9 +20,9 @@ Lemonseed is a **local, multi-user home AI hub** — not a cloud client and not 
 | Layer | Choice |
 |-------|--------|
 | Inference backend | **Embeddable `lemond` in SquashFS** (headless; no Lemonade web/desktop UI). Built from source via Nix, not the Ubuntu release tarball. |
-| First UX | Control-plane “local chat ready” status + Lemonade OpenAI-compatible API; **Open WebUI** is M6+ |
+| First UX | Control-plane “local chat ready” status + Lemonade OpenAI-compatible API; **primary UI chosen in M6** (see M6 bookmark) |
 | Image gen | Deferred past M5; prefer **ComfyUI** later over Lemonade llama-sd / sd-cpp |
-| Agents | Deferred; prefer a stabler loop than OpenClaw when we get there |
+| Agents | Candidate primary UX in M6 evaluation (NanoClaw-style); not dual-shipped with chat UI by default |
 | Brand | **lemonseed.ai** |
 | Docker | Remains for **modules** (Open WebUI, etc.); **not** the primary Lemonade runtime |
 
@@ -51,7 +51,7 @@ Lemonseed is a **local, multi-user home AI hub** — not a cloud client and not 
 - Shipping application container images inside the base SquashFS
 - Writable overlay / tmpfs overlay on root
 - Cloud model burst / anonymized cloud GPU relay (Concept “future”; not M5)
-- Multi-user auth, Open WebUI, ComfyUI, agents (post-M5)
+- Multi-user auth, Open WebUI, ComfyUI (post-M5; primary UX TBD in M6)
 - LUKS/encrypted user-data (deferred past M5; plan later)
 
 ---
@@ -66,10 +66,28 @@ Lemonseed is a **local, multi-user home AI hub** — not a cloud client and not 
 | **M3 — Partition & A/B tooling** | **Done** — `partitions.yaml` → `out/repart.d`; `boot/grub.cfg`; slot-aware root; `lemonseed-ab` + lock-in; `lemonseed-update` in-place updater |
 | **M4 — USB installer** | **Nearly done** — install + portal + first-boot setup; polish remaining |
 | **M4.1 — Preserve known user-data on reinstall** | **Done** — namespaced storage identity; preserve checkbox; layout-compatible reinstall |
-| **M5 — Hardware-aware local chat** | **Next** — headless `lemond` in SquashFS + NVIDIA stack + inventory + catalog LLM load |
-| **M6+ (later)** | Open WebUI / gateway auth, ComfyUI, multi-user, AMD/UMA profiles, heterogeneous GPU planner, encryption, agents, offline install, Secure Boot/TPM |
+| **M5 — Hardware-aware local chat** | **Done** — `lemond` + NVIDIA/CUDA; inventory + catalog planner + CP pull/load/pin + portal “Local chat ready”; unit tests + QEMU API smoke |
+| **M6 — Primary interaction UX** | **Next** — pick **one** default household UI (traditional chat vs agentic messaging); then gateway auth around that choice |
+| **M6+ (later)** | ComfyUI, multi-user, AMD/UMA profiles, heterogeneous GPU planner, encryption, offline install, Secure Boot/TPM |
 
-**Immediate next step:** implement **M5** on the **NVIDIA prototype**: package headless `lemond` into SquashFS (nix-amd-ai packaging patterns), host NVIDIA stack, hardware inventory, catalog fit, pull/load one chat model.
+**Immediate next step:** M6 primary UX evaluation (Open WebUI vs NanoClaw-style), then gateway auth around the chosen path.
+
+### M6 — Primary UX evaluation (bookmark)
+
+**Problem:** Shipping both a traditional chat UI (e.g. Open WebUI) and an agentic messaging UI (e.g. [NanoClaw](https://nanoclaw.dev/)-style container agent + web/channel messaging) as co-equal “main” surfaces will overlap functionally and confuse households.
+
+**M6 gate:** evaluate and choose **one primary** interaction path before building gateway auth Phase 2 and LAN module chrome around it.
+
+| Candidate | Shape | Fits Lemonseed when… |
+|-----------|--------|----------------------|
+| **Traditional chat** (Open WebUI or similar) | Browser chat against Lemonade’s OpenAI-compatible API | Household expects a familiar ChatGPT-like UI; tools/agents are secondary |
+| **Agentic messaging** (NanoClaw-style) | Isolated agent sessions + messaging/web UI; local Lemonade as a provider | Primary value is always-on assistant / workers / channels, not a chat playground |
+
+**Decision rules:**
+- Exactly **one** default entry point on the portal after setup.
+- The non-chosen path may remain optional/advanced or deferred — not a second front door.
+- Do **not** assume Open WebUI when designing gateway auth until this evaluation lands.
+- Inference stays **headless `lemond` in SquashFS**; whichever UI wins is a **module** (Docker) talking to localhost Lemonade.
 
 ### M3 verification
 
@@ -242,13 +260,23 @@ We may later take `nix-amd-ai` as a flake input for AMD/NPU profiles, or vendor 
 4. Expandable diagnostics can expose inventory + planner rationale.
 
 #### Acceptance checklist
-- [ ] `/api/hardware` reports the NVIDIA device(s) and per-GPU memory
-- [ ] Planner returns a catalog selection with a human-readable reason
-- [ ] `lemond` systemd unit is healthy on localhost with API key auth
-- [ ] Host GPU/backend is visible to `lemond` (e.g. `/v1/system-info` / installed recipe)
-- [ ] Selected model is pulled with hash/license check, then loaded
-- [ ] Known prompt completes via Lemonade’s local OpenAI-compatible API
-- [ ] Portal shows ready / not-ready without requiring a manual refresh loop beyond normal polling
+- [x] `/api/hardware` reports the NVIDIA device(s) and per-GPU memory
+- [x] Planner returns a catalog selection with a human-readable reason
+- [x] `lemond` systemd unit is healthy on localhost with API key auth
+- [x] Host GPU/backend is visible to `lemond` (e.g. `/v1/system-info` / installed recipe)
+- [x] Selected model is pulled with hash/license check, then loaded *(CP background pull/load; verify on hardware)*
+- [x] Known prompt completes via Lemonade’s local OpenAI-compatible API *(validated manually on prototype; CP loads catalog model)*
+- [x] Portal shows ready / not-ready without requiring a manual refresh loop beyond normal polling
+
+**M5 platform note (2026-08-21):** Nix-wired `llamacpp` cpu/cuda, FHS probes, correct `config.json` reseed, and manual Gemma load/chat were verified on the GTX 1660 SUPER prototype before CP automation landed. CP background pull/load/pin + boot reload verified on hardware.
+
+#### Testing (M5)
+| Tier | Target | Command |
+|------|--------|---------|
+| **A — unit** | Update/artifacts, gen-repart, control-plane catalog/hardware/chat/HTTP | `make test` (no root) |
+| **B — loopback** | systemd-repart layout, A/B updater | `sudo make repart-test`, `sudo make update-test` |
+| **C — QEMU HTTP** | CPU-profile appliance boot; `/healthz`, `/api/status`, `/api/boot` | `make test-qemu` (needs `make build-qemu`) |
+| **D — GPU lab** | Full M5 acceptance on NVIDIA hardware / future Proxmox GPU VM | manual / lab automation (later) |
 
 #### Explicitly out of M5
 Open WebUI, gateway auth Phase 2, ComfyUI/sd-cpp images, Lemonade web/desktop UI, multi-user accounts, LUKS, AMD production path, multi-GPU scheduling, A/B lock-in gated on model load (lock-in stays on OS/CP health for now).
@@ -617,4 +645,5 @@ Historical M1 checklist (kept for archive):
 - [x] Encryption deferred past M5
 - [x] `/var/lib/lemonseed/` for models/state
 - [x] Headless `lemond` in SquashFS (not Docker; no Lemonade UI)
+- [x] Tier A unit tests (`make test`)
 - [ ] Any Concept.md R1 item that must pull into M5 despite the cut
