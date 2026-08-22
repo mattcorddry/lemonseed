@@ -67,27 +67,107 @@ Lemonseed is a **local, multi-user home AI hub** — not a cloud client and not 
 | **M4 — USB installer** | **Nearly done** — install + portal + first-boot setup; polish remaining |
 | **M4.1 — Preserve known user-data on reinstall** | **Done** — namespaced storage identity; preserve checkbox; layout-compatible reinstall |
 | **M5 — Hardware-aware local chat** | **Done** — `lemond` + NVIDIA/CUDA; inventory + catalog planner + CP pull/load/pin + portal “Local chat ready”; unit tests + QEMU API smoke |
-| **M6 — Primary interaction UX** | **Next** — pick **one** default household UI (traditional chat vs agentic messaging); then gateway auth around that choice |
+| **M6 — Primary interaction UX** | **In progress** — UX evaluation → one primary module + gateway Phase 2 auth/routing |
 | **M6+ (later)** | ComfyUI, multi-user, AMD/UMA profiles, heterogeneous GPU planner, encryption, offline install, Secure Boot/TPM |
 
-**Immediate next step:** M6 primary UX evaluation (Open WebUI vs NanoClaw-style), then gateway auth around the chosen path.
+**Immediate next step:** run the M6 UX evaluation spike (below), record a decision, then implement gateway Phase 2 around the chosen primary module.
 
-### M6 — Primary UX evaluation (bookmark)
+### M6 — Primary interaction UX (design)
 
-**Problem:** Shipping both a traditional chat UI (e.g. Open WebUI) and an agentic messaging UI (e.g. [NanoClaw](https://nanoclaw.dev/)-style container agent + web/channel messaging) as co-equal “main” surfaces will overlap functionally and confuse households.
+**Goal:** Ship **one** household-facing chat/assistant experience on the LAN — not two overlapping “main” UIs. M6 ends with a chosen primary path, a Docker module wired through nginx, and gateway auth Phase 2 scoped to that path.
 
-**M6 gate:** evaluate and choose **one primary** interaction path before building gateway auth Phase 2 and LAN module chrome around it.
+**Non-goals for M6:** multi-user accounts with per-user data isolation, ComfyUI/image gen, voice appliance, mobile apps, cloud relay, shipping both candidates as equal defaults.
 
-| Candidate | Shape | Fits Lemonseed when… |
-|-----------|--------|----------------------|
-| **Traditional chat** (Open WebUI or similar) | Browser chat against Lemonade’s OpenAI-compatible API | Household expects a familiar ChatGPT-like UI; tools/agents are secondary |
-| **Agentic messaging** (NanoClaw-style) | Isolated agent sessions + messaging/web UI; local Lemonade as a provider | Primary value is always-on assistant / workers / channels, not a chat playground |
+#### Why this gate exists
 
-**Decision rules:**
-- Exactly **one** default entry point on the portal after setup.
-- The non-chosen path may remain optional/advanced or deferred — not a second front door.
-- Do **not** assume Open WebUI when designing gateway auth until this evaluation lands.
-- Inference stays **headless `lemond` in SquashFS**; whichever UI wins is a **module** (Docker) talking to localhost Lemonade.
+Concept.md describes both **chat** (one-shot and long-running conversations) and **workers** (background agents, notifications, automations). Those can be one product surface or two. Lemonseed must pick a **primary metaphor** before we invest in login flows, module routing, and onboarding copy — otherwise we build gateway auth twice and households see duplicate entry points.
+
+| Path | Primary metaphor | Best when… |
+|------|------------------|------------|
+| **A — Traditional chat** (Open WebUI or similar) | “Family ChatGPT on the LAN” | Chat is the main job; workers/agents are later add-ons behind the same UI or API |
+| **B — Agentic messaging** (NanoClaw-style) | “Always-on assistant + channels” | Proactive workers, messaging-style threads, and tool loops are co-equal with chat |
+
+**Locked regardless of path:** inference stays **headless `lemond` in SquashFS** on localhost; the primary UI is a **Docker module** talking to `http://127.0.0.1:13305` (OpenAI-compatible API + API key from CP).
+
+#### Evaluation spike (do before implementation)
+
+Run both candidates on the **NVIDIA prototype** (or future Proxmox GPU VM) against the **M5 default model** already loaded. Time-box to a few days; capture notes in this doc or a short `docs/m6-ux-evaluation.md`.
+
+| Criterion | Questions |
+|-----------|-----------|
+| **Household fit** | Can a non-technical user start a chat in &lt;2 minutes after setup? Is proactive/agent behavior understandable without a manual? |
+| **Lemonade integration** | How much config to point at local Lemonade (base URL, model id, API key injection)? Any features that assume cloud or Ollama-only? |
+| **Ops on NixOS appliance** | Image size, pull policy, volume layout under `/var/lib/lemonseed/`, upgrade story, health checks CP can poll |
+| **Security / isolation** | Container boundaries, tool execution, filesystem access — especially for Path B |
+| **Concept alignment** | Path to Release 1 workers/notifications without a second front door |
+| **Maintenance** | Upstream velocity, license, fit with our SquashFS + Docker module model |
+
+**Decision output (required):** one row in the table below, plus explicit deferral of the other path.
+
+| Decision | Primary module | Deferred path |
+|----------|----------------|---------------|
+| TBD | — | — |
+
+#### Architecture (common to either path)
+
+```
+Browser / LAN client
+        │
+        ▼
+   nginx :80  ── Phase 2: auth + route table
+        │
+        ├── /           → control plane portal (status, admin, module links)
+        ├── /chat/…     → primary module (path prefix TBD by winner)
+        └── /api/…      → CP JSON API (localhost origin only from CP process)
+        
+lemond :13305 (127.0.0.1, API key)  ← never exposed directly to LAN
+```
+
+**Gateway Phase 2 (M6 deliverable after UX decision):**
+- Replace throwaway Phase 1 nginx vhost with **session auth** (exact mechanism TBD: e.g. household shared password first, per-user later).
+- **Route table** owned by CP config (or generated nginx snippet): primary module at `/` or `/chat`, CP admin at `/settings` or subpath.
+- Module containers get **only** what they need: Lemonade URL + read-only API key via env/file from CP; no host network.
+- CP continues to own: catalog, model load, `chat-ready` state, Docker pull/start for modules.
+
+**Portal changes:** “Local chat ready” remains the inference status line; add a single **“Open chat”** (or equivalent) CTA that deep-links into the chosen module — not separate buttons for two products.
+
+#### Candidate A — Open WebUI (traditional chat)
+
+| Aspect | Notes |
+|--------|--------|
+| **Shape** | Mature web UI; OpenAI-compatible backend; model picker, history, RAG hooks |
+| **Pros** | Familiar UX; strong Lemonade/OpenAI API story; aligns with “chat first” in Concept R1 |
+| **Cons** | Agent/worker story is bolt-on; may fight our “one default model” policy unless configured |
+| **Integration sketch** | Docker module; env `OPENAI_API_BASE_URL=http://host.docker.internal:13305/v1` (or gateway subpath); inject `LEMONADE_API_KEY`; disable cloud providers; pin default model to catalog selection |
+| **Risks** | Feature creep (RAG, multiple models) vs appliance simplicity |
+
+#### Candidate B — NanoClaw-style agentic messaging
+
+| Aspect | Notes |
+|--------|--------|
+| **Shape** | Container-isolated agent loop + messaging/web UI; channels, sessions, tools |
+| **Pros** | Closer to Concept workers/notifications; differentiated from “another ChatGPT skin” |
+| **Cons** | Younger ecosystem; harder household onboarding; security review burden for tool execution |
+| **Integration sketch** | Docker module(s); Lemonade as LLM provider; CP provisions API key + model id; strict volume and network policy |
+| **Risks** | Overlap with future “workers” if we also add Open WebUI later; ops complexity |
+
+#### M6 phased deliverables
+
+| Phase | Deliverable |
+|-------|-------------|
+| **M6.0** | UX evaluation spike + written decision (this section) |
+| **M6.1** | Package chosen module in Nix/Docker; CP `modules.json` or equivalent; pull/start on boot when chat-ready |
+| **M6.2** | Gateway Phase 2: nginx auth + routing; portal CTA; module health in `/api/status` |
+| **M6.3** | Household smoke test: setup → portal → primary UI → send message → reply via local Lemonade |
+
+#### M6 acceptance checklist
+
+- [ ] Written UX decision (A or B) with deferred path noted
+- [ ] Primary module runs as Docker module with Lemonade on localhost only
+- [ ] nginx Phase 2: auth on LAN-facing routes; CP API not anonymously world-writable beyond current setup intent
+- [ ] Portal single entry point to primary UX
+- [ ] `make test` still green; module bring-up covered by test or documented manual gate
+- [ ] No second co-equal “main” UI shipped by default
 
 ### M3 verification
 
@@ -646,4 +726,9 @@ Historical M1 checklist (kept for archive):
 - [x] `/var/lib/lemonseed/` for models/state
 - [x] Headless `lemond` in SquashFS (not Docker; no Lemonade UI)
 - [x] Tier A unit tests (`make test`)
-- [ ] Any Concept.md R1 item that must pull into M5 despite the cut
+- [x] M5 closed — see commit on `main` (hardware-aware local chat + tests)
+
+**M6 review (open):**
+- [ ] UX evaluation spike completed
+- [ ] Primary path chosen (Open WebUI vs agentic messaging)
+- [ ] Gateway Phase 2 scoped to chosen module only
