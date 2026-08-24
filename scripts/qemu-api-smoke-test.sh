@@ -15,8 +15,8 @@ USERDATA_SIZE="${QEMU_USERDATA_SIZE:-8G}"
 HOST_PORT="${QEMU_API_HOST_PORT:-19080}"
 TIMEOUT="${QEMU_API_TIMEOUT:-300}"
 PIDFILE="${ROOT}/out/qemu-api-smoke.pid"
-LOG="${ROOT}/out/qemu-api-smoke.log}"
-MEM="${QEMU_MEM:-2048}"
+LOG="${ROOT}/out/qemu-api-smoke.log"
+MEM="${QEMU_MEM:-3072}"
 SMP="${QEMU_SMP:-2}"
 
 cleanup() {
@@ -94,13 +94,22 @@ fi
 mkdir -p "$(dirname "${LOG}")"
 rm -f "${PIDFILE}" "${LOG}"
 
+ACCEL_ARGS=()
+if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+  ACCEL_ARGS=(-accel kvm)
+  echo "==> Using KVM acceleration"
+else
+  echo "==> /dev/kvm not usable; falling back to TCG (slow)"
+fi
+
 echo "==> Starting QEMU (host API http://127.0.0.1:${HOST_PORT}/ → guest :80)"
 "${QEMU_BIN}" \
   -machine q35 \
+  "${ACCEL_ARGS[@]}" \
   -m "${MEM}" \
   -smp "${SMP}" \
   -display none \
-  -serial none \
+  -serial file:"${LOG}" \
   -no-reboot \
   -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${HOST_PORT}-:80" \
   -device virtio-net-pci,netdev=net0 \
@@ -171,5 +180,45 @@ assert 'version' in data, data
 assert 'lemond' in data, data
 print('OK: version=%r' % data.get('version'))
 "
+
+echo "==> Checking /api/data (Postgres + Valkey + provisioning)"
+data_deadline=$((SECONDS + 240))
+data_json=""
+while (( SECONDS < data_deadline )); do
+  if data_json="$(poll_http "/api/data" 30 2>/dev/null)"; then
+    ready="$(echo "${data_json}" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+pg = (d.get("postgres") or {}).get("state")
+vk = (d.get("valkey") or {}).get("state")
+prov = (d.get("provisioning") or {}).get("state")
+print("yes" if pg == "ready" and vk == "ready" and prov == "ready" else "no")
+' 2>/dev/null || true)"
+    if [[ "${ready}" == "yes" ]]; then
+      break
+    fi
+  fi
+  sleep 5
+done
+
+if [[ -z "${data_json}" ]]; then
+  echo "Timed out waiting for /api/data" >&2
+  tail -40 "${LOG}" >&2 || true
+  exit 1
+fi
+
+echo "${data_json}" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+pg = (data.get("postgres") or {}).get("state")
+vk = (data.get("valkey") or {}).get("state")
+prov = (data.get("provisioning") or {}).get("state")
+print(f"OK: postgres={pg!r} valkey={vk!r} provisioning={prov!r}")
+if prov != "ready":
+    print(data, file=sys.stderr)
+assert pg == "ready", data
+assert vk == "ready", data
+assert prov == "ready", data
+'
 
 echo "==> QEMU API smoke test PASSED"

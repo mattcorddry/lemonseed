@@ -345,6 +345,20 @@ class StubHttpTests(unittest.TestCase):
         self.assertEqual(data["role"], "control-plane")
         self.assertEqual(data["status"], "ok")
 
+    @mock.patch.object(stub.data_services, "ensure_provision_worker")
+    @mock.patch.object(stub.data_services, "data_snapshot")
+    def test_api_data(self, snap: mock.Mock, _worker: mock.Mock) -> None:
+        snap.return_value = {
+            "postgres": {"state": "starting", "host": "127.0.0.1:5432"},
+            "valkey": {"state": "ready", "host": "127.0.0.1:6379"},
+            "provisioning": {"state": "idle"},
+        }
+        code, body = self._get("/api/data")
+        self.assertEqual(code, 200)
+        data = json.loads(body.decode())
+        self.assertEqual(data["valkey"]["state"], "ready")
+        _worker.assert_called_once()
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main(verbosity=2))

@@ -1,6 +1,6 @@
 # Lemonseed Appliance — Design
 
-Status: **living design** (M1–M4.1 done; M5 done; M6 next — primary UX undecided)  
+Status: **living design** (M1–M5 done; **M6 in progress** — Open WebUI chosen as primary UX)  
 Related: [Concept.md](./Concept.md) (product vision), [Requirements.md](./Requirements.md)
 
 This document captures architectural decisions. It is the source of truth for implementation milestones. Product intent lives in Concept.md; this file translates that intent into buildable decisions.
@@ -20,9 +20,11 @@ Lemonseed is a **local, multi-user home AI hub** — not a cloud client and not 
 | Layer | Choice |
 |-------|--------|
 | Inference backend | **Embeddable `lemond` in SquashFS** (headless; no Lemonade web/desktop UI). Built from source via Nix, not the Ubuntu release tarball. |
-| First UX | Control-plane “local chat ready” status + Lemonade OpenAI-compatible API; **primary UI chosen in M6** (see M6 bookmark) |
-| Image gen | Deferred past M5; prefer **ComfyUI** later over Lemonade llama-sd / sd-cpp |
-| Agents | Candidate primary UX in M6 evaluation (NanoClaw-style); not dual-shipped with chat UI by default |
+| First UX | **Open WebUI** (Docker module) — primary household chat + light agentic features; portal deep-links when chat-ready |
+| Mobile (later) | [Conduit](https://conduit.mobile/) — open-source Open WebUI client; evaluate after LAN UX is solid |
+| Shared data | **PostgreSQL** (+ **pgvector**), **Valkey** (Redis-compatible) — appliance-wide; modules get provisioned DB/role creds |
+| Image gen | **ComfyUI** via Open WebUI workflows (VRAM-gated); not Lemonade llama-sd / sd-cpp |
+| Agents / workers | **Light agentic** inside Open WebUI (automations, tasks, channels, timers) — not a separate NanoClaw-style front door |
 | Brand | **lemonseed.ai** |
 | Docker | Remains for **modules** (Open WebUI, etc.); **not** the primary Lemonade runtime |
 
@@ -51,8 +53,8 @@ Lemonseed is a **local, multi-user home AI hub** — not a cloud client and not 
 - Shipping application container images inside the base SquashFS
 - Writable overlay / tmpfs overlay on root
 - Cloud model burst / anonymized cloud GPU relay (Concept “future”; not M5)
-- Multi-user auth, Open WebUI, ComfyUI (post-M5; primary UX TBD in M6)
-- LUKS/encrypted user-data (deferred past M5; plan later)
+- Multi-user auth via **nginx proxy auth** (Lemonseed session); Open WebUI native login **disabled**; no per-container OAuth
+- LUKS/encrypted user-data (deferred past M6; plan later)
 
 ---
 
@@ -67,106 +69,145 @@ Lemonseed is a **local, multi-user home AI hub** — not a cloud client and not 
 | **M4 — USB installer** | **Nearly done** — install + portal + first-boot setup; polish remaining |
 | **M4.1 — Preserve known user-data on reinstall** | **Done** — namespaced storage identity; preserve checkbox; layout-compatible reinstall |
 | **M5 — Hardware-aware local chat** | **Done** — `lemond` + NVIDIA/CUDA; inventory + catalog planner + CP pull/load/pin + portal “Local chat ready”; unit tests + QEMU API smoke |
-| **M6 — Primary interaction UX** | **In progress** — UX evaluation → one primary module + gateway Phase 2 auth/routing |
-| **M6+ (later)** | ComfyUI, multi-user, AMD/UMA profiles, heterogeneous GPU planner, encryption, offline install, Secure Boot/TPM |
+| **M6 — Open WebUI household UX** | **In progress** — M6.0a data plane done; next Open WebUI on Postgres (auth later via nginx) |
+| **M6+ (later)** | Conduit/mobile polish, AMD/UMA profiles, heterogeneous GPU planner, encryption, offline install, Secure Boot/TPM |
 
-**Immediate next step:** run the M6 UX evaluation spike (below), record a decision, then implement gateway Phase 2 around the chosen primary module.
+**Immediate next step:** M6.1 — Open WebUI as Docker module on Postgres with auth disabled, wired to Lemonade; blue/green update path.
 
-### M6 — Primary interaction UX (design)
+### M6 — Open WebUI as primary UX (decided)
 
-**Goal:** Ship **one** household-facing chat/assistant experience on the LAN — not two overlapping “main” UIs. M6 ends with a chosen primary path, a Docker module wired through nginx, and gateway auth Phase 2 scoped to that path.
+**Decision (2026-08):** **Open WebUI** is the single primary household interface. A separate NanoClaw-style agentic messaging UI is **deferred** — Open WebUI can deliver a sufficient “light agentic” experience (automations, tasks, sub-agents, channels) without a second front door.
 
-**Non-goals for M6:** multi-user accounts with per-user data isolation, ComfyUI/image gen, voice appliance, mobile apps, cloud relay, shipping both candidates as equal defaults.
+**Rationale:** Familiar chat UX + upstream feature velocity + strong OpenAI-compatible backend fit with `lemond`. NanoClaw-style stacks are harder to onboard and overlap with Open WebUI’s agent/task/channel features. [Conduit](https://conduit.mobile/) provides a credible path to mobile later because it targets Open WebUI APIs.
 
-#### Why this gate exists
+| Decision | Primary module | Deferred |
+|----------|----------------|----------|
+| **Locked** | Open WebUI (Docker) | NanoClaw-style standalone agentic UI |
 
-Concept.md describes both **chat** (one-shot and long-running conversations) and **workers** (background agents, notifications, automations). Those can be one product surface or two. Lemonseed must pick a **primary metaphor** before we invest in login flows, module routing, and onboarding copy — otherwise we build gateway auth twice and households see duplicate entry points.
-
-| Path | Primary metaphor | Best when… |
-|------|------------------|------------|
-| **A — Traditional chat** (Open WebUI or similar) | “Family ChatGPT on the LAN” | Chat is the main job; workers/agents are later add-ons behind the same UI or API |
-| **B — Agentic messaging** (NanoClaw-style) | “Always-on assistant + channels” | Proactive workers, messaging-style threads, and tool loops are co-equal with chat |
-
-**Locked regardless of path:** inference stays **headless `lemond` in SquashFS** on localhost; the primary UI is a **Docker module** talking to `http://127.0.0.1:13305` (OpenAI-compatible API + API key from CP).
-
-#### Evaluation spike (do before implementation)
-
-Run both candidates on the **NVIDIA prototype** (or future Proxmox GPU VM) against the **M5 default model** already loaded. Time-box to a few days; capture notes in this doc or a short `docs/m6-ux-evaluation.md`.
-
-| Criterion | Questions |
-|-----------|-----------|
-| **Household fit** | Can a non-technical user start a chat in &lt;2 minutes after setup? Is proactive/agent behavior understandable without a manual? |
-| **Lemonade integration** | How much config to point at local Lemonade (base URL, model id, API key injection)? Any features that assume cloud or Ollama-only? |
-| **Ops on NixOS appliance** | Image size, pull policy, volume layout under `/var/lib/lemonseed/`, upgrade story, health checks CP can poll |
-| **Security / isolation** | Container boundaries, tool execution, filesystem access — especially for Path B |
-| **Concept alignment** | Path to Release 1 workers/notifications without a second front door |
-| **Maintenance** | Upstream velocity, license, fit with our SquashFS + Docker module model |
-
-**Decision output (required):** one row in the table below, plus explicit deferral of the other path.
-
-| Decision | Primary module | Deferred path |
-|----------|----------------|---------------|
-| TBD | — | — |
-
-#### Architecture (common to either path)
+**Locked architecture:**
+- Inference stays **headless `lemond` in SquashFS** on `127.0.0.1:13305` (API key from CP).
+- Open WebUI runs as a **Docker module**; nginx :80 is the only LAN entry.
+- **Module and CP durable state** live in shared **PostgreSQL** (and **Valkey** where needed) — not bind-mounted SQLite files inside containers.
+- CP owns catalog, model load, `chat-ready`, module lifecycle, DB/credential provisioning, and (later) Lemonseed user sessions at nginx.
 
 ```
-Browser / LAN client
+Browser / Conduit (later)
         │
         ▼
-   nginx :80  ── Phase 2: auth + route table
+   nginx :80  ── routing now; proxy auth later (not OAuth inside modules)
         │
-        ├── /           → control plane portal (status, admin, module links)
-        ├── /chat/…     → primary module (path prefix TBD by winner)
-        └── /api/…      → CP JSON API (localhost origin only from CP process)
-        
-lemond :13305 (127.0.0.1, API key)  ← never exposed directly to LAN
+        ├── /              → Open WebUI (primary)
+        ├── /settings/…    → control plane portal (admin, status)
+        └── /api/…         → CP JSON API
+
+Open WebUI (Docker) ──► lemond :13305/v1
+                     └──► PostgreSQL (+ pgvector), Valkey (CP-provisioned creds)
+
+CP ──► PostgreSQL (appliance + module metadata, users when auth lands)
+SearXNG / ComfyUI ──► sidecar modules when enabled (VRAM/policy)
 ```
 
-**Gateway Phase 2 (M6 deliverable after UX decision):**
-- Replace throwaway Phase 1 nginx vhost with **session auth** (exact mechanism TBD: e.g. household shared password first, per-user later).
-- **Route table** owned by CP config (or generated nginx snippet): primary module at `/` or `/chat`, CP admin at `/settings` or subpath.
-- Module containers get **only** what they need: Lemonade URL + read-only API key via env/file from CP; no host network.
-- CP continues to own: catalog, model load, `chat-ready` state, Docker pull/start for modules.
+#### Shared data & module infrastructure
 
-**Portal changes:** “Local chat ready” remains the inference status line; add a single **“Open chat”** (or equivalent) CTA that deep-links into the chosen module — not separate buttons for two products.
+**Principle:** minimize **bind-mounted application state** in module containers. Chat history, OWUI config, embeddings metadata, CP module registry, and (later) user records belong in **managed databases** on user-data — not opaque host directory trees per container.
 
-#### Candidate A — Open WebUI (traditional chat)
+**Why not SQLite in modules:** module updates should use **start-new → health-check → retire-old** (blue/green). SQLite ties state to a single container filesystem and blocks running old and new instances against the same data concurrently. PostgreSQL (and Valkey) support shared clients, online backup, and transactional restore.
 
-| Aspect | Notes |
-|--------|--------|
-| **Shape** | Mature web UI; OpenAI-compatible backend; model picker, history, RAG hooks |
-| **Pros** | Familiar UX; strong Lemonade/OpenAI API story; aligns with “chat first” in Concept R1 |
-| **Cons** | Agent/worker story is bolt-on; may fight our “one default model” policy unless configured |
-| **Integration sketch** | Docker module; env `OPENAI_API_BASE_URL=http://host.docker.internal:13305/v1` (or gateway subpath); inject `LEMONADE_API_KEY`; disable cloud providers; pin default model to catalog selection |
-| **Risks** | Feature creep (RAG, multiple models) vs appliance simplicity |
+| Service | Role |
+|---------|------|
+| **PostgreSQL** | Primary durable store: Open WebUI, CP state, future modules; **pgvector** extension for embeddings/RAG |
+| **Valkey** | Redis-compatible cache/queue/session scratch (exact use per module TBD) |
+| **Object storage (later)** | Large blobs (uploads, generated images) may still use `/var/lib/lemonseed/` paths — but **metadata and indexes in Postgres** |
 
-#### Candidate B — NanoClaw-style agentic messaging
+**Layout (direction):**
+- Data services run as **CP-managed containers or systemd-backed services** on user-data (`/var/lib/lemonseed/data/` for PG data dir, backups, WAL archive target).
+- CP **provisions per-module** (and per-service) **database + role + password**; secrets injected at container start — not checked into config.
+- **Backups:** Postgres `pg_dump`/basebackup on a schedule; Valkey snapshot policy TBD; both participate in preserve-on-reinstall user-data story.
+- **Bind mounts:** limited to secrets drop-ins, read-only config seeds, and **large media** — not primary OLTP state.
 
-| Aspect | Notes |
-|--------|--------|
-| **Shape** | Container-isolated agent loop + messaging/web UI; channels, sessions, tools |
-| **Pros** | Closer to Concept workers/notifications; differentiated from “another ChatGPT skin” |
-| **Cons** | Younger ecosystem; harder household onboarding; security review burden for tool execution |
-| **Integration sketch** | Docker module(s); Lemonade as LLM provider; CP provisions API key + model id; strict volume and network policy |
-| **Risks** | Overlap with future “workers” if we also add Open WebUI later; ops complexity |
+**Module update strategy (blue/green):**
+1. Pull new image tag.
+2. Start **new** container against **same** Postgres/Valkey endpoints (new credentials or shared role per policy).
+3. **Health-check** new instance (HTTP ready + DB migration success if applicable).
+4. Flip nginx upstream to new instance.
+5. Stop old container.
+
+Failed health-check → old container keeps serving; appliance stays up.
+
+#### Gateway & auth
+
+**M6.1 (now):** **Fully disable Open WebUI authentication** — no OWUI login screen, no OAuth hooks inside the module. LAN access matches current bring-up trust model until nginx auth ships.
+
+**M6.2+ (planned):** **Proxy-style auth in nginx only** — Lemonseed user management validates the session at the edge; trusted identity forwarded to upstreams via headers (exact header scheme TBD). **Do not** delegate OAuth/OpenID to each container; modules stay auth-naive behind nginx.
+
+- Open WebUI container receives Lemonade URL + API key + Postgres/Valkey DSN via env/secrets from CP.
+- No host network; no direct LAN exposure of `lemond` or Postgres.
+
+#### Open WebUI container policy
+
+| Area | Policy |
+|------|--------|
+| **OpenTerminal** | **Multi-user mode** — one container serves all household users (not per-user containers). |
+| **Web search** | Use **SearXNG** or another self-hosted/external search backend; built-in Open WebUI web search is not good enough for product use. Evaluate [community web search improvement](https://openwebui.com/posts/web_search_acff6f71) for UX. |
+| **Autocomplete** | **Disabled** — not worth token burn on appliance hardware. |
+| **Automations** | **Enabled** — core “light agentic” path. |
+| **Task management, sub-agents, timers** | **Enabled** where hardware supports the backing model (see model tiers). |
+| **Memory** | **Enabled**, automatic, for all models. |
+| **Workspace** | **Disabled**. |
+| **Notes** | **Enabled**. |
+| **Calendar** | **Enabled** — seed a shared **family/group calendar** by default at first setup. |
+| **Channels** | **Enabled** — seed a shared **“everyone”** channel by default at first setup. |
+| **Speech** | **Local only** — enable STT/TTS paths that run on-appliance; **no cloud speech dependencies**. |
+| **Images** | **ComfyUI** workflows for creation and editing; **VRAM-gated** (ComfyUI has improved GPU/CPU sharing in recent versions — still policy-gated on small boxes). |
+
+#### Model management (planner + Open WebUI)
+
+Catalog/planner extends M5 tiering; CP pushes defaults into Open WebUI config.
+
+| Hardware class | Models | Agentic features |
+|----------------|--------|------------------|
+| **Small** (&lt; 64 GiB VRAM) | **One** catalog model with good defaults (current M5 path: e.g. Gemma E2B on ~6 GiB GPU) | Automations, channels, notes, calendar — **no** heavy sub-agent/task stack unless model fits |
+| **Large** (≥ 64 GiB VRAM) | **Fast** model for daily chat (e.g. Gemma MoE class) + **dense** model for deeper research / heavy agent work | Task management, sub-agents, timers on **dense** model tier |
+
+**All models:** system prompts that establish identity (**“Lemonseed”**), role, and per-user context (who the user is in the household). CP or seeded OWUI config owns baseline prompts; user-specific layers added after auth lands.
+
+#### Community plugins — evaluate before ship
+
+Verify **license compatibility** and security before bundling or auto-installing any community plugin.
+
+| Plugin | URL | Purpose |
+|--------|-----|---------|
+| SMB file operations | [openwebui.com/…/smb_file_operationstool_145f7e79](https://openwebui.com/posts/smb_file_operationstool_145f7e79) | LAN file share access |
+| Spreadsheets | [openwebui.com/…/create_and_edit_spreadsheets_f2211b30](https://openwebui.com/posts/create_and_edit_spreadsheets_f2211b30) | Office-style docs |
+| Secure mail agent | [openwebui.com/…/securemail_agent_99b0e788](https://openwebui.com/posts/securemail_agent_99b0e788) | Email integration |
+| Data plot (Plotly) | [openwebui.com/…/data_plot_plotly_f375c4fc](https://openwebui.com/posts/data_plot_plotly_f375c4fc) | Visualization |
+
+Default appliance image: **no** community plugins until reviewed; optional “enable in settings” or post-M6 module pack.
 
 #### M6 phased deliverables
 
 | Phase | Deliverable |
 |-------|-------------|
-| **M6.0** | UX evaluation spike + written decision (this section) |
-| **M6.1** | Package chosen module in Nix/Docker; CP `modules.json` or equivalent; pull/start on boot when chat-ready |
-| **M6.2** | Gateway Phase 2: nginx auth + routing; portal CTA; module health in `/api/status` |
-| **M6.3** | Household smoke test: setup → portal → primary UI → send message → reply via local Lemonade |
+| **M6.0** | **Done** — UX decision recorded (this section) |
+| **M6.0a** | **Done** — shared PostgreSQL (+ pgvector) + Valkey; CP credential provisioning; CP state in Postgres; QEMU + hardware smoke |
+| **M6.1** | Open WebUI on Postgres; **auth disabled**; Lemonade backend wired; blue/green update path |
+| **M6.2** | nginx **proxy auth** (Lemonseed sessions); OWUI remains authless behind nginx; portal “Open chat” CTA |
+| **M6.3** | OWUI policy seeding; SearXNG sidecar; family calendar/channel defaults |
+| **M6.4** | Household smoke; `make test` green |
+| **M6+** | Conduit mobile, ComfyUI VRAM gating, multi-model tiers, vetted community plugins |
+
+**Backlog (not current milestone):** CP API status fields (`/api/data`, `/api/status`, subsystem snapshots) should report **current health** via cheap live checks (e.g. `pg_isready` / `SELECT 1`, Valkey PING, HTTP ready), not a one-shot or cached reflection of “daemon started once.” If Postgres stops accepting connections after boot, the API should flip to unhealthy. Apply the same pattern to other subsystems as low-cost probes become available.
 
 #### M6 acceptance checklist
 
-- [ ] Written UX decision (A or B) with deferred path noted
-- [ ] Primary module runs as Docker module with Lemonade on localhost only
-- [ ] nginx Phase 2: auth on LAN-facing routes; CP API not anonymously world-writable beyond current setup intent
-- [ ] Portal single entry point to primary UX
-- [ ] `make test` still green; module bring-up covered by test or documented manual gate
+- [x] Written UX decision: Open WebUI primary; NanoClaw-style UI deferred
+- [x] Shared Postgres (+ pgvector) + Valkey; minimal bind-mount module state
+- [ ] Open WebUI runs as Docker module on Postgres; `lemond` stays localhost-only
+- [ ] Open WebUI auth **disabled** (M6.1); nginx proxy auth deferred to M6.2
+- [ ] Blue/green module updates with health-check before cutover
+- [ ] Portal single entry point (“Open chat”)
+- [ ] Policy defaults applied (autocomplete off, automations on, workspace off, etc.)
+- [ ] `make test` still green
 - [ ] No second co-equal “main” UI shipped by default
 
 ### M3 verification
@@ -545,8 +586,9 @@ Final mount flags per path will be tightened during bring-up; principle: **`noex
 - Tools needed for updates: mount ESP on demand, `grub-editenv`, verify signatures, write inactive slot
 
 ### Not in the SquashFS base
-- Open WebUI, ComfyUI, and other **module** images — pulled at runtime via control plane / Docker
+- Open WebUI, ComfyUI, PostgreSQL, Valkey, and other **module/data** images — pulled at runtime via control plane / Docker
 - Model weights and Lemonade mutable config — live on user-data under `/var/lib/lemonseed/`
+- PostgreSQL/Valkey data dirs — on user-data under `/var/lib/lemonseed/data/` (preserve-on-reinstall)
 - User data
 
 ### Networking
@@ -563,7 +605,7 @@ Final mount flags per path will be tightened during bring-up; principle: **`noex
 ### HTTP gateway (M4+)
 - **Public entry is always nginx on :80** (firewall opens 80; CP stays loopback-only).
 - **Phase 1 (first boot / unset appliance):** nginx is a straight reverse proxy to `127.0.0.1:8080`. The CP serves a **no-login** readiness + setup wizard (`/`, `/setup`, `/api/boot`). Completing setup writes `/etc/appliance-setup-complete` (+ JSON state).
-- **Phase 2 (post-setup):** replace/swap the nginx vhost for **auth + module routing** (control plane UI + Docker modules such as Open WebUI) while keeping :80 as the single pane of glass. Phase 1 config is intentionally throwaway.
+- **Phase 2 (post-setup):** nginx vhost gains **module routing** immediately; **proxy auth** at nginx when Lemonseed user management is ready (M6.2). Modules (Open WebUI, etc.) stay **auth-naive** — no per-container OAuth. Phase 1 straight-proxy config is intentionally throwaway.
 - **mDNS:** Avahi publishes the slug of the appliance **Name** from setup (`Matt Lemonseed 1` → `matt-lemonseed-1.local`). Before setup the name defaults to `Lemonseed`, so a fresh appliance is reachable at `lemonseed.local` for the installer hand-off. After a preserve reinstall of a **renamed** appliance, `lemonseed-avahi-alias` briefly publishes `lemonseed.local` as a CNAME so the installer can discover the box; the installer (and any leftover `lemonseed.local` hit) then redirects to `<slug>.local` and the alias is released (`/run/lemonseed/mdns-handoff-done`). Fully confirmed appliances never claim `lemonseed.local`, so multiple units can share a LAN.
 - **Appliance identity (one name, not two):** setup collects a single user-facing **Name**; its slug is the system hostname, the mDNS name, and the hostname dhcpcd advertises. `networking.hostName` is therefore **empty** in the NixOS config — a non-empty value makes `/etc/hostname` a read-only store symlink and pins `host-name=` in `avahi-daemon.conf`, both of which would defeat the chosen name. `lemonseed-identity.service` seeds `/etc/hostname` on `@etc` (from `/etc/appliance-setup.json`, else the existing value, else `lemonseed`) before dhcpcd/Avahi start.
 - **Name collisions:** setup resolves `<slug>.local` over mDNS before offering a default; if another host owns it, the suggested name becomes `Lemonseed 2` (editable), and submitting a name owned by a different host is rejected. Avahi's effective hostname (queried over D-Bus, including any collision suffix) identifies our own announcement; IP comparison is only a fallback because DHCP leases can change. Multiple appliances therefore never share one advertised name.
@@ -688,13 +730,15 @@ Resolved for early milestones where noted; remaining items do not block M5 start
 | Mutable state | btrfs subvols `@etc`/`@var` mounted on `/etc`/`/var` |
 | `/tmp` | size-capped tmpfs (128M) |
 | ESP | On-demand mount only |
-| Apps / modules | Not baked into image; Docker at runtime (Open WebUI, etc.) |
+| Apps / modules | Not baked into image; Docker at runtime; **state in Postgres/Valkey**, not bind-mounted SQLite |
+| Data services | Shared PostgreSQL (+ pgvector), Valkey; CP-provisioned credentials |
 | Inference runtime | **`lemond` embedded in SquashFS** (headless); Docker is not the Lemonade path |
+| Module updates | Blue/green: start new → health-check → nginx cutover → stop old |
 | GPU | Drivers in base; NVIDIA first (M5); AMD/UMA later; no VRAM pooling |
-| Inference UX | Catalog-selected LLM; chat-only in M5; no Lemonade UI |
+| Inference UX | Open WebUI primary (M6); catalog-selected LLM via `lemond` |
 | Models | Stored under `/var/lib/lemonseed/`; versioned catalog fit |
 | Lemonade packaging | From-source Nix; wire Nix backends; patterns from nix-amd-ai |
-| Control plane | systemd root; Python; privileged API + web UI |
+| Control plane | systemd root; Python; privileged API + web UI; **CP state in Postgres** |
 | Builds | Local; flakes; `build-production` / `build-qemu` / `run-qemu` / `qemu-clean` |
 | Version | Date + local counter; `VERSION` override |
 | Partition config | YAML source → systemd-repart as apply engine |
@@ -702,7 +746,7 @@ Resolved for early milestones where noted; remaining items do not block M5 start
 | Distribution | HTTP; versioned artifact directory |
 | Installer | M4; partitions only (no btrfs format); reinstall releases LVM/DM |
 | Encryption | Deferred past M5 |
-| Open WebUI / auth | Post-M5 (gateway Phase 2) |
+| Open WebUI / auth | **M6.1:** OWUI auth off. **M6.2+:** nginx proxy auth only |
 
 ---
 
@@ -728,7 +772,11 @@ Historical M1 checklist (kept for archive):
 - [x] Tier A unit tests (`make test`)
 - [x] M5 closed — see commit on `main` (hardware-aware local chat + tests)
 
-**M6 review (open):**
-- [ ] UX evaluation spike completed
-- [ ] Primary path chosen (Open WebUI vs agentic messaging)
-- [ ] Gateway Phase 2 scoped to chosen module only
+**M6 review:**
+- [x] UX evaluation complete — Open WebUI primary; NanoClaw-style UI deferred
+- [x] Conduit noted as future mobile path
+- [x] Shared Postgres + Valkey + pgvector; minimal bind mounts; blue/green module updates
+- [x] Auth: OWUI disabled for M6.1; nginx proxy auth planned (not container OAuth)
+- [x] M6.0a data services + CP credential provisioning
+- [ ] M6.1 Open WebUI on Postgres + Lemonade backend
+- [ ] M6.2 nginx proxy auth

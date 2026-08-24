@@ -23,6 +23,7 @@ from urllib.request import Request, urlopen
 from zoneinfo import available_timezones
 
 import chat_ready
+import data_services
 import hardware
 from catalog import plan_model
 
@@ -275,15 +276,19 @@ def lemond_snapshot() -> dict[str, Any]:
 
 def boot_snapshot() -> dict[str, Any]:
     """Best-effort readiness signals for the first-boot UI."""
-    units = [
+    core_units = [
         "network-online.target",
         "nginx.service",
         "avahi-daemon.service",
         "lemond.service",
         "appliance-control-plane.service",
     ]
+    data_units = [
+        "lemonseed-postgres.service",
+        "lemonseed-valkey.service",
+    ]
     status: dict[str, str] = {}
-    for unit in units:
+    for unit in core_units + data_units:
         try:
             out = subprocess.check_output(
                 ["systemctl", "is-active", unit],
@@ -297,7 +302,7 @@ def boot_snapshot() -> dict[str, Any]:
     lemond = lemond_snapshot()
     docker = docker_snapshot()
     startup_ready = (
-        all(state == "active" for state in status.values())
+        all(status[u] == "active" for u in core_units)
         and docker["state"] == "ready"
         and lemond["state"] == "ready"
         and FIRST_BOOT_FILE.is_file()
@@ -310,6 +315,7 @@ def boot_snapshot() -> dict[str, Any]:
         "first_boot_marker": "recorded" if FIRST_BOOT_FILE.is_file() else "pending",
         "lemond": lemond,
         "docker": docker,
+        "data": data_services.data_snapshot(),
         "startup_ready": startup_ready,
     }
 
@@ -763,9 +769,14 @@ class Handler(BaseHTTPRequestHandler):
             report = hardware.collect_hardware()
             self._json(200, plan_model(report))
             return
+        if path == "/api/data":
+            data_services.ensure_provision_worker()
+            self._json(200, data_services.data_snapshot())
+            return
         if path == "/api/status":
             maybe_complete_mdns_handoff(self)
             chat_ready.ensure_chat_worker()
+            data_services.ensure_provision_worker()
             boot = boot_snapshot()
             setup = load_setup()
             self._json(
@@ -776,6 +787,7 @@ class Handler(BaseHTTPRequestHandler):
                     **boot,
                     "setup": setup,
                     "chat": chat_ready.chat_snapshot(),
+                    "data": data_services.data_snapshot(),
                     "portal_url": f"http://{primary_mdns_slug()}.local/",
                 },
             )
@@ -840,6 +852,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     chat_ready.ensure_chat_worker()
+    data_services.ensure_provision_worker()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"appliance-control-plane listening on http://{HOST}:{PORT}", flush=True)
     server.serve_forever()

@@ -6,14 +6,18 @@ let
   cpSrc = ../../control-plane;
   cpRoot = pkgs.runCommand "lemonseed-control-plane-src" { } ''
     mkdir -p "$out/catalog"
-    cp ${cpSrc}/stub.py ${cpSrc}/hardware.py ${cpSrc}/catalog.py ${cpSrc}/chat_ready.py "$out/"
+    cp ${cpSrc}/stub.py ${cpSrc}/hardware.py ${cpSrc}/catalog.py ${cpSrc}/chat_ready.py \
+       ${cpSrc}/db.py ${cpSrc}/data_services.py "$out/"
     cp ${cpSrc}/catalog/models.json "$out/catalog/"
   '';
+
+  pythonEnv = pkgs.python3.withPackages (ps: [ ps.psycopg2 ]);
 
   controlPlane = pkgs.writeShellApplication {
     name = "appliance-control-plane";
     runtimeInputs = [
-      pkgs.python3
+      pythonEnv
+      pkgs.postgresql
       pkgs.systemd
       pkgs.coreutils
       pkgs.docker
@@ -29,7 +33,7 @@ let
     text = ''
       export PYTHONPATH=${cpRoot}
       export LEMONSEED_CATALOG=${cpRoot}/catalog/models.json
-      exec ${pkgs.python3}/bin/python3 ${cpRoot}/stub.py
+      exec ${pythonEnv}/bin/python3 ${cpRoot}/stub.py
     '';
   };
 in
@@ -55,14 +59,12 @@ in
       ExecStart = "${controlPlane}/bin/appliance-control-plane";
       Restart = "on-failure";
       RestartSec = "2s";
-      # Localhost only — nginx is the public face on :80.
       Environment = [
         "APPLIANCE_CP_HOST=127.0.0.1"
         "APPLIANCE_CP_PORT=8080"
         "LEMONSEED_CATALOG=${cpRoot}/catalog/models.json"
         "PYTHONPATH=${cpRoot}"
       ];
-      # Model pull/load scratch and chat-ready state live on @var.
       ReadWritePaths = [
         "/var/lib/lemonseed"
         "/etc"
@@ -72,7 +74,6 @@ in
     };
   };
 
-  # /run is tmpfs; these must exist before ReadWritePaths mount setup.
   systemd.tmpfiles.rules = [
     "d /run/appliance 0755 root root -"
     "d /run/lemonseed 0755 root root -"

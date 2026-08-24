@@ -10,6 +10,7 @@
     ./modules/nvidia.nix
     ./modules/fhs-compat.nix
     ./modules/lemond.nix
+    ./modules/data-services.nix
     ./modules/control-plane.nix
     ./modules/gateway.nix
     ./modules/console.nix
@@ -76,6 +77,8 @@
 
   virtualisation.docker.enable = true;
   virtualisation.docker.enableOnBoot = true;
+
+  lemonseed.dataServices.enable = true;
   networking.useDHCP = true;
   networking.firewall.enable = true;
 
