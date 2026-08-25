@@ -521,8 +521,7 @@ def run_install(
         phase="await_usb",
         message=(
             f"Lemonseed {version} is installed. "
-            "Remove the installer CD/USB, then click Reboot "
-            "(immediate restart — do not wait for a clean shutdown)."
+            "Remove the installer USB, then click Reboot."
         ),
         progress=100,
         can_reboot=True,

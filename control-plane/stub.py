@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Lemonseed control plane (bring-up stub).
+"""Lemonseed control plane (bring-up + app shell).
 
 Listens on 127.0.0.1:8080 behind nginx :80.
   - Before setup: no-auth first-boot / setup wizard
-  - After setup: simple ready portal (auth + module routing come later via nginx)
+  - After setup: Lemonseed shell at / (toolbar + iframe → chat, settings, …)
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from zoneinfo import available_timezones
 import chat_ready
 import data_services
 import hardware
+import modules
 from catalog import plan_model
 
 
@@ -387,6 +388,97 @@ input, select {
 }
 .err { color: var(--bad); margin-top: 0.75rem; }
 .okmsg { color: var(--ok); margin-top: 0.75rem; }
+.app-shell {
+  max-width: none; margin: 0; padding: 0; min-height: 100vh;
+  display: flex; flex-direction: column;
+}
+.app-bar {
+  display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+  padding: 0.55rem 1rem; border-bottom: 1px solid var(--line);
+  background: rgba(15, 28, 24, 0.92); backdrop-filter: blur(8px);
+}
+.app-bar .brand {
+  margin: 0; font-size: 0.8rem; letter-spacing: 0.16em;
+  text-transform: uppercase; color: var(--accent); font-weight: 700;
+}
+.app-bar .title { margin: 0; font-size: 1rem; font-weight: 600; }
+.app-bar .spacer { flex: 1; }
+.app-bar .nav {
+  display: flex; align-items: center; gap: 0.15rem;
+}
+.app-bar .nav a, .app-bar .nav span {
+  color: var(--muted); text-decoration: none; font-size: 0.88rem; font-weight: 600;
+  padding: 0.35rem 0.65rem; border-radius: 999px;
+}
+.app-bar .nav a:hover { color: var(--accent); background: rgba(255,255,255,0.06); }
+.app-bar .nav a.active { color: var(--accent-ink); background: var(--accent); }
+.app-bar .nav .disabled {
+  opacity: 0.45; cursor: default; pointer-events: none;
+}
+.app-bar .metrics {
+  display: none; align-items: center; gap: 0.85rem;
+}
+@media (min-width: 720px) { .app-bar .metrics { display: flex; } }
+.metric { min-width: 4.75rem; }
+.metric label {
+  display: block; font-size: 0.62rem; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--muted); margin-bottom: 0.2rem;
+}
+.metric .bar {
+  height: 4px; border-radius: 999px; background: rgba(255,255,255,0.12); overflow: hidden;
+}
+.metric .bar > span {
+  display: block; height: 100%; background: linear-gradient(90deg, #7dcf6a, var(--accent));
+  transition: width 0.35s ease;
+}
+.app-bar .gear {
+  color: var(--muted); text-decoration: none; font-size: 1.15rem;
+  line-height: 1; padding: 0.25rem 0.45rem; border-radius: 8px;
+}
+.app-bar .gear:hover, .app-bar .gear.active { color: var(--accent); }
+.app-bar a {
+  color: var(--muted); text-decoration: none; font-size: 0.9rem; font-weight: 600;
+}
+.app-bar a:hover { color: var(--accent); }
+.embed-shell {
+  max-width: 42rem; margin: 0 auto; padding: 1.5rem 1rem 2.5rem;
+}
+.embed-shell h1 {
+  margin: 0 0 1rem; font-size: clamp(1.5rem, 5vw, 2rem); letter-spacing: -0.02em;
+}
+.frame-wrap iframe.hidden {
+  visibility: hidden;
+  pointer-events: none;
+  z-index: 0;
+}
+.frame-wrap { flex: 1; min-height: 0; position: relative; background: #0a1210; }
+.frame-wrap iframe {
+  position: absolute; inset: 0; width: 100%; height: 100%; border: 0; z-index: 1;
+}
+.frame-fallback {
+  position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; padding: 2rem; text-align: center; color: var(--muted);
+  z-index: 2;
+}
+.frame-fallback.hidden { display: none; }
+.landing {
+  max-width: 28rem; margin: 0 auto; padding: 1.5rem;
+  border: 1px solid var(--line); border-radius: 16px;
+  background: rgba(15, 28, 24, 0.72);
+  text-align: left;
+}
+.landing h2 {
+  margin: 0 0 0.5rem; font-size: 1.25rem; color: var(--ink); letter-spacing: -0.02em;
+}
+.landing p { margin: 0; color: var(--muted); line-height: 1.45; }
+.landing .status-line {
+  margin-top: 1rem; font-weight: 700; font-variant-numeric: tabular-nums;
+}
+.landing .status-line.ok { color: var(--ok); }
+.landing .status-line.wait { color: var(--wait); }
+.landing .status-line.bad { color: var(--bad); }
+.frame-wrap iframe.hidden { display: none; }
+.frame-fallback.hidden { display: none; }
 """
 
 
@@ -545,9 +637,213 @@ if (timezoneSelect && !{json.dumps(bool(saved_timezone))}) {{
     return body.encode()
 
 
-def page_ready(snap: dict[str, Any]) -> bytes:
+def page_shell(snap: dict[str, Any], *, view: str = "chat") -> bytes:
+    """Post-setup app shell: persistent toolbar + keep-alive iframes."""
     setup = load_setup()
     name = escape(str(setup.get("name") or "Lemonseed"))
+    mods = snap.get("modules") or modules.modules_snapshot()
+    owui = mods.get("open_webui") or {}
+    owui_state = str(owui.get("state") or "idle")
+    if view not in ("chat", "settings", "modules"):
+        view = "chat"
+
+    chat_active = "active" if view == "chat" else ""
+    gear_active = "active" if view == "settings" else ""
+    # Chat frame stays blank until healthy; panel frame holds settings/modules.
+    chat_frame_class = "hidden"
+    panel_frame_class = "" if view == "settings" else "hidden"
+    panel_src = "/settings/content/" if view == "settings" else "about:blank"
+    landing_class = "" if view == "chat" else "hidden"
+
+    body = f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>{name}</title><style>{STYLE}</style>
+</head><body>
+<main class="app-shell">
+<header class="app-bar">
+<p class="brand">Lemonseed</p>
+<p class="title">{name}</p>
+<nav class="nav" aria-label="Main">
+  <a href="/" id="nav-chat" class="{chat_active}" data-view="chat">Chat</a>
+  <span class="disabled" title="Coming soon">Modules</span>
+</nav>
+<span class="spacer"></span>
+<div class="metrics" aria-hidden="true">
+  <div class="metric" title="System load (1 min)">
+    <label>Load</label>
+    <div class="bar"><span id="metric-load" style="width:0%"></span></div>
+  </div>
+  <div class="metric" title="Storage used on /var/lib/lemonseed">
+    <label>Storage</label>
+    <div class="bar"><span id="metric-storage" style="width:0%"></span></div>
+  </div>
+</div>
+<a href="/settings/" id="nav-settings" class="gear {gear_active}" title="Settings" data-view="settings">⚙</a>
+</header>
+<div class="frame-wrap">
+<div class="frame-fallback {landing_class}" id="chat-fallback">
+  <div class="landing">
+    <h2>Preparing chat</h2>
+    <p id="landing-lede">Lemonseed is downloading and starting the chat interface. This can take a few minutes on first boot.</p>
+    <p class="status-line wait" id="landing-status">ui: {escape(owui_state)}</p>
+  </div>
+</div>
+<iframe id="chat-frame" class="{chat_frame_class}" title="Chat" src="about:blank" allow="clipboard-read; clipboard-write"></iframe>
+<iframe id="panel-frame" class="{panel_frame_class}" title="Settings" src="{panel_src}"></iframe>
+</div>
+</main>
+<script>
+let currentView = {json.dumps(view)};
+let chatBootstrapped = false;
+let readyStreak = 0;
+const CHAT_SRC = '/?embed=1';
+const SETTINGS_SRC = '/settings/content/';
+
+function uiCopy(state, httpReady, error, reason) {{
+  if (state === 'ready' && httpReady) return ['Chat is ready.', 'ok'];
+  if (state === 'pulling') return ['Downloading the chat interface…', 'wait'];
+  if (state === 'starting' || state === 'busy') return ['Starting the chat interface…', 'wait'];
+  if (state === 'waiting') return [reason || 'Waiting for storage services…', 'wait'];
+  if (state === 'error') return [error || reason || 'Chat failed to start. Open Settings for diagnostics.', 'bad'];
+  return ['Preparing chat…', 'wait'];
+}}
+
+function showChatFrame() {{
+  const chat = document.getElementById('chat-frame');
+  const panel = document.getElementById('panel-frame');
+  const fallback = document.getElementById('chat-fallback');
+  panel.classList.add('hidden');
+  if (chatBootstrapped) {{
+    fallback.classList.add('hidden');
+    chat.classList.remove('hidden');
+  }} else {{
+    chat.classList.add('hidden');
+    fallback.classList.remove('hidden');
+  }}
+}}
+
+function showPanelFrame(src) {{
+  const chat = document.getElementById('chat-frame');
+  const panel = document.getElementById('panel-frame');
+  const fallback = document.getElementById('chat-fallback');
+  // Keep chat mounted (hidden) so OWUI / websockets stay alive.
+  chat.classList.add('hidden');
+  fallback.classList.add('hidden');
+  panel.classList.remove('hidden');
+  if (src && panel.src !== new URL(src, location.origin).href) {{
+    panel.src = src;
+  }}
+}}
+
+function setView(name, pushHistory) {{
+  currentView = name;
+  document.getElementById('nav-chat').classList.toggle('active', name === 'chat');
+  document.getElementById('nav-settings').classList.toggle('active', name === 'settings');
+  if (name === 'chat') {{
+    showChatFrame();
+    if (pushHistory) history.pushState({{view: name}}, '', '/');
+  }} else if (name === 'settings') {{
+    showPanelFrame(SETTINGS_SRC);
+    if (pushHistory) history.pushState({{view: name}}, '', '/settings/');
+  }}
+}}
+
+function ensureChatLoaded() {{
+  if (chatBootstrapped) return;
+  chatBootstrapped = true;
+  const chat = document.getElementById('chat-frame');
+  chat.src = CHAT_SRC;
+  if (currentView === 'chat') showChatFrame();
+}}
+
+async function gatewayReachable() {{
+  // End-to-end check through nginx (same path the SPA hits after embed).
+  try {{
+    const response = await fetch('/_app/version.json', {{cache: 'no-store'}});
+    return response.ok;
+  }} catch (_err) {{
+    return false;
+  }}
+}}
+
+document.getElementById('nav-chat').addEventListener('click', (ev) => {{
+  ev.preventDefault();
+  setView('chat', true);
+}});
+document.getElementById('nav-settings').addEventListener('click', (ev) => {{
+  ev.preventDefault();
+  setView('settings', true);
+}});
+window.addEventListener('popstate', () => {{
+  const path = location.pathname.replace(/\\/$/, '') || '/';
+  setView(path === '/settings' ? 'settings' : 'chat', false);
+}});
+
+async function refreshStatus() {{
+  try {{
+    const response = await fetch('/api/status', {{cache: 'no-store'}});
+    if (!response.ok) return;
+    const data = await response.json();
+    const telemetry = data.telemetry || {{}};
+    const loadEl = document.getElementById('metric-load');
+    const storageEl = document.getElementById('metric-storage');
+    if (loadEl && telemetry.load_pct != null) loadEl.style.width = telemetry.load_pct + '%';
+    if (storageEl && telemetry.storage_pct != null) storageEl.style.width = telemetry.storage_pct + '%';
+
+    const owui = (data.modules || {{}}).open_webui || {{}};
+    const ui = owui.state || 'idle';
+    const httpReady = !!owui.http_ready;
+    const lede = document.getElementById('landing-lede');
+    const status = document.getElementById('landing-status');
+    const [msg, cls] = uiCopy(ui, httpReady, owui.error, owui.reason);
+    if (lede) lede.textContent = msg;
+    if (status) {{
+      status.textContent = 'ui: ' + ui + (httpReady ? ' (healthy)' : '');
+      status.className = 'status-line ' + cls;
+    }}
+    if (ui === 'ready' && httpReady && await gatewayReachable()) {{
+      readyStreak += 1;
+    }} else {{
+      readyStreak = 0;
+    }}
+    // Two consecutive healthy polls + nginx can reach OWUI assets.
+    if (!chatBootstrapped && readyStreak >= 2) {{
+      ensureChatLoaded();
+    }}
+  }} catch (_err) {{}}
+}}
+setInterval(refreshStatus, 5000);
+refreshStatus();
+if (currentView === 'settings') showPanelFrame(SETTINGS_SRC);
+</script>
+</body></html>"""
+    return body.encode()
+
+
+def telemetry_snapshot() -> dict[str, Any]:
+    """Lightweight load + storage bars for the app toolbar."""
+    try:
+        load1, load5, load15 = os.getloadavg()
+    except OSError:
+        load1 = load5 = load15 = 0.0
+    cpu = hardware._cpu_info()
+    threads = max(1, int(cpu.get("threads") or cpu.get("cores") or 1))
+    load_pct = min(100, round(100 * load1 / threads))
+    storage = hardware._disk_free(Path("/var/lib/lemonseed"))
+    total = int(storage.get("total_bytes") or 0)
+    used = int(storage.get("used_bytes") or 0)
+    storage_pct = round(100 * used / total) if total else 0
+    return {
+        "load_pct": load_pct,
+        "load": {"1m": round(load1, 2), "5m": round(load5, 2), "15m": round(load15, 2)},
+        "storage_pct": storage_pct,
+        "storage_path": "/var/lib/lemonseed",
+    }
+
+
+def page_settings_content(snap: dict[str, Any]) -> bytes:
+    setup = load_setup()
     chat = snap.get("chat") or chat_ready.chat_snapshot()
     chat_state = str(chat.get("state") or "idle")
     display = escape(str(chat.get("display_name") or chat.get("model_id") or "—"))
@@ -587,16 +883,24 @@ def page_ready(snap: dict[str, Any]) -> bytes:
     if not gpu_rows:
         gpu_rows = '<div class="row"><span class="name">gpu</span><span class="state wait">none detected</span></div>'
 
+    mods = snap.get("modules") or modules.modules_snapshot()
+    owui = mods.get("open_webui") or {}
+    owui_state = escape(str(owui.get("state") or "idle"))
+    owui_class = "ok" if owui.get("state") == "ready" else ("bad" if owui.get("state") == "error" else "wait")
+
     body = f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>{name}</title><style>{STYLE}</style>
-</head><body><main class="shell">
-<p class="wordmark">Lemonseed</p>
-<h1>{name}</h1>
-<p class="lede">Appliance is online. Local inference runs on this machine; a household chat UI comes in a later milestone.</p>
+<title>Settings</title><style>{STYLE}</style>
+</head><body><main class="embed-shell">
+<h1>Settings</h1>
 <section class="panel">
-<h2>Local chat</h2>
+<h2>Chat</h2>
+<div class="row"><span class="name">open webui</span><span class="state {owui_class}">{owui_state}</span></div>
+<div class="row"><span class="name">path</span><span class="state ok">/?embed=1</span></div>
+</section>
+<section class="panel">
+<h2>Local inference</h2>
 <div class="row"><span class="name">status</span><span class="state {chat_class}" id="chat-state">{chat_label}</span></div>
 <div class="row"><span class="name">model</span><span class="state ok" id="chat-model">{display}</span></div>
 <p class="lede" id="chat-lede">{chat_lede}</p>
@@ -614,6 +918,7 @@ def page_ready(snap: dict[str, Any]) -> bytes:
 <p class="lede" id="chat-reason">{reason}</p>
 <p class="lede"><a style="color:var(--accent)" href="/api/hardware">/api/hardware</a> ·
 <a style="color:var(--accent)" href="/api/chat">/api/chat</a> ·
+<a style="color:var(--accent)" href="/api/modules">/api/modules</a> ·
 <a style="color:var(--accent)" href="/api/status">/api/status</a></p>
 </details>
 </section>
@@ -728,6 +1033,7 @@ def complete_setup(name: str, timezone: str) -> None:
     marker.write_text(payload["completed_at"] + "\n", encoding="utf-8")
     marker.replace(SETUP_COMPLETE_FILE)
     chat_ready.ensure_chat_worker()
+    modules.ensure_module_worker()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -773,10 +1079,16 @@ class Handler(BaseHTTPRequestHandler):
             data_services.ensure_provision_worker()
             self._json(200, data_services.data_snapshot())
             return
+        if path == "/api/modules":
+            data_services.ensure_provision_worker()
+            modules.ensure_module_worker()
+            self._json(200, modules.modules_snapshot())
+            return
         if path == "/api/status":
             maybe_complete_mdns_handoff(self)
             chat_ready.ensure_chat_worker()
             data_services.ensure_provision_worker()
+            modules.ensure_module_worker()
             boot = boot_snapshot()
             setup = load_setup()
             self._json(
@@ -788,9 +1100,43 @@ class Handler(BaseHTTPRequestHandler):
                     "setup": setup,
                     "chat": chat_ready.chat_snapshot(),
                     "data": data_services.data_snapshot(),
+                    "modules": modules.modules_snapshot(),
+                    "telemetry": telemetry_snapshot(),
                     "portal_url": f"http://{primary_mdns_slug()}.local/",
                 },
             )
+            return
+        if path in ("/settings/content", "/settings/content/"):
+            if redirect_off_factory_mdns(self, "/settings/"):
+                return
+            if not setup_complete():
+                self.send_response(302)
+                self.send_header("Location", "/setup")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            snap = boot_snapshot()
+            snap["chat"] = chat_ready.chat_snapshot()
+            snap["hardware"] = hardware.collect_hardware()
+            snap["modules"] = modules.modules_snapshot()
+            self._send(200, page_settings_content(snap), "text/html; charset=utf-8")
+            return
+        if path in ("/settings", "/settings/"):
+            if redirect_off_factory_mdns(self, "/settings/"):
+                return
+            if not setup_complete():
+                self.send_response(302)
+                self.send_header("Location", "/setup")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            snap = boot_snapshot()
+            snap["chat"] = chat_ready.chat_snapshot()
+            snap["hardware"] = hardware.collect_hardware()
+            snap["modules"] = modules.modules_snapshot()
+            chat_ready.ensure_chat_worker()
+            modules.ensure_module_worker()
+            self._send(200, page_shell(snap, view="settings"), "text/html; charset=utf-8")
             return
         if path in ("/", "/index.html", "/setup"):
             if redirect_off_factory_mdns(self, path if path != "/index.html" else "/"):
@@ -798,14 +1144,18 @@ class Handler(BaseHTTPRequestHandler):
             snap = boot_snapshot()
             snap["chat"] = chat_ready.chat_snapshot()
             snap["hardware"] = hardware.collect_hardware()
+            snap["data"] = data_services.data_snapshot()
+            snap["modules"] = modules.modules_snapshot()
             setup = load_setup()
             review_required = (
                 not setup_complete()
                 or setup.get("confirmed_version") != appliance_version()
             )
-            if setup_complete() and snap["startup_ready"] and not review_required:
+            if setup_complete() and not review_required:
                 chat_ready.ensure_chat_worker()
-                self._send(200, page_ready(snap), "text/html; charset=utf-8")
+                modules.ensure_module_worker()
+                # Shell is available even while startup_ready is still warming up.
+                self._send(200, page_shell(snap), "text/html; charset=utf-8")
             else:
                 self._send(
                     200,
@@ -853,6 +1203,7 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     chat_ready.ensure_chat_worker()
     data_services.ensure_provision_worker()
+    modules.ensure_module_worker()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"appliance-control-plane listening on http://{HOST}:{PORT}", flush=True)
     server.serve_forever()

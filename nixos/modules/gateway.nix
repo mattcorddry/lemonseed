@@ -1,4 +1,4 @@
-# Public HTTP gateway: nginx :80 → control plane :8080, plus mDNS.
+# Public HTTP gateway: nginx :80 → Lemonseed shell + Open WebUI + CP APIs.
 
 { pkgs, ... }:
 
@@ -53,17 +53,90 @@ let
       exec python3 ${../../scripts/lemonseed-avahi-alias.py}
     '';
   };
+
+  # Default blue slot until CP flips after health-check.
+  defaultOwuiUpstream = pkgs.writeText "owui-upstream.conf" ''
+    upstream lemonseed_owui {
+      server 127.0.0.1:18080;
+    }
+  '';
+
+  seedOwuiUpstream = pkgs.writeShellApplication {
+    name = "lemonseed-owui-upstream-seed";
+    runtimeInputs = [ pkgs.coreutils ];
+    text = ''
+      set -euo pipefail
+      install -d -m 0755 /run/lemonseed
+      if [[ ! -s /run/lemonseed/owui-upstream.conf ]]; then
+        install -m 0644 ${defaultOwuiUpstream} /run/lemonseed/owui-upstream.conf
+      fi
+    '';
+  };
+
+  cpProxy = ''
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+    proxy_read_timeout 3600s;
+  '';
+
+  # OWUI serves root-absolute /_app, /api/v1, etc. Catch-all goes to OWUI;
+  # Lemonseed keeps exact / (document navigations) + reserved /api/* + /settings + /setup.
+  # Iframe navigations to / must hit OWUI at path / — otherwise SvelteKit sees /chat/ and 404s.
+  owuiProxy = ''
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_buffering off;
+    proxy_hide_header X-Frame-Options;
+    proxy_hide_header Content-Security-Policy;
+  '';
+
+  # Containers reach host-local lemond via host.docker.internal:80 (not :13305).
+  # Allow Docker private bridge ranges only — not typical LAN (192.168/16).
+  lemondProxy = ''
+    allow 127.0.0.0/8;
+    allow 172.16.0.0/12;
+    deny all;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header Authorization $http_authorization;
+    proxy_pass_header Authorization;
+    proxy_read_timeout 3600s;
+    proxy_buffering off;
+  '';
+
+  rootProxy = ''
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_buffering off;
+    proxy_hide_header X-Frame-Options;
+    proxy_hide_header Content-Security-Policy;
+  '';
 in
 {
   networking.firewall.allowedTCPPorts = [ 80 ];
   networking.firewall.allowedUDPPorts = [ 5353 ];
 
-  # With networking.hostName empty, avahi-daemon.conf omits host-name= and the
-  # daemon tracks the live system hostname that lemonseed-identity applied.
-  # Primary advertisement is always <slug>.local. During install/reinstall
-  # handoff only, lemonseed-avahi-alias may briefly publish lemonseed.local as a
-  # CNAME so the installer can discover a renamed appliance; it releases that
-  # name as soon as handoff completes (see /run/lemonseed/mdns-handoff-done).
   services.avahi = {
     enable = true;
     nssmdns4 = true;
@@ -110,7 +183,6 @@ in
     };
   };
 
-  # Long-lived: Avahi retracts D-Bus EntryGroup records when the client exits.
   systemd.services.lemonseed-avahi-alias = {
     description = "Temporary lemonseed.local CNAME for installer handoff";
     wantedBy = [ "multi-user.target" ];
@@ -122,7 +194,6 @@ in
     serviceConfig = {
       Type = "simple";
       ExecStart = "${avahiAlias}/bin/lemonseed-avahi-alias";
-      # Exit 0 when handoff is done or not needed — do not keep claiming lemonseed.local.
       Restart = "on-failure";
       RestartSec = "3s";
       StandardOutput = "journal+console";
@@ -130,13 +201,40 @@ in
     };
   };
 
-  # Phase 1 gateway: reverse-proxy everything to the control plane.
-  # After first-boot setup completes we will swap this for auth + module
-  # routing (Open WebUI, etc.) while keeping :80 as the only public entry.
+  systemd.services.lemonseed-owui-upstream-seed = {
+    description = "Seed Open WebUI nginx upstream file";
+    wantedBy = [ "multi-user.target" ];
+    before = [ "nginx.service" ];
+    after = [ "local-fs.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      ExecStart = "${seedOwuiUpstream}/bin/lemonseed-owui-upstream-seed";
+    };
+  };
+
   services.nginx = {
     enable = true;
     recommendedProxySettings = true;
     recommendedGzipSettings = true;
+    # Errors already default to stderr → journald; keep explicit.
+    logError = "stderr";
+    appendHttpConfig = ''
+      include /run/lemonseed/owui-upstream.conf;
+      # Access logs via syslog socket → journald (no /var/log/nginx files).
+      access_log syslog:server=unix:/dev/log,nohostname,tag=nginx;
+
+      # Top-level / → Lemonseed shell; iframe (or ?embed=1) → Open WebUI at path /.
+      # OWUI is a root SPA — serving it under /chat/ makes the client router 404.
+      map "$http_sec_fetch_dest:$arg_embed" $lemonseed_root_upstream {
+        default      http://127.0.0.1:8080;
+        "iframe:"    http://lemonseed_owui;
+        "iframe:1"   http://lemonseed_owui;
+        ":1"         http://lemonseed_owui;
+        "empty:1"    http://lemonseed_owui;
+        "document:1" http://lemonseed_owui;
+      }
+    '';
     virtualHosts."lemonseed" = {
       default = true;
       listen = [
@@ -145,32 +243,118 @@ in
           port = 80;
         }
       ];
-      locations."/" = {
-        proxyPass = "http://127.0.0.1:8080";
+
+      # Exact root: shell for browsers, OWUI for the app iframe.
+      locations."= /" = {
         extraConfig = ''
-          proxy_http_version 1.1;
-          proxy_set_header Upgrade $http_upgrade;
-          proxy_set_header Connection $connection_upgrade;
-          proxy_read_timeout 3600s;
+          proxy_pass $lemonseed_root_upstream;
+          ${rootProxy}
         '';
+      };
+      locations."= /index.html" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = cpProxy;
+      };
+      locations."= /setup" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = cpProxy;
+      };
+      locations."= /healthz" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = cpProxy;
+      };
+      locations."= /health" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = cpProxy;
+      };
+      locations."/settings/" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = cpProxy;
+      };
+      locations."= /settings" = {
+        return = "302 /settings/";
+      };
+
+      # Reserved Lemonseed JSON APIs (must win over OWUI /api/*).
+      locations."= /api/boot" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = cpProxy;
+      };
+      locations."= /api/status" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = cpProxy;
+      };
+      locations."= /api/hardware" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = cpProxy;
+      };
+      locations."= /api/plan" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = cpProxy;
+      };
+      locations."= /api/data" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = cpProxy;
+      };
+      locations."= /api/modules" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = cpProxy;
+      };
+      locations."= /api/chat" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = cpProxy;
+      };
+
+      # Internal lemond proxy for modules on the lemon network (not LAN-facing).
+      locations."/_lemonseed/lemond/" = {
+        proxyPass = "http://127.0.0.1:13305/";
+        extraConfig = lemondProxy;
+      };
+
+      # Legacy iframe entry → embed at / (OWUI root SPA path).
+      locations."= /chat" = {
+        return = "302 /?embed=1";
+      };
+      locations."= /chat/" = {
+        return = "302 /?embed=1";
+      };
+
+      # Socket.IO / websockets (explicit; Upgrade headers already in owuiProxy).
+      locations."/ws/" = {
+        proxyPass = "http://lemonseed_owui";
+        extraConfig = owuiProxy;
+      };
+
+      # Everything else (SPA assets, OWUI /api/v1, /c/…, …) → Open WebUI.
+      locations."/" = {
+        proxyPass = "http://lemonseed_owui";
+        extraConfig = owuiProxy;
       };
     };
   };
 
-  # Bring the portal up as soon as the network stack is usable.
   systemd.services.nginx = {
     after = [
       "network-online.target"
       "appliance-control-plane.service"
+      "lemonseed-owui-upstream-seed.service"
     ];
     wants = [
       "network-online.target"
       "appliance-control-plane.service"
+      "lemonseed-owui-upstream-seed.service"
     ];
   };
+
+  # No on-disk nginx access/error logs — nothing for logrotate to manage.
+  services.logrotate.settings.nginx.enable = false;
 
   systemd.services.avahi-daemon = {
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
   };
+
+  systemd.tmpfiles.rules = [
+    "d /run/lemonseed 0755 root root -"
+  ];
 }

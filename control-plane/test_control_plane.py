@@ -359,6 +359,29 @@ class StubHttpTests(unittest.TestCase):
         self.assertEqual(data["valkey"]["state"], "ready")
         _worker.assert_called_once()
 
+    @mock.patch.object(stub.modules, "ensure_module_worker")
+    @mock.patch.object(stub.modules, "modules_snapshot")
+    @mock.patch.object(stub.data_services, "ensure_provision_worker")
+    def test_api_modules(
+        self,
+        _prov: mock.Mock,
+        snap: mock.Mock,
+        _worker: mock.Mock,
+    ) -> None:
+        snap.return_value = {
+            "open_webui": {
+                "state": "ready",
+                "path": "/chat/",
+                "port": 18080,
+                "http_ready": True,
+            }
+        }
+        code, body = self._get("/api/modules")
+        self.assertEqual(code, 200)
+        data = json.loads(body.decode())
+        self.assertEqual(data["open_webui"]["path"], "/chat/")
+        _worker.assert_called_once()
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main(verbosity=2))

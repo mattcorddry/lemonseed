@@ -221,4 +221,15 @@ assert vk == "ready", data
 assert prov == "ready", data
 '
 
+echo "==> Checking /api/modules (OWUI lifecycle; may still be pulling)"
+modules_json="$(poll_http "/api/modules" 30)"
+echo "${modules_json}" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+owui = data.get("open_webui") or {}
+assert "state" in owui, data
+assert owui.get("path") == "/?embed=1", data
+print("OK: open_webui state=%r path=%r" % (owui.get("state"), owui.get("path")))
+'
+
 echo "==> QEMU API smoke test PASSED"

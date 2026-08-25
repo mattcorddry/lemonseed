@@ -69,10 +69,10 @@ Lemonseed is a **local, multi-user home AI hub** — not a cloud client and not 
 | **M4 — USB installer** | **Nearly done** — install + portal + first-boot setup; polish remaining |
 | **M4.1 — Preserve known user-data on reinstall** | **Done** — namespaced storage identity; preserve checkbox; layout-compatible reinstall |
 | **M5 — Hardware-aware local chat** | **Done** — `lemond` + NVIDIA/CUDA; inventory + catalog planner + CP pull/load/pin + portal “Local chat ready”; unit tests + QEMU API smoke |
-| **M6 — Open WebUI household UX** | **In progress** — M6.0a data plane done; next Open WebUI on Postgres (auth later via nginx) |
+| **M6 — Open WebUI household UX** | **In progress** — M6.1 done (shell + OWUI + Lemonade); next M6.2 auth or M6.3 OWUI expansion |
 | **M6+ (later)** | Conduit/mobile polish, AMD/UMA profiles, heterogeneous GPU planner, encryption, offline install, Secure Boot/TPM |
 
-**Immediate next step:** M6.1 — Open WebUI as Docker module on Postgres with auth disabled, wired to Lemonade; blue/green update path.
+**Immediate next step:** Short **M6.3a** OWUI policy seeding (no auth required), then **M6.2** nginx proxy auth before multi-user / shared-LAN features — or jump to M6.2 first if LAN trust is the next product risk.
 
 ### M6 — Open WebUI as primary UX (decided)
 
@@ -86,7 +86,8 @@ Lemonseed is a **local, multi-user home AI hub** — not a cloud client and not 
 
 **Locked architecture:**
 - Inference stays **headless `lemond` in SquashFS** on `127.0.0.1:13305` (API key from CP).
-- Open WebUI runs as a **Docker module**; nginx :80 is the only LAN entry.
+- Open WebUI runs as a **Docker module** managed by the control plane; nginx :80 is the only LAN entry.
+- **Primary UX** is a **Lemonseed app shell** (CP-served) that embeds Open WebUI in an iframe — not DOM injection into OWUI, and not “OWUI as the whole product.”
 - **Module and CP durable state** live in shared **PostgreSQL** (and **Valkey** where needed) — not bind-mounted SQLite files inside containers.
 - CP owns catalog, model load, `chat-ready`, module lifecycle, DB/credential provisioning, and (later) Lemonseed user sessions at nginx.
 
@@ -96,17 +97,19 @@ Browser / Conduit (later)
         ▼
    nginx :80  ── routing now; proxy auth later (not OAuth inside modules)
         │
-        ├── /              → Open WebUI (primary)
+        ├── /              → Lemonseed shell (document) or OWUI (iframe / ?embed=1)
         ├── /settings/…    → control plane portal (admin, status)
-        └── /api/…         → CP JSON API
+        ├── /setup, /healthz, /api/{boot,status,…} → CP
+        └── /*             → Open WebUI (assets, /api/v1, /c/…, websockets)
 
-Open WebUI (Docker) ──► lemond :13305/v1
-                     └──► PostgreSQL (+ pgvector), Valkey (CP-provisioned creds)
+Open WebUI (Docker) ──► nginx /_lemonseed/lemond/ ──► lemond 127.0.0.1:13305/v1
+                     └──► PostgreSQL (+ pgvector)
 
 CP ──► PostgreSQL (appliance + module metadata, users when auth lands)
 SearXNG / ComfyUI ──► sidecar modules when enabled (VRAM/policy)
 ```
 
+**Shell chrome (M6.1):** thin brand bar, Chat / Modules nav, settings gear, load/storage meters; Open WebUI kept alive in a background iframe when switching tabs.
 #### Shared data & module infrastructure
 
 **Principle:** minimize **bind-mounted application state** in module containers. Chat history, OWUI config, embeddings metadata, CP module registry, and (later) user records belong in **managed databases** on user-data — not opaque host directory trees per container.
@@ -120,9 +123,11 @@ SearXNG / ComfyUI ──► sidecar modules when enabled (VRAM/policy)
 | **Object storage (later)** | Large blobs (uploads, generated images) may still use `/var/lib/lemonseed/` paths — but **metadata and indexes in Postgres** |
 
 **Layout (direction):**
-- Data services run as **CP-managed containers or systemd-backed services** on user-data (`/var/lib/lemonseed/data/` for PG data dir, backups, WAL archive target).
-- CP **provisions per-module** (and per-service) **database + role + password**; secrets injected at container start — not checked into config.
-- **Backups:** Postgres `pg_dump`/basebackup on a schedule; Valkey snapshot policy TBD; both participate in preserve-on-reinstall user-data story.
+- Data services and app modules run on the user-defined Docker network **`lemon`**.
+- Host-facing ports bind **only** to `127.0.0.1` (CP / nginx); never `0.0.0.0` or LAN NICs.
+- Inter-container traffic uses Docker DNS names (e.g. `lemonseed-postgres`); host processes use localhost publishes.
+- CP **provisions per-module** database + role + password; secrets injected at container start — not checked into config.
+- **Backups:** Postgres `pg_dump`/basebackup on a schedule; Valkey snapshot policy TBD; both participate in preserve-on-reinstall user-data story (see backlog: backup/restore).
 - **Bind mounts:** limited to secrets drop-ins, read-only config seeds, and **large media** — not primary OLTP state.
 
 **Module update strategy (blue/green):**
@@ -136,7 +141,7 @@ Failed health-check → old container keeps serving; appliance stays up.
 
 #### Gateway & auth
 
-**M6.1 (now):** **Fully disable Open WebUI authentication** — no OWUI login screen, no OAuth hooks inside the module. LAN access matches current bring-up trust model until nginx auth ships.
+**M6.1 (done):** **Fully disable Open WebUI authentication** — no OWUI login screen, no OAuth hooks inside the module. LAN access matches current bring-up trust model until nginx auth ships.
 
 **M6.2+ (planned):** **Proxy-style auth in nginx only** — Lemonseed user management validates the session at the edge; trusted identity forwarded to upstreams via headers (exact header scheme TBD). **Do not** delegate OAuth/OpenID to each container; modules stay auth-naive behind nginx.
 
@@ -190,25 +195,31 @@ Default appliance image: **no** community plugins until reviewed; optional “en
 |-------|-------------|
 | **M6.0** | **Done** — UX decision recorded (this section) |
 | **M6.0a** | **Done** — shared PostgreSQL (+ pgvector) + Valkey; CP credential provisioning; CP state in Postgres; QEMU + hardware smoke |
-| **M6.1** | Open WebUI on Postgres; **auth disabled**; Lemonade backend wired; blue/green update path |
-| **M6.2** | nginx **proxy auth** (Lemonseed sessions); OWUI remains authless behind nginx; portal “Open chat” CTA |
-| **M6.3** | OWUI policy seeding; SearXNG sidecar; family calendar/channel defaults |
+| **M6.1** | **Done** — Open WebUI on Postgres; auth disabled; Lemonade wired; Lemonseed shell + blue/green; durable chat history |
+| **M6.2** | nginx **proxy auth** (Lemonseed sessions); OWUI remains authless behind nginx |
+| **M6.3** | OWUI policy seeding; SearXNG sidecar; calendar/channel defaults |
 | **M6.4** | Household smoke; `make test` green |
 | **M6+** | Conduit mobile, ComfyUI VRAM gating, multi-model tiers, vetted community plugins |
 
-**Backlog (not current milestone):** CP API status fields (`/api/data`, `/api/status`, subsystem snapshots) should report **current health** via cheap live checks (e.g. `pg_isready` / `SELECT 1`, Valkey PING, HTTP ready), not a one-shot or cached reflection of “daemon started once.” If Postgres stops accepting connections after boot, the API should flip to unhealthy. Apply the same pattern to other subsystems as low-cost probes become available.
+**Sequencing M6.2 vs OWUI expansion (M6.3):** Prefer a short **M6.3a policy-seed** pass (autocomplete off, automations on, workspace defaults, Lemonseed system prompt) that does not need auth, then **M6.2 proxy auth** before multi-user / shared-LAN features that assume distinct people. **SearXNG**, channels/calendar, and ComfyUI wait until after auth if they create shared durable state or widen the attack surface on an open LAN. If the next demo is still single-trust LAN, finishing M6.3a then SearXNG before auth is acceptable — do not block light OWUI polish on M6.2.
+
+**Backlog (not current milestone):**
+
+- **Live API health:** CP status fields (`/api/data`, `/api/status`, subsystem snapshots) should report **current health** via cheap live checks (e.g. `pg_isready` / `SELECT 1`, Valkey PING, HTTP ready), not a one-shot or cached reflection of “daemon started once.” If Postgres stops accepting connections after boot, the API should flip to unhealthy.
+- **Module catalog specs:** Define a Lemonseed **module configuration file** (one file per module under a catalog directory in-tree). Each spec encapsulates execution params (docker-compose fragment / pinned image), UX (logo, name, description, help), and dependencies (Postgres, Valkey, future object store). Catalog entries are what users see and what the CP downloads/sets up. The catalog itself needs a **test/release cycle**: pull candidate images → integration test → advance the version pin only when validated.
+- **Backup / restore:** Transactionally clean, space/time-efficient backup including Postgres dump, Valkey dump, and per-module **durable** volumes declared in the module spec. Targets: USB (preflight free-space check; optional encryption) and local SMB/NAS shares.
 
 #### M6 acceptance checklist
 
 - [x] Written UX decision: Open WebUI primary; NanoClaw-style UI deferred
 - [x] Shared Postgres (+ pgvector) + Valkey; minimal bind-mount module state
-- [ ] Open WebUI runs as Docker module on Postgres; `lemond` stays localhost-only
-- [ ] Open WebUI auth **disabled** (M6.1); nginx proxy auth deferred to M6.2
-- [ ] Blue/green module updates with health-check before cutover
-- [ ] Portal single entry point (“Open chat”)
+- [x] Open WebUI runs as Docker module on Postgres; `lemond` stays localhost-only
+- [x] Open WebUI auth **disabled** (M6.1); nginx proxy auth deferred to M6.2
+- [x] Blue/green module updates with health-check before cutover
+- [x] Lemonseed shell at `/` embeds Open WebUI (supersedes portal “Open chat” CTA)
 - [ ] Policy defaults applied (autocomplete off, automations on, workspace off, etc.)
-- [ ] `make test` still green
-- [ ] No second co-equal “main” UI shipped by default
+- [x] `make test` still green
+- [x] No second co-equal “main” UI shipped by default (shell embeds OWUI)
 
 ### M3 verification
 
@@ -605,7 +616,7 @@ Final mount flags per path will be tightened during bring-up; principle: **`noex
 ### HTTP gateway (M4+)
 - **Public entry is always nginx on :80** (firewall opens 80; CP stays loopback-only).
 - **Phase 1 (first boot / unset appliance):** nginx is a straight reverse proxy to `127.0.0.1:8080`. The CP serves a **no-login** readiness + setup wizard (`/`, `/setup`, `/api/boot`). Completing setup writes `/etc/appliance-setup-complete` (+ JSON state).
-- **Phase 2 (post-setup):** nginx vhost gains **module routing** immediately; **proxy auth** at nginx when Lemonseed user management is ready (M6.2). Modules (Open WebUI, etc.) stay **auth-naive** — no per-container OAuth. Phase 1 straight-proxy config is intentionally throwaway.
+- **Phase 2 (post-setup / M6.1+):** nginx routes document `/` → Lemonseed shell (CP); **iframe** `/` (or `/?embed=1`) → Open WebUI at path `/` (root SPA — must not be mounted under `/chat/` or the client router 404s); catch-all → Open WebUI (assets/`/api/v1`/`/ws/`); reserved `/settings/`, `/setup`, `/healthz`, and Lemonseed `/api/{boot,status,…}` → CP. Reloadable upstream file enables blue/green. **Proxy auth** at nginx when Lemonseed user management is ready (M6.2). Modules stay **auth-naive**.
 - **mDNS:** Avahi publishes the slug of the appliance **Name** from setup (`Matt Lemonseed 1` → `matt-lemonseed-1.local`). Before setup the name defaults to `Lemonseed`, so a fresh appliance is reachable at `lemonseed.local` for the installer hand-off. After a preserve reinstall of a **renamed** appliance, `lemonseed-avahi-alias` briefly publishes `lemonseed.local` as a CNAME so the installer can discover the box; the installer (and any leftover `lemonseed.local` hit) then redirects to `<slug>.local` and the alias is released (`/run/lemonseed/mdns-handoff-done`). Fully confirmed appliances never claim `lemonseed.local`, so multiple units can share a LAN.
 - **Appliance identity (one name, not two):** setup collects a single user-facing **Name**; its slug is the system hostname, the mDNS name, and the hostname dhcpcd advertises. `networking.hostName` is therefore **empty** in the NixOS config — a non-empty value makes `/etc/hostname` a read-only store symlink and pins `host-name=` in `avahi-daemon.conf`, both of which would defeat the chosen name. `lemonseed-identity.service` seeds `/etc/hostname` on `@etc` (from `/etc/appliance-setup.json`, else the existing value, else `lemonseed`) before dhcpcd/Avahi start.
 - **Name collisions:** setup resolves `<slug>.local` over mDNS before offering a default; if another host owns it, the suggested name becomes `Lemonseed 2` (editable), and submitting a name owned by a different host is rejected. Avahi's effective hostname (queried over D-Bus, including any collision suffix) identifies our own announcement; IP comparison is only a fallback because DHCP leases can change. Multiple appliances therefore never share one advertised name.
@@ -778,5 +789,5 @@ Historical M1 checklist (kept for archive):
 - [x] Shared Postgres + Valkey + pgvector; minimal bind mounts; blue/green module updates
 - [x] Auth: OWUI disabled for M6.1; nginx proxy auth planned (not container OAuth)
 - [x] M6.0a data services + CP credential provisioning
-- [ ] M6.1 Open WebUI on Postgres + Lemonade backend
+- [x] M6.1 Open WebUI on Postgres + Lemonade backend + Lemonseed shell
 - [ ] M6.2 nginx proxy auth

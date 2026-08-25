@@ -5,10 +5,16 @@ set -euo pipefail
 TTY="${1:-/dev/tty4}"
 
 addresses() {
-  ip -4 -o addr show up scope global 2>/dev/null \
-    | awk '$2 !~ /^docker/ {print $4}' \
-    | cut -d/ -f1 \
-    || true
+  local iface addr
+  for iface in $(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}'); do
+    case "$iface" in
+      eth*|en*|wlan*|wl*) ;;
+      *) continue ;;
+    esac
+    while read -r addr; do
+      [[ -n "$addr" && "$addr" != 169.254.* ]] && printf '%s\n' "$addr"
+    done < <(ip -4 -o addr show dev "$iface" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+  done
 }
 
 portal_url() {

@@ -1,5 +1,6 @@
 # Shared PostgreSQL (+ pgvector) and Valkey for M6 module state.
-# Localhost-only; data under /var/lib/lemonseed/data/ on user-data.
+# All Lemonseed containers join the user-defined Docker network "lemon".
+# Host-facing ports bind only to 127.0.0.1 (never 0.0.0.0 / LAN NICs).
 
 { config, lib, pkgs, ... }:
 
@@ -15,6 +16,7 @@ let
   valkeyImage = "valkey/valkey:8-alpine";
   postgresContainer = "lemonseed-postgres";
   valkeyContainer = "lemonseed-valkey";
+  lemonNetwork = "lemon";
 
   init = pkgs.writeShellApplication {
     name = "lemonseed-data-init";
@@ -40,34 +42,66 @@ EOF
     '';
   };
 
-  postgresStart = pkgs.writeShellApplication {
-    name = "lemonseed-postgres-start";
+  ensureNetwork = pkgs.writeShellApplication {
+    name = "lemonseed-docker-network";
     runtimeInputs = with pkgs; [ coreutils docker ];
     text = ''
       set -euo pipefail
-      if docker ps --format '{{.Names}}' | grep -qx ${postgresContainer}; then
-        mode="$(docker inspect -f '{{.HostConfig.NetworkMode}}' ${postgresContainer} 2>/dev/null || true)"
-        if [[ "$mode" == "host" ]]; then
-          exit 0
-        fi
-        docker rm -f ${postgresContainer} >/dev/null
-      elif docker ps -a --format '{{.Names}}' | grep -qx ${postgresContainer}; then
-        mode="$(docker inspect -f '{{.HostConfig.NetworkMode}}' ${postgresContainer} 2>/dev/null || true)"
-        if [[ "$mode" == "host" ]]; then
-          exec docker start ${postgresContainer}
-        fi
-        docker rm -f ${postgresContainer} >/dev/null
+      if docker network inspect ${lemonNetwork} >/dev/null 2>&1; then
+        exit 0
       fi
-      # Host networking so CP connections appear as 127.0.0.1 (published ports
-      # otherwise show up as Docker bridge 172.17.0.1 and fail pg_hba).
+      docker network create --driver bridge ${lemonNetwork}
+    '';
+  };
+
+  # Recreate when not on lemon, or host publish is missing / not loopback-only.
+  containerNeedsRecreate = ''
+    needs_recreate() {
+      local name="$1"
+      local host_port="$2"
+      if ! docker ps -a --format '{{.Names}}' | grep -qx "$name"; then
+        return 1
+      fi
+      local mode ports
+      mode="$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$name" 2>/dev/null || true)"
+      ports="$(docker inspect -f '{{json .HostConfig.PortBindings}}' "$name" 2>/dev/null || true)"
+      if [[ "$mode" != "${lemonNetwork}" ]]; then
+        return 0
+      fi
+      # Require an explicit 127.0.0.1 publish (never 0.0.0.0 / empty HostIp).
+      if ! grep -Fq '"HostIp":"127.0.0.1"' <<<"$ports"; then
+        return 0
+      fi
+      if ! grep -Fq "\"HostPort\":\"$host_port\"" <<<"$ports"; then
+        return 0
+      fi
+      return 1
+    }
+  '';
+
+  postgresStart = pkgs.writeShellApplication {
+    name = "lemonseed-postgres-start";
+    runtimeInputs = with pkgs; [ coreutils docker gnugrep ];
+    text = ''
+      set -euo pipefail
+      ${containerNeedsRecreate}
+      # Inside the container Postgres may listen on *; exposure to the host is
+      # only via -p 127.0.0.1:5432:5432 (never 0.0.0.0 on the host).
+      if needs_recreate ${postgresContainer} 5432; then
+        docker rm -f ${postgresContainer} >/dev/null
+      elif docker ps --format '{{.Names}}' | grep -qx ${postgresContainer}; then
+        exit 0
+      elif docker ps -a --format '{{.Names}}' | grep -qx ${postgresContainer}; then
+        exec docker start ${postgresContainer}
+      fi
       exec docker run -d \
         --name ${postgresContainer} \
         --restart unless-stopped \
-        --network host \
+        --network ${lemonNetwork} \
+        -p 127.0.0.1:5432:5432 \
         -v ${postgresData}:/var/lib/postgresql/data \
         --env-file ${postgresEnv} \
-        ${postgresImage} \
-        -c listen_addresses=127.0.0.1
+        ${postgresImage}
     '';
   };
 
@@ -82,29 +116,27 @@ EOF
 
   valkeyStart = pkgs.writeShellApplication {
     name = "lemonseed-valkey-start";
-    runtimeInputs = with pkgs; [ coreutils docker ];
+    runtimeInputs = with pkgs; [ coreutils docker gnugrep ];
     text = ''
       set -euo pipefail
-      if docker ps --format '{{.Names}}' | grep -qx ${valkeyContainer}; then
-        mode="$(docker inspect -f '{{.HostConfig.NetworkMode}}' ${valkeyContainer} 2>/dev/null || true)"
-        if [[ "$mode" == "host" ]]; then
-          exit 0
-        fi
+      ${containerNeedsRecreate}
+      # Bind all interfaces *inside* the container so peers on "lemon" can
+      # connect; host publish stays 127.0.0.1-only.
+      if needs_recreate ${valkeyContainer} 6379; then
         docker rm -f ${valkeyContainer} >/dev/null
+      elif docker ps --format '{{.Names}}' | grep -qx ${valkeyContainer}; then
+        exit 0
       elif docker ps -a --format '{{.Names}}' | grep -qx ${valkeyContainer}; then
-        mode="$(docker inspect -f '{{.HostConfig.NetworkMode}}' ${valkeyContainer} 2>/dev/null || true)"
-        if [[ "$mode" == "host" ]]; then
-          exec docker start ${valkeyContainer}
-        fi
-        docker rm -f ${valkeyContainer} >/dev/null
+        exec docker start ${valkeyContainer}
       fi
       exec docker run -d \
         --name ${valkeyContainer} \
         --restart unless-stopped \
-        --network host \
+        --network ${lemonNetwork} \
+        -p 127.0.0.1:6379:6379 \
         -v ${valkeyData}:/data \
         ${valkeyImage} \
-        valkey-server --bind 127.0.0.1 --save 60 1 --loglevel warning
+        valkey-server --save 60 1 --loglevel warning
     '';
   };
 
@@ -125,6 +157,7 @@ in
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [
       init
+      ensureNetwork
       postgresStart
       postgresStop
       valkeyStart
@@ -135,6 +168,7 @@ in
       description = "Initialize Lemonseed data service directories and secrets";
       wantedBy = [ "multi-user.target" ];
       before = [
+        "lemonseed-docker-network.service"
         "lemonseed-postgres.service"
         "lemonseed-valkey.service"
       ];
@@ -146,15 +180,34 @@ in
       };
     };
 
+    systemd.services.lemonseed-docker-network = {
+      description = "Ensure Lemonseed Docker network (lemon)";
+      wantedBy = [ "multi-user.target" ];
+      after = [
+        "docker.service"
+        "lemonseed-data-init.service"
+      ];
+      wants = [ "docker.service" ];
+      before = [
+        "lemonseed-postgres.service"
+        "lemonseed-valkey.service"
+      ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${ensureNetwork}/bin/lemonseed-docker-network";
+      };
+    };
+
     systemd.services.lemonseed-postgres = {
       description = "Lemonseed PostgreSQL (+ pgvector)";
       wantedBy = [ "multi-user.target" ];
       after = [
         "network-online.target"
         "docker.service"
-        "lemonseed-data-init.service"
+        "lemonseed-docker-network.service"
       ];
-      wants = [ "network-online.target" "docker.service" ];
+      wants = [ "network-online.target" "docker.service" "lemonseed-docker-network.service" ];
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
@@ -171,9 +224,9 @@ in
       after = [
         "network-online.target"
         "docker.service"
-        "lemonseed-data-init.service"
+        "lemonseed-docker-network.service"
       ];
-      wants = [ "network-online.target" "docker.service" ];
+      wants = [ "network-online.target" "docker.service" "lemonseed-docker-network.service" ];
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;

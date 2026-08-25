@@ -7,7 +7,7 @@ let
   cpRoot = pkgs.runCommand "lemonseed-control-plane-src" { } ''
     mkdir -p "$out/catalog"
     cp ${cpSrc}/stub.py ${cpSrc}/hardware.py ${cpSrc}/catalog.py ${cpSrc}/chat_ready.py \
-       ${cpSrc}/db.py ${cpSrc}/data_services.py "$out/"
+       ${cpSrc}/db.py ${cpSrc}/data_services.py ${cpSrc}/modules.py "$out/"
     cp ${cpSrc}/catalog/models.json "$out/catalog/"
   '';
 
@@ -21,6 +21,7 @@ let
       pkgs.systemd
       pkgs.coreutils
       pkgs.docker
+      pkgs.nginx
       pkgs.avahi
       pkgs.iproute2
       pkgs.util-linux
