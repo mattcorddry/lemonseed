@@ -69,10 +69,10 @@ Lemonseed is a **local, multi-user home AI hub** — not a cloud client and not 
 | **M4 — USB installer** | **Nearly done** — install + portal + first-boot setup; polish remaining |
 | **M4.1 — Preserve known user-data on reinstall** | **Done** — namespaced storage identity; preserve checkbox; layout-compatible reinstall |
 | **M5 — Hardware-aware local chat** | **Done** — `lemond` + NVIDIA/CUDA; inventory + catalog planner + CP pull/load/pin + portal “Local chat ready”; unit tests + QEMU API smoke |
-| **M6 — Open WebUI household UX** | **In progress** — M6.1 done (shell + OWUI + Lemonade); next M6.2 auth or M6.3 OWUI expansion |
+| **M6 — Open WebUI household UX** | **In progress** — M6.1 done; **M6.3a** policy+brand done; next **M6.2** nginx proxy auth (SearXNG/ComfyUI after basics) |
 | **M6+ (later)** | Conduit/mobile polish, AMD/UMA profiles, heterogeneous GPU planner, encryption, offline install, Secure Boot/TPM |
 
-**Immediate next step:** Short **M6.3a** OWUI policy seeding (no auth required), then **M6.2** nginx proxy auth before multi-user / shared-LAN features — or jump to M6.2 first if LAN trust is the next product risk.
+**Immediate next step:** **M6.2** nginx proxy auth before multi-user / shared-LAN features. SearXNG / ComfyUI can follow once auth and policy basics are in place.
 
 ### M6 — Open WebUI as primary UX (decided)
 
@@ -197,18 +197,25 @@ Default appliance image: **no** community plugins until reviewed; optional “en
 | **M6.0a** | **Done** — shared PostgreSQL (+ pgvector) + Valkey; CP credential provisioning; CP state in Postgres; QEMU + hardware smoke |
 | **M6.1** | **Done** — Open WebUI on Postgres; auth disabled; Lemonade wired; Lemonseed shell + blue/green; durable chat history |
 | **M6.2** | nginx **proxy auth** (Lemonseed sessions); OWUI remains authless behind nginx |
-| **M6.3** | OWUI policy seeding; SearXNG sidecar; calendar/channel defaults |
+| **M6.3** | OWUI policy seeding (**M6.3a** done for env defaults); SearXNG sidecar; calendar/channel defaults |
 | **M6.4** | Household smoke; `make test` green |
 | **M6+** | Conduit mobile, ComfyUI VRAM gating, multi-model tiers, vetted community plugins |
 
 **Sequencing M6.2 vs OWUI expansion (M6.3):** Prefer a short **M6.3a policy-seed** pass (autocomplete off, automations on, workspace defaults, Lemonseed system prompt) that does not need auth, then **M6.2 proxy auth** before multi-user / shared-LAN features that assume distinct people. **SearXNG**, channels/calendar, and ComfyUI wait until after auth if they create shared durable state or widen the attack surface on an open LAN. If the next demo is still single-trust LAN, finishing M6.3a then SearXNG before auth is acceptable — do not block light OWUI polish on M6.2.
 
-**Backlog (not current milestone):**
+**M6.3a (done):** Open WebUI env seeds via `enrich_open_webui_secrets()` with `ENABLE_PERSISTENT_CONFIG=False`: autocomplete off; automations on (incl. non-admin permission); workspace access off; notes/memory on; channels off until shared-channel seeding; web search / image gen / community sharing off until sidecars; `DEFAULT_MODEL_PARAMS` Lemonseed identity prompt + `function_calling=legacy` (v0.11 native tools caused empty KB/file queries); `DEFAULT_MODEL_METADATA` disables builtin_tools / knowledge / files until curated sources exist; `ENABLE_VERSION_UPDATE_CHECK=False` (with `OFFLINE_MODE`) to suppress update/What’s New noise. Shell/setup/installer use the lemon brand mark under `/_lemonseed/brand/` (installer: `/static/brand/`). Open WebUI image pin rebased to **v0.11.0** (latest stable at bump time). Shell **Getting Ready** bubble gates the OWUI iframe on **both** module `http_ready` and `chat.state=ready` (model pulled, loaded, and verified via a short Lemonade completion).
 
+**Backlog (not current milestone):**
+- **Custom model catalog:** friendly display names (e.g. flagged labels), Lemonade `user_models.json` / registry overrides so Open WebUI and Lemonade agree — not alias hacks at load time.
+- **OWUI model/policy via API:** evaluate configuring models through Open WebUI’s admin/API instead of (or in addition to) `DEFAULT_MODEL_*` env seeds — may survive container recreate more cleanly and avoid env/UI drift; keep env for bootstraps that must work before first login.
+- **CP-owned module lifecycle:** Docker module containers use `--restart no`; CP starts/replaces them after boot and on policy drift (blue/green + nginx reload). A long-lived supervisor starts a missing container and force-recreates after **5 contiguous** failed HTTP health probes. Continue hardening rollback (failed cutover keeps old slot) rather than relying on Docker auto-start of stale Envs.
+- **CP model picker:** let households choose/experiment with alternate catalog models from the control panel (not only the automatic planner pick).
+- **Local Wikipedia cache:** experimental indexed Wikipedia snapshot on spacious, well-connected appliances as an optional knowledge source for OWUI (when native KB tools are re-enabled).
 - **Live API health:** CP status fields (`/api/data`, `/api/status`, subsystem snapshots) should report **current health** via cheap live checks (e.g. `pg_isready` / `SELECT 1`, Valkey PING, HTTP ready), not a one-shot or cached reflection of “daemon started once.” If Postgres stops accepting connections after boot, the API should flip to unhealthy.
 - **Module catalog specs:** Define a Lemonseed **module configuration file** (one file per module under a catalog directory in-tree). Each spec encapsulates execution params (docker-compose fragment / pinned image), UX (logo, name, description, help), and dependencies (Postgres, Valkey, future object store). Catalog entries are what users see and what the CP downloads/sets up. The catalog itself needs a **test/release cycle**: pull candidate images → integration test → advance the version pin only when validated.
+- **Module image pins (strategy):** Every Docker module tracks the **newest upstream stable** tag we have validated. Keep an explicit pin in code (Open WebUI: `ghcr.io/open-webui/open-webui:v0.11.0` via `OWUI_IMAGE_DEFAULT` in `control-plane/modules.py`) so field appliances never float on `:latest` / `:main`. The build/rebase pipeline should regularly bump pins to current stable, run unit + QEMU smoke (and hardware when the module is user-facing), then land the pin — not leave modules on stale releases for “safety.” Lab overrides use `LEMONSEED_OWUI_IMAGE` only.
 - **Backup / restore:** Transactionally clean, space/time-efficient backup including Postgres dump, Valkey dump, and per-module **durable** volumes declared in the module spec. Targets: USB (preflight free-space check; optional encryption) and local SMB/NAS shares.
-
+- **Installer stream-to-disk:** partition first, stream squashfs to `root-a`, avoid multi-GB RAM staging on the live ISO.
 #### M6 acceptance checklist
 
 - [x] Written UX decision: Open WebUI primary; NanoClaw-style UI deferred
@@ -217,7 +224,7 @@ Default appliance image: **no** community plugins until reviewed; optional “en
 - [x] Open WebUI auth **disabled** (M6.1); nginx proxy auth deferred to M6.2
 - [x] Blue/green module updates with health-check before cutover
 - [x] Lemonseed shell at `/` embeds Open WebUI (supersedes portal “Open chat” CTA)
-- [ ] Policy defaults applied (autocomplete off, automations on, workspace off, etc.)
+- [x] Policy defaults applied (autocomplete off, automations on, workspace off, etc.)
 - [x] `make test` still green
 - [x] No second co-equal “main” UI shipped by default (shell embeds OWUI)
 
@@ -251,10 +258,29 @@ make build-installer          # → out/installer/lemonseed-installer.iso
 #### Disk policy
 - **Auto-pick** the preferred internal disk; confirmation required before wipe.
 - **Disallow** install onto USB-attached or **eMMC** media (not suitable for appliance user-data).
+- Eligible disks must be **≥ 20 GiB** (raised from 16 GiB).
 - If multiple eligible disks exist, confirmation screen allows selecting an alternate.
 - Inspect existing labels/partition tables; show a **warning bar** if an existing OS would be wiped.
 - Never target the installer USB itself (boot medium exclusion).
 - Reinstall over a previous Lemonseed disk is expected: leftover `appliance` LVM maps (even with nothing mounted) hold the disk busy and `systemd-repart` cannot reread the GPT. The wipe path deactivates those maps and the installer ISO disables LVM autoactivation.
+
+#### Minimum hardware (preflight)
+
+Before download/repart, the installer refuses hosts that cannot usefully run Lemonseed (`installer/preflight.py`, also on `/api/disks` / `/api/preflight`):
+
+| Check | Floor |
+|-------|-------|
+| Target disk | ≥ 20 GiB |
+| System memory | **8 GB class** (≥ 7.2 GiB `MemTotal`; 10% reservation budget for firmware/GPU) |
+| Processor | ≥ 4 CPU cores |
+
+`MemTotal` is used (not `MemAvailable`) because x86 boxes sold as “8 GB” often report ~7.6–7.8 GiB after BIOS and GPU reservations. Floor: `8 GiB × 0.9` → **7,549,747 kB**.
+
+**GPU VRAM is not checked on the installer USB** (lean ISO, no NVIDIA drivers). VRAM and model fit are validated after install on the appliance (`control-plane/hardware.py`, catalog planner).
+
+Aligned with Lemonade’s small-model Docker guidance (8 GB RAM / 4 cores). Failures use plain language with next steps (not opaque ENOSPC).
+
+**Backlog:** stream `root.squashfs` directly to `root-a` after partitioning (skip full RAM staging); add `size_bytes` to release `manifest.json`.
 
 ### M4.1 — Preserve known user-data on reinstall
 

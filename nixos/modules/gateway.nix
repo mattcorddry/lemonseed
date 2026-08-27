@@ -3,6 +3,8 @@
 { pkgs, ... }:
 
 let
+  brandAssets = ../../control-plane/static/brand;
+
   identity = pkgs.writeShellApplication {
     name = "lemonseed-apply-identity";
     runtimeInputs = with pkgs; [
@@ -303,6 +305,22 @@ in
       locations."= /api/chat" = {
         proxyPass = "http://127.0.0.1:8080";
         extraConfig = cpProxy;
+      };
+
+      # Brand icons (shell / setup / favicon) — must not fall through to OWUI.
+      locations."/_lemonseed/brand/" = {
+        alias = "${brandAssets}/";
+        extraConfig = ''
+          expires 7d;
+          add_header Cache-Control "public";
+        '';
+      };
+      locations."= /favicon.ico" = {
+        alias = "${brandAssets}/favicon.ico";
+        extraConfig = ''
+          expires 7d;
+          add_header Cache-Control "public";
+        '';
       };
 
       # Internal lemond proxy for modules on the lemon network (not LAN-facing).

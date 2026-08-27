@@ -37,11 +37,34 @@ SETUP_COMPLETE_FILE = Path("/etc/appliance-setup-complete")
 SETUP_STATE_FILE = Path("/etc/appliance-setup.json")
 HANDOFF_DONE_FILE = Path("/run/lemonseed/mdns-handoff-done")
 LEMOND_ENV_FILE = Path("/var/lib/lemonseed/lemonade/lemond.env")
+# Brand icons: packaged under control-plane/static/brand, or repo assets/brand.
+_BRAND_CANDIDATES = (
+    Path(__file__).resolve().parent / "static" / "brand",
+    Path(__file__).resolve().parent.parent / "assets" / "brand",
+)
+BRAND_DIR = next((p for p in _BRAND_CANDIDATES if p.is_dir()), _BRAND_CANDIDATES[0])
+BRAND_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".ico": "image/x-icon",
+    ".svg": "image/svg+xml",
+    ".webp": "image/webp",
+}
 TIMEZONES = sorted(
     timezone
     for timezone in available_timezones()
     if "/" in timezone and not timezone.startswith(("Etc/", "posix/", "right/"))
 )
+
+
+def brand_head_links() -> str:
+    """Favicon + apple-touch links for HTML pages."""
+    return (
+        '<link rel="icon" href="/_lemonseed/brand/favicon.ico" sizes="any"/>'
+        '<link rel="icon" type="image/png" href="/_lemonseed/brand/lemon-32.png" sizes="32x32"/>'
+        '<link rel="apple-touch-icon" href="/_lemonseed/brand/apple-touch-icon.png"/>'
+    )
 
 
 def _read_text(path: Path) -> Optional[str]:
@@ -344,11 +367,24 @@ html, body {
   color: var(--ink); font-family: var(--font);
 }
 .shell { max-width: 36rem; margin: 0 auto; padding: 2.25rem 1.25rem 3rem; }
-.wordmark {
-  margin: 0; font-size: 0.85rem; letter-spacing: 0.18em;
-  text-transform: uppercase; color: var(--accent); font-weight: 700;
+.brand-mark {
+  display: flex; align-items: center; gap: 0.65rem; margin-bottom: 0.15rem;
 }
-h1 { margin: 0.35rem 0 0.45rem; font-size: clamp(2rem, 8vw, 2.5rem); letter-spacing: -0.03em; }
+.brand-mark .logo {
+  display: block; width: 3.25rem; height: 3.25rem; margin: 0;
+  border-radius: 50%; object-fit: cover; flex-shrink: 0;
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.08);
+}
+.brand-mark .wordmark {
+  font-size: clamp(1.35rem, 5vw, 1.65rem); font-weight: 700;
+  letter-spacing: 0.14em; color: var(--ink);
+}
+.logo {
+  display: block; width: 3.25rem; height: 3.25rem; margin: 0;
+  border-radius: 50%; object-fit: cover;
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.08);
+}
+h1 { margin: 0.55rem 0 0.45rem; font-size: clamp(2rem, 8vw, 2.5rem); letter-spacing: -0.03em; }
 .lede { color: var(--muted); line-height: 1.45; margin: 0; }
 .panel {
   margin-top: 1.5rem; padding: 1.1rem;
@@ -397,9 +433,10 @@ input, select {
   padding: 0.55rem 1rem; border-bottom: 1px solid var(--line);
   background: rgba(15, 28, 24, 0.92); backdrop-filter: blur(8px);
 }
-.app-bar .brand {
-  margin: 0; font-size: 0.8rem; letter-spacing: 0.16em;
-  text-transform: uppercase; color: var(--accent); font-weight: 700;
+.app-bar .brand-logo {
+  display: block; width: 1.75rem; height: 1.75rem; margin: 0;
+  border-radius: 50%; object-fit: cover; flex-shrink: 0;
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.1);
 }
 .app-bar .title { margin: 0; font-size: 1rem; font-weight: 600; }
 .app-bar .spacer { flex: 1; }
@@ -589,9 +626,12 @@ waitForStartup();
     body = f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Lemonseed setup</title><style>{STYLE}</style>
+<title>Lemonseed setup</title>{brand_head_links()}<style>{STYLE}</style>
 </head><body><main class="shell">
-<p class="wordmark">Lemonseed</p>
+<div class="brand-mark">
+<img class="logo" src="/_lemonseed/brand/lemon-128.png" width="52" height="52" alt=""/>
+<span class="wordmark">LEMONSEED</span>
+</div>
 <h1>{"Review setup" if review_required else "Starting Lemonseed"}</h1>
 <p class="lede">{"Confirm the preserved appliance settings before continuing." if review_required else "Waiting for appliance services to become ready."}</p>
 <section class="panel">
@@ -642,8 +682,7 @@ def page_shell(snap: dict[str, Any], *, view: str = "chat") -> bytes:
     setup = load_setup()
     name = escape(str(setup.get("name") or "Lemonseed"))
     mods = snap.get("modules") or modules.modules_snapshot()
-    owui = mods.get("open_webui") or {}
-    owui_state = str(owui.get("state") or "idle")
+    _owui = mods.get("open_webui") or {}
     if view not in ("chat", "settings", "modules"):
         view = "chat"
 
@@ -658,11 +697,11 @@ def page_shell(snap: dict[str, Any], *, view: str = "chat") -> bytes:
     body = f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>{name}</title><style>{STYLE}</style>
+<title>{name}</title>{brand_head_links()}<style>{STYLE}</style>
 </head><body>
 <main class="app-shell">
 <header class="app-bar">
-<p class="brand">Lemonseed</p>
+<img class="brand-logo" src="/_lemonseed/brand/lemon-64.png" width="28" height="28" alt=""/>
 <p class="title">{name}</p>
 <nav class="nav" aria-label="Main">
   <a href="/" id="nav-chat" class="{chat_active}" data-view="chat">Chat</a>
@@ -684,9 +723,9 @@ def page_shell(snap: dict[str, Any], *, view: str = "chat") -> bytes:
 <div class="frame-wrap">
 <div class="frame-fallback {landing_class}" id="chat-fallback">
   <div class="landing">
-    <h2>Preparing chat</h2>
-    <p id="landing-lede">Lemonseed is downloading and starting the chat interface. This can take a few minutes on first boot.</p>
-    <p class="status-line wait" id="landing-status">ui: {escape(owui_state)}</p>
+    <h2 id="landing-title">Getting Ready</h2>
+    <p id="landing-lede">Preparing this appliance…</p>
+    <p class="status-line wait" id="landing-status">Starting…</p>
   </div>
 </div>
 <iframe id="chat-frame" class="{chat_frame_class}" title="Chat" src="about:blank" allow="clipboard-read; clipboard-write"></iframe>
@@ -700,13 +739,53 @@ let readyStreak = 0;
 const CHAT_SRC = '/?embed=1';
 const SETTINGS_SRC = '/settings/content/';
 
-function uiCopy(state, httpReady, error, reason) {{
-  if (state === 'ready' && httpReady) return ['Chat is ready.', 'ok'];
-  if (state === 'pulling') return ['Downloading the chat interface…', 'wait'];
-  if (state === 'starting' || state === 'busy') return ['Starting the chat interface…', 'wait'];
-  if (state === 'waiting') return [reason || 'Waiting for storage services…', 'wait'];
-  if (state === 'error') return [error || reason || 'Chat failed to start. Open Settings for diagnostics.', 'bad'];
-  return ['Preparing chat…', 'wait'];
+function landingCopy(chat, owui) {{
+  const chatState = chat.state || 'idle';
+  const ui = owui.state || 'idle';
+  const httpReady = !!owui.http_ready;
+  const modelReady = chatState === 'ready';
+  const uiReady = ui === 'ready' && httpReady;
+
+  if (chatState === 'error' || ui === 'error') {{
+    const err = chat.error || owui.error || chat.reason || owui.reason || 'Something went wrong. Open Settings for diagnostics.';
+    return {{
+      title: 'Getting Ready',
+      workflow: chat.workflow || owui.workflow || 'Local chat unavailable',
+      task: chat.task || owui.task || String(err),
+      cls: 'bad',
+    }};
+  }}
+  if (modelReady && uiReady) {{
+    return {{
+      title: 'Getting Ready',
+      workflow: 'Ready',
+      task: 'Opening chat…',
+      cls: 'ok',
+    }};
+  }}
+  // Prefer model progress when the LLM is still preparing.
+  if (!modelReady && chatState && chatState !== 'idle' && chatState !== 'ready') {{
+    return {{
+      title: 'Getting Ready',
+      workflow: chat.workflow || 'Downloading an initial LLM',
+      task: chat.task || chat.message || 'Preparing a local model…',
+      cls: 'wait',
+    }};
+  }}
+  if (!uiReady) {{
+    return {{
+      title: 'Getting Ready',
+      workflow: owui.workflow || 'Configuring chat',
+      task: owui.task || owui.reason || owui.message || 'Preparing the chat interface…',
+      cls: 'wait',
+    }};
+  }}
+  return {{
+    title: 'Getting Ready',
+    workflow: chat.workflow || 'Downloading an initial LLM',
+    task: chat.task || chat.message || 'Finishing setup…',
+    cls: 'wait',
+  }};
 }}
 
 function showChatFrame() {{
@@ -792,22 +871,26 @@ async function refreshStatus() {{
     if (storageEl && telemetry.storage_pct != null) storageEl.style.width = telemetry.storage_pct + '%';
 
     const owui = (data.modules || {{}}).open_webui || {{}};
+    const chat = data.chat || {{}};
     const ui = owui.state || 'idle';
     const httpReady = !!owui.http_ready;
+    const modelReady = chat.state === 'ready';
+    const copy = landingCopy(chat, owui);
+    const title = document.getElementById('landing-title');
     const lede = document.getElementById('landing-lede');
     const status = document.getElementById('landing-status');
-    const [msg, cls] = uiCopy(ui, httpReady, owui.error, owui.reason);
-    if (lede) lede.textContent = msg;
+    if (title) title.textContent = copy.title;
+    if (lede) lede.textContent = copy.workflow;
     if (status) {{
-      status.textContent = 'ui: ' + ui + (httpReady ? ' (healthy)' : '');
-      status.className = 'status-line ' + cls;
+      status.textContent = copy.task;
+      status.className = 'status-line ' + copy.cls;
     }}
-    if (ui === 'ready' && httpReady && await gatewayReachable()) {{
+    if (ui === 'ready' && httpReady && modelReady && await gatewayReachable()) {{
       readyStreak += 1;
     }} else {{
       readyStreak = 0;
     }}
-    // Two consecutive healthy polls + nginx can reach OWUI assets.
+    // Two consecutive healthy polls: OWUI + model verified + nginx asset path.
     if (!chatBootstrapped && readyStreak >= 2) {{
       ensureChatLoaded();
     }}
@@ -891,7 +974,7 @@ def page_settings_content(snap: dict[str, Any]) -> bytes:
     body = f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Settings</title><style>{STYLE}</style>
+<title>Settings</title>{brand_head_links()}<style>{STYLE}</style>
 </head><body><main class="embed-shell">
 <h1>Settings</h1>
 <section class="panel">
@@ -1058,6 +1141,37 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path in ("/healthz", "/health"):
             self._send(200, b"ok\n", "text/plain; charset=utf-8")
+            return
+        if path.startswith("/_lemonseed/brand/"):
+            rel = path[len("/_lemonseed/brand/") :]
+            if not rel or ".." in rel or rel.startswith("/") or "/" in rel:
+                self._send(404, b"not found\n", "text/plain; charset=utf-8")
+                return
+            fp = BRAND_DIR / rel
+            if not fp.is_file():
+                self._send(404, b"not found\n", "text/plain; charset=utf-8")
+                return
+            ctype = BRAND_MIME.get(fp.suffix.lower(), "application/octet-stream")
+            body = fp.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == "/favicon.ico":
+            fp = BRAND_DIR / "favicon.ico"
+            if fp.is_file():
+                body = fp.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/x-icon")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self._send(404, b"not found\n", "text/plain; charset=utf-8")
             return
         if path == "/api/boot":
             self._json(200, boot_snapshot())

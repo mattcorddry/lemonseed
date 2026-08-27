@@ -5,8 +5,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
+"${ROOT}/scripts/check-untracked.sh"
+
 echo "==> lemonseed-update / artifacts"
 python3 "${ROOT}/scripts/test_lemonseed_update.py"
+
+echo "==> installer"
+PYTHONPATH="${ROOT}/installer" python3 -m unittest discover -s "${ROOT}/installer" -p 'test_*.py' -v
 
 echo "==> gen-repart"
 python3 "${ROOT}/scripts/test_gen_repart.py"

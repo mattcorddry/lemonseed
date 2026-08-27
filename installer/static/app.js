@@ -18,6 +18,7 @@
 
   let selected = null;
   let selectedDisk = null;
+  let hostPreflight = { ok: true, reasons: [] };
   let pollTimer = null;
   let waitTimer = null;
 
@@ -26,7 +27,21 @@
     return g >= 10 ? `${g.toFixed(0)} GB` : `${g.toFixed(1)} GB`;
   }
 
+  function showHostPreflightWarn() {
+    warnEl.classList.remove("hidden");
+    const reasons = hostPreflight.reasons || [];
+    const body = reasons.length
+      ? reasons.map((r) => `<p>${r}</p>`).join("")
+      : "<p>This computer does not meet Lemonseed's minimum requirements. Please check the system memory and processor, then try again.</p>";
+    warnEl.innerHTML =
+      "<strong>This computer isn't ready for Lemonseed yet</strong>" + body;
+  }
+
   function updateWarn(disk) {
+    if (!hostPreflight.ok) {
+      showHostPreflightWarn();
+      return;
+    }
     if (!disk) {
       warnEl.classList.add("hidden");
       return;
@@ -44,20 +59,25 @@
     }
   }
 
-  function updatePreserve(disk) {
-    const available = Boolean(disk && disk.preservable_user_data);
-    preserveRow.classList.toggle("hidden", !available);
-    preserveCheck.checked = available;
+  function renderPreflight(payload) {
+    hostPreflight = payload.preflight || { ok: true, reasons: [] };
+    if (hostPreflight.ok) {
+      return;
+    }
+    showHostPreflightWarn();
+    startBtn.disabled = true;
   }
 
   function renderDisks(payload) {
     disksEl.innerHTML = "";
+    renderPreflight(payload);
+    const hostOk = hostPreflight.ok !== false;
     const eligible = (payload.disks || []).filter((d) => d.eligible);
     const blocked = (payload.disks || []).filter((d) => !d.eligible);
 
     if (!eligible.length) {
       disksEl.innerHTML =
-        '<p class="lede">No suitable internal disk found. USB and eMMC devices cannot be used.</p>';
+        '<p class="lede">No suitable internal disk found. USB and eMMC devices cannot be used. Disks under 20 GB are too small.</p>';
       startBtn.disabled = true;
       return;
     }
@@ -79,7 +99,7 @@
         [...disksEl.querySelectorAll(".disk")].forEach((el) =>
           el.classList.toggle("selected", el === btn)
         );
-        startBtn.disabled = false;
+        startBtn.disabled = !hostOk;
       });
       disksEl.appendChild(btn);
       if (d.path === selected) {
@@ -92,11 +112,17 @@
       const note = document.createElement("p");
       note.className = "lede";
       note.style.marginTop = "0.75rem";
-      note.textContent = `${blocked.length} other disk(s) hidden (USB, eMMC, too small, or installer medium).`;
+      note.textContent = `${blocked.length} other disk(s) hidden (USB, eMMC, under 20 GB, or installer medium).`;
       disksEl.appendChild(note);
     }
 
-    startBtn.disabled = !selected;
+    startBtn.disabled = !selected || !hostOk;
+  }
+
+  function updatePreserve(disk) {
+    const available = Boolean(disk && disk.preservable_user_data);
+    preserveRow.classList.toggle("hidden", !available);
+    preserveCheck.checked = available;
   }
 
   function showProgress() {

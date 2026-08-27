@@ -7,6 +7,7 @@ OUT="${ROOT}/out/installer"
 
 export PATH="/nix/var/nix/profiles/default/bin:${PATH}"
 
+"${ROOT}/scripts/check-untracked.sh"
 "${ROOT}/scripts/nix-gc.sh" --if-needed
 
 echo "==> building installer ISO (nix build .#installer-iso)"

@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 
 from disks import list_candidate_disks, pick_default
 from install import InstallError, image_base_url, run_install
+from preflight import evaluate_host, MIN_DISK_BYTES
 
 HOST = os.environ.get("LEMONSEED_INSTALLER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("LEMONSEED_INSTALLER_PORT", "80"))
@@ -129,12 +130,18 @@ INDEX_HTML = """<!DOCTYPE html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Lemonseed Installer</title>
+  <link rel="icon" href="/static/brand/favicon.ico" sizes="any" />
+  <link rel="icon" type="image/png" href="/static/brand/lemon-32.png" sizes="32x32" />
+  <link rel="apple-touch-icon" href="/static/brand/apple-touch-icon.png" />
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <main class="shell">
     <header class="brand">
-      <p class="wordmark">Lemonseed</p>
+      <div class="brand-mark">
+        <img class="logo" src="/static/brand/lemon-128.png" width="52" height="52" alt="" />
+        <span class="wordmark">LEMONSEED</span>
+      </div>
       <h1>Install</h1>
       <p class="lede">Choose a disk, confirm, and we’ll set up this machine.</p>
     </header>
@@ -203,7 +210,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/disks":
             disks = list_candidate_disks()
-            self._json(200, {"disks": disks, "default": pick_default(disks), "image_base": IMAGE_BASE})
+            host = evaluate_host()
+            self._json(
+                200,
+                {
+                    "disks": disks,
+                    "default": pick_default(disks),
+                    "image_base": IMAGE_BASE,
+                    "preflight": host,
+                    "min_disk_bytes": MIN_DISK_BYTES,
+                },
+            )
+            return
+        if path == "/api/preflight":
+            self._json(200, evaluate_host())
             return
         if path == "/api/status":
             self._json(200, get_state())
@@ -220,7 +240,19 @@ class Handler(BaseHTTPRequestHandler):
             if not fp.is_file():
                 self._send(404, b"not found\n", "text/plain")
                 return
-            ctype = "text/css" if fp.suffix == ".css" else "application/javascript" if fp.suffix == ".js" else "application/octet-stream"
+            ctype = (
+                "text/css"
+                if fp.suffix == ".css"
+                else "application/javascript"
+                if fp.suffix == ".js"
+                else "image/png"
+                if fp.suffix == ".png"
+                else "image/jpeg"
+                if fp.suffix in (".jpg", ".jpeg")
+                else "image/x-icon"
+                if fp.suffix == ".ico"
+                else "application/octet-stream"
+            )
             self._send(200, fp.read_bytes(), ctype)
             return
         self._send(404, b"not found\n", "text/plain")

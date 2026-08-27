@@ -203,6 +203,7 @@ class ChatReadyTests(unittest.TestCase):
         names = chat_ready._loaded_model_names(health)
         self.assertEqual(names, {"Gemma-4-E2B-it-GGUF", "Other"})
 
+    @mock.patch.object(chat_ready, "_verify_completion", return_value=(True, "ok"))
     @mock.patch.object(chat_ready, "_model_is_loaded", return_value=True)
     @mock.patch.object(chat_ready, "plan_model")
     @mock.patch.object(chat_ready, "collect_hardware")
@@ -213,17 +214,23 @@ class ChatReadyTests(unittest.TestCase):
         collect: mock.Mock,
         plan: mock.Mock,
         _loaded: mock.Mock,
+        _verify: mock.Mock,
     ) -> None:
         collect.return_value = _cuda_hw()
         plan.return_value = {
             "state": "selected",
             "reason": "ok",
-            "selection": {"id": "Gemma-4-E2B-it-GGUF", "display_name": "Gemma 4 E2B"},
+            "selection": {
+                "id": "Gemma-4-E2B-it-GGUF",
+                "display_name": "Gemma 4 E2B",
+            },
         }
         result = chat_ready.prepare_local_chat()
         self.assertEqual(result["state"], "ready")
         self.assertEqual(result["model_id"], "Gemma-4-E2B-it-GGUF")
+        self.assertEqual(result["display_name"], "Gemma 4 E2B")
 
+    @mock.patch.object(chat_ready, "_verify_completion", return_value=(True, "ok"))
     @mock.patch.object(chat_ready, "_model_is_loaded")
     @mock.patch.object(chat_ready, "_run_lemonade")
     @mock.patch.object(chat_ready, "plan_model")
@@ -236,23 +243,30 @@ class ChatReadyTests(unittest.TestCase):
         plan: mock.Mock,
         run: mock.Mock,
         loaded: mock.Mock,
+        _verify: mock.Mock,
     ) -> None:
         collect.return_value = _cuda_hw()
+        model_id = "Gemma-4-E2B-it-GGUF"
         plan.return_value = {
             "state": "selected",
             "reason": "ok",
-            "selection": {"id": "Gemma-4-E2B-it-GGUF", "display_name": "Gemma 4 E2B"},
+            "selection": {"id": model_id, "display_name": "Gemma 4 E2B"},
         }
-        run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
-        loaded.side_effect = [False, True]
+        run_calls: list[list[str]] = []
+
+        def _run(args: list[str], timeout: int = 0) -> mock.Mock:
+            run_calls.append(list(args))
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        def _loaded(name: str) -> bool:
+            return any(c[:2] == ["load", name] for c in run_calls)
+
+        run.side_effect = _run
+        loaded.side_effect = _loaded
 
         result = chat_ready.prepare_local_chat()
-        self.assertEqual(result["state"], "ready")
-        run.assert_any_call(
-            ["load", "Gemma-4-E2B-it-GGUF", "--llamacpp", "cuda", "--pinned"],
-            timeout=600,
-        )
-
+        self.assertEqual(result["state"], "ready", result.get("error"))
+        self.assertTrue(any(c[:2] == ["load", model_id] for c in run_calls))
     @mock.patch.object(chat_ready, "_model_is_loaded", return_value=False)
     @mock.patch.object(chat_ready, "ensure_chat_worker")
     def test_chat_snapshot_reconciles_stale_ready(

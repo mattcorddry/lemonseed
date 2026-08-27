@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from catalog import plan_model
@@ -31,6 +32,8 @@ def _default_state() -> dict[str, Any]:
         "state": "idle",
         "progress": 0,
         "message": "",
+        "workflow": "Getting ready",
+        "task": "",
         "model_id": None,
         "display_name": None,
         "reason": None,
@@ -75,16 +78,32 @@ def chat_snapshot() -> dict[str, Any]:
         and not _model_is_loaded(model_id)
     ):
         # Stale ready after lemond restart — kick reload without blocking callers.
+        label = state.get("display_name") or model_id
         state = {
             **state,
             "state": "preparing",
             "progress": 70,
-            "message": f"Reloading {state.get('display_name') or model_id}…",
+            "message": f"Reloading {label}…",
+            "workflow": "Downloading an initial LLM",
+            "task": f"Reloading {label}",
             "error": None,
         }
         write_chat_ready(state)
         ensure_chat_worker()
+    # Ensure structured progress fields for the shell bubble.
+    if "workflow" not in state:
+        state["workflow"] = _workflow_for_state(str(state.get("state") or "idle"))
+    if "task" not in state:
+        state["task"] = str(state.get("message") or "")
     return state
+
+
+def _workflow_for_state(state: str) -> str:
+    if state in ("ready",):
+        return "Ready"
+    if state in ("not-ready", "error"):
+        return "Local chat unavailable"
+    return "Downloading an initial LLM"
 
 
 def _run_lemonade(args: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
@@ -142,11 +161,73 @@ def _model_is_loaded(model_id: str) -> bool:
     return model_id in _loaded_model_names()
 
 
+def _verify_completion(model_id: str) -> tuple[bool, str]:
+    """Minimal chat completion to prove the loaded model answers."""
+    key = lemonade_api_key()
+    if not key:
+        return False, "Lemonade API key missing"
+    body = json.dumps(
+        {
+            "model": model_id,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
+            "stream": False,
+        }
+    ).encode("utf-8")
+    try:
+        req = Request(
+            "http://127.0.0.1:13305/v1/chat/completions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urlopen(req, timeout=120) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        choices = payload.get("choices") if isinstance(payload, dict) else None
+        if isinstance(choices, list) and choices:
+            return True, "ok"
+        return False, "empty completion response"
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        return False, str(exc)
+
+
 def _hardware_ref(hardware: dict[str, Any]) -> dict[str, Any]:
     """Point at /api/hardware rather than duplicating GPU inventory."""
     return {
         "gpu_index": largest_gpu_index(hardware),
         "ram_gb": hardware.get("ram_gb"),
+    }
+
+
+def _progress_payload(
+    *,
+    state: str,
+    progress: int,
+    message: str,
+    workflow: str,
+    task: str,
+    model_id: Optional[str],
+    display: Optional[str],
+    reason: Any,
+    error: Any,
+    plan: Any,
+    href: Any,
+) -> dict[str, Any]:
+    return {
+        "state": state,
+        "progress": progress,
+        "message": message,
+        "workflow": workflow,
+        "task": task,
+        "model_id": model_id,
+        "display_name": display,
+        "reason": reason,
+        "error": error,
+        "plan": plan,
+        "hardware_ref": href,
     }
 
 
@@ -166,67 +247,79 @@ def prepare_local_chat(*, force: bool = False) -> dict[str, Any]:
         plan = plan_model(hardware)
         href = _hardware_ref(hardware)
         if plan.get("state") != "selected" or not plan.get("selection"):
-            payload = {
-                "state": "not-ready",
-                "progress": 0,
-                "message": "Local chat is not ready",
-                "model_id": None,
-                "display_name": None,
-                "reason": plan.get("reason"),
-                "error": None,
-                "plan": plan,
-                "hardware_ref": href,
-            }
+            payload = _progress_payload(
+                state="not-ready",
+                progress=0,
+                message="Local chat is not ready",
+                workflow="Local chat unavailable",
+                task=str(plan.get("reason") or "No suitable model for this hardware"),
+                model_id=None,
+                display=None,
+                reason=plan.get("reason"),
+                error=None,
+                plan=plan,
+                href=href,
+            )
             write_chat_ready(payload)
             return payload
 
         selection = plan["selection"]
         model_id = str(selection.get("id") or "")
         display = str(selection.get("display_name") or model_id)
+        workflow = "Downloading an initial LLM"
 
         # File state alone is not enough — lemond forgets loads across restart.
         if not force and _model_is_loaded(model_id):
-            payload = {
-                "state": "ready",
-                "progress": 100,
-                "message": "Local chat ready",
-                "model_id": model_id,
-                "display_name": display,
-                "reason": plan.get("reason"),
-                "error": None,
-                "plan": plan,
-                "hardware_ref": href,
-            }
-            write_chat_ready(payload)
-            return payload
+            ok, detail = _verify_completion(model_id)
+            if ok:
+                payload = _progress_payload(
+                    state="ready",
+                    progress=100,
+                    message="Local chat ready",
+                    workflow="Ready",
+                    task=f"{display} is ready",
+                    model_id=model_id,
+                    display=display,
+                    reason=plan.get("reason"),
+                    error=None,
+                    plan=plan,
+                    href=href,
+                )
+                write_chat_ready(payload)
+                return payload
+            print(f"chat-ready verify retry: {detail}", flush=True)
 
         write_chat_ready(
-            {
-                "state": "preparing",
-                "progress": 5,
-                "message": f"Preparing {display}…",
-                "model_id": model_id,
-                "display_name": display,
-                "reason": plan.get("reason"),
-                "error": None,
-                "plan": plan,
-                "hardware_ref": href,
-            }
+            _progress_payload(
+                state="preparing",
+                progress=5,
+                message=f"Preparing {display}…",
+                workflow=workflow,
+                task=f"Preparing {display}",
+                model_id=model_id,
+                display=display,
+                reason=plan.get("reason"),
+                error=None,
+                plan=plan,
+                href=href,
+            )
         )
 
         try:
             write_chat_ready(
-                {
-                    "state": "preparing",
-                    "progress": 20,
-                    "message": f"Downloading {display}…",
-                    "model_id": model_id,
-                    "display_name": display,
-                    "reason": plan.get("reason"),
-                    "error": None,
-                    "plan": plan,
-                    "hardware_ref": href,
-                }
+                _progress_payload(
+                    state="preparing",
+                    progress=20,
+                    message=f"Downloading {display}…",
+                    workflow=workflow,
+                    task=f"Downloading {model_id}",
+                    model_id=model_id,
+                    display=display,
+                    reason=plan.get("reason"),
+                    error=None,
+                    plan=plan,
+                    href=href,
+                )
             )
             pull = _run_lemonade(["pull", model_id], timeout=3600)
             if pull.returncode != 0:
@@ -234,19 +327,20 @@ def prepare_local_chat(*, force: bool = False) -> dict[str, Any]:
                 raise RuntimeError(f"lemonade pull failed: {detail or pull.returncode}")
 
             write_chat_ready(
-                {
-                    "state": "preparing",
-                    "progress": 75,
-                    "message": f"Loading {display} onto GPU…",
-                    "model_id": model_id,
-                    "display_name": display,
-                    "reason": plan.get("reason"),
-                    "error": None,
-                    "plan": plan,
-                    "hardware_ref": href,
-                }
+                _progress_payload(
+                    state="preparing",
+                    progress=75,
+                    message=f"Loading {display} onto GPU…",
+                    workflow=workflow,
+                    task=f"Loading {model_id} onto the GPU",
+                    model_id=model_id,
+                    display=display,
+                    reason=plan.get("reason"),
+                    error=None,
+                    plan=plan,
+                    href=href,
+                )
             )
-            # Pin so max_loaded_models=1 does not evict the appliance default.
             load = _run_lemonade(
                 ["load", model_id, "--llamacpp", "cuda", "--pinned"],
                 timeout=600,
@@ -260,31 +354,54 @@ def prepare_local_chat(*, force: bool = False) -> dict[str, Any]:
                     f"lemonade load returned success but {model_id} is not in /v1/health"
                 )
 
-            payload = {
-                "state": "ready",
-                "progress": 100,
-                "message": "Local chat ready",
-                "model_id": model_id,
-                "display_name": display,
-                "reason": plan.get("reason"),
-                "error": None,
-                "plan": plan,
-                "hardware_ref": href,
-            }
+            write_chat_ready(
+                _progress_payload(
+                    state="preparing",
+                    progress=90,
+                    message=f"Verifying {display}…",
+                    workflow=workflow,
+                    task=f"Verifying {model_id}",
+                    model_id=model_id,
+                    display=display,
+                    reason=plan.get("reason"),
+                    error=None,
+                    plan=plan,
+                    href=href,
+                )
+            )
+            ok, detail = _verify_completion(model_id)
+            if not ok:
+                raise RuntimeError(f"model verification failed: {detail}")
+
+            payload = _progress_payload(
+                state="ready",
+                progress=100,
+                message="Local chat ready",
+                workflow="Ready",
+                task=f"{display} is ready",
+                model_id=model_id,
+                display=display,
+                reason=plan.get("reason"),
+                error=None,
+                plan=plan,
+                href=href,
+            )
             write_chat_ready(payload)
             return payload
         except Exception as exc:  # noqa: BLE001
-            payload = {
-                "state": "error",
-                "progress": 0,
-                "message": "Local chat failed to prepare",
-                "model_id": model_id,
-                "display_name": display,
-                "reason": plan.get("reason"),
-                "error": str(exc),
-                "plan": plan,
-                "hardware_ref": href,
-            }
+            payload = _progress_payload(
+                state="error",
+                progress=0,
+                message="Local chat failed to prepare",
+                workflow="Local chat unavailable",
+                task=str(exc),
+                model_id=model_id,
+                display=display,
+                reason=plan.get("reason"),
+                error=str(exc),
+                plan=plan,
+                href=href,
+            )
             write_chat_ready(payload)
             return payload
     finally:

@@ -5,6 +5,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
+"${ROOT}/scripts/check-untracked.sh"
+
 if ! command -v nix >/dev/null 2>&1; then
   # Multi-user Nix install default location (not a project path).
   if [[ -x /nix/var/nix/profiles/default/bin/nix ]]; then

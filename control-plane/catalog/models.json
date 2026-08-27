@@ -1,9 +1,10 @@
 {
-    "catalog_version": 2,
+  "catalog_version": 2,
   "models": [
     {
       "id": "Gemma-4-E2B-it-GGUF",
       "display_name": "Gemma 4 E2B",
+      "vendor": "Google",
       "backend": "llamacpp:cuda",
       "recipe": "llamacpp",
       "checkpoint": "unsloth/gemma-4-E2B-it-GGUF:Q4_K_M",
@@ -16,6 +17,7 @@
     {
       "id": "Gemma-4-E4B-it-GGUF",
       "display_name": "Gemma 4 E4B",
+      "vendor": "Google",
       "backend": "llamacpp:cuda",
       "recipe": "llamacpp",
       "checkpoint": "unsloth/gemma-4-E4B-it-GGUF:Q4_K_M",

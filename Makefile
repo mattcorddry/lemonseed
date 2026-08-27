@@ -24,7 +24,7 @@ DISK ?=
 
 .PHONY: help build-production build-qemu build-installer run-qemu qemu-clean clean keys \
 	repart-generate disk-repart grub-cfg repart-test update-test test test-qemu \
-	test-update-unit nix-gc
+	test-update-unit check-untracked nix-gc
 
 help:
 	@echo "Lemonseed image build pipeline"
@@ -47,6 +47,7 @@ help:
 	@echo "  make test              Unit tests (no root / no hypervisor)"
 	@echo "  make test-qemu         QEMU boot + HTTP API smoke (needs build-qemu)"
 	@echo "  make test-update-unit  Alias for update unit tests only"
+	@echo "  make check-untracked   Fail if untracked (non-ignored) files exist"
 	@echo "  make nix-gc            Soft Nix GC (drop stale build roots; no -d)"
 	@echo "  make clean             Remove out/"
 	@echo "  make keys              Generate local ed25519 test keys under keys/"
@@ -57,10 +58,12 @@ help:
 	@echo "  SIGN=1    Write detached signatures (requires keys/; see make keys)"
 	@echo "  DISK      Target block device for disk-repart"
 	@echo "  NIX_GC_THRESHOLD=80  Pre-build GC if / or /nix is at least this % full"
+	@echo "  ALLOW_UNTRACKED=1    Bypass check-untracked (flake omission risk)"
 	@echo ""
 	@echo "Notes:"
 	@echo "  A/B helpers: lemonseed-ab / lemonseed-update (on appliance)"
 	@echo "  make test-update-unit | make test (unit) | make test-qemu (HTTP boot)"
+	@echo "  Flakes omit untracked files — check-untracked runs in test + build-*"
 	@echo "  Installer UI: http://lemonseed.local/ (Avahi) on port 80"
 
 build-production:
@@ -120,6 +123,9 @@ test-qemu:
 
 test-update-unit:
 	python3 "$(ROOT)/scripts/test_lemonseed_update.py"
+
+check-untracked:
+	"$(ROOT)/scripts/check-untracked.sh"
 
 nix-gc:
 	"$(ROOT)/scripts/nix-gc.sh"

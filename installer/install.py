@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from disks import list_candidate_disks
+from preflight import require_host_ready
 
 ProgressFn = Callable[..., None]
 
@@ -486,6 +487,15 @@ def seed_esp(disk: str, files: dict[str, Path], progress: ProgressFn | None) -> 
 def run_install(
     disk_path: str, progress: ProgressFn | None = None, preserve_user_data: bool = False
 ) -> None:
+    _progress(
+        progress,
+        phase="validate",
+        message="Checking hardware requirements…",
+        progress=2,
+        error=None,
+        can_reboot=False,
+    )
+    require_host_ready()
     disk = _eligible(disk_path)
     _progress(
         progress,

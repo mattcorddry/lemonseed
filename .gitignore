@@ -2,7 +2,6 @@
 result
 result-*
 /out/
-
 # Local versioning / caches
 /.build-counter
 .direnv
@@ -10,7 +9,6 @@ result-*
 __pycache__/
 *.py[cod]
 *.egg-info/
-
 # Signing keys (local/test) — keep directory placeholder
 /keys/*.key
 /keys/*.pem
@@ -18,8 +16,10 @@ __pycache__/
 /keys/ed25519.priv
 /keys/ed25519.pub
 !/keys/.gitkeep
-
 # Editor / OS
 *.swp
 *~
 .DS_Store
+.vendor/
+.xdg-cache/
+.tmp/

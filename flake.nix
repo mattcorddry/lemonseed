@@ -39,7 +39,16 @@
         };
       };
 
-      packages.${system} = {
+      packages.${system} = let
+        pkgs = nixpkgs.legacyPackages.${system};
+        qemuOwuiImage = pkgs.dockerTools.pullImage {
+          imageName = "ghcr.io/open-webui/open-webui";
+          imageDigest = "sha256:72c0ba641ba75e7aa52655cb242570906ececd09b1140fb736483038a22b3228";
+          finalImageTag = "v0.11.0";
+          hash = "sha256-dDz7zdzDbuLB81rQm0yeFQFsn1uhLuinoRMTM5UZExI=";
+        };
+      in
+      {
         default = self.nixosConfigurations.appliance.config.system.build.applianceArtifacts;
         artifacts = self.nixosConfigurations.appliance.config.system.build.applianceArtifacts;
         artifacts-qemu =
@@ -50,6 +59,8 @@
         initrd = self.nixosConfigurations.appliance.config.system.build.applianceInitrd;
         # Host helper for `make run-qemu` when qemu is not installed system-wide.
         qemu = nixpkgs.legacyPackages.${system}.qemu_kvm;
+        # Pinned OWUI image tar for `make test-qemu` virtio-fs export (not in squashfs).
+        qemu-owui-image = qemuOwuiImage;
         # EFI/USB-bootable installer ISO (M4).
         installer-iso = self.nixosConfigurations.installer.config.system.build.isoImage;
       };

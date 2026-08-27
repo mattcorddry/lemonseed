@@ -214,7 +214,8 @@ in
         ExecStartPre = "-${pkgs.docker}/bin/docker pull ${postgresImage}";
         ExecStart = "${postgresStart}/bin/lemonseed-postgres-start";
         ExecStop = "${postgresStop}/bin/lemonseed-postgres-stop";
-        TimeoutStartSec = "300";
+        # Cold pulls on slow links / TCG QEMU easily exceed a few minutes.
+        TimeoutStartSec = "1800";
       };
     };
 
@@ -233,7 +234,7 @@ in
         ExecStartPre = "-${pkgs.docker}/bin/docker pull ${valkeyImage}";
         ExecStart = "${valkeyStart}/bin/lemonseed-valkey-start";
         ExecStop = "${valkeyStop}/bin/lemonseed-valkey-stop";
-        TimeoutStartSec = "120";
+        TimeoutStartSec = "1800";
       };
     };
 

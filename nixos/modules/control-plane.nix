@@ -5,10 +5,11 @@
 let
   cpSrc = ../../control-plane;
   cpRoot = pkgs.runCommand "lemonseed-control-plane-src" { } ''
-    mkdir -p "$out/catalog"
+    mkdir -p "$out/catalog" "$out/static/brand"
     cp ${cpSrc}/stub.py ${cpSrc}/hardware.py ${cpSrc}/catalog.py ${cpSrc}/chat_ready.py \
        ${cpSrc}/db.py ${cpSrc}/data_services.py ${cpSrc}/modules.py "$out/"
     cp ${cpSrc}/catalog/models.json "$out/catalog/"
+    cp -r ${cpSrc}/static/brand/. "$out/static/brand/"
   '';
 
   pythonEnv = pkgs.python3.withPackages (ps: [ ps.psycopg2 ]);

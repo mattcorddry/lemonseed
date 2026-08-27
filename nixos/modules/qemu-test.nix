@@ -4,6 +4,8 @@
 { lib, ... }:
 
 {
+  imports = [ ./qemu-docker-cache.nix ];
+
   # SquashFS presented as the first virtio disk.
   fileSystems."/" = lib.mkForce {
     device = "/dev/vda";

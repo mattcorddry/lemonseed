@@ -272,8 +272,8 @@ def list_candidate_disks() -> list[dict[str, Any]]:
         if _is_emmc(name, tran):
             eligible = False
             reasons.append("emmc")
-        if size < 16 * 1024**3:
-            # Soft floor: ESP 1G + 2×4G roots + user-data headroom
+        if size < 20 * 1024**3:
+            # Soft floor: ESP + 2×4G roots + userdata + one catalog model.
             eligible = False
             reasons.append("too-small")
 
