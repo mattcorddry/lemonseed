@@ -126,4 +126,9 @@ script=$(echo "$unpack"/*/install)
 export INVOKED_FROM_INSTALL_IN=1
 "$script" "$@"
 
+# setup flakes
+mkdir -p ~/.config/nix
+[ -f ~/.config/nix/nix.conf ] && mv -fv ~/.config/nix/nix.conf ~/.config/nix/nix.conf.bak
+echo "experimental-features = nix-command flakes" > ~/.config/nix/nix.conf
+
 } # End of wrapping
