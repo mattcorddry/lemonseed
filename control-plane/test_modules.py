@@ -69,11 +69,15 @@ class ModulesTests(unittest.TestCase):
     def test_write_upstream(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "owui-upstream.conf"
-            with mock.patch.object(modules, "UPSTREAM_FILE", path):
+            flag = Path(tmp) / "owui-ready"
+            with mock.patch.object(modules, "UPSTREAM_FILE", path), \
+                    mock.patch.object(modules, "OWUI_READY_FLAG", flag):
                 modules.write_upstream(18081)
             text = path.read_text(encoding="utf-8")
             self.assertIn("127.0.0.1:18081", text)
             self.assertIn("upstream lemonseed_owui", text)
+            # Marking the upstream ready also flips the nginx readiness flag.
+            self.assertTrue(flag.exists())
 
     @mock.patch.object(modules, "lemonade_api_key", return_value="test-key")
     @mock.patch.object(modules, "_write_module_secret")
@@ -336,8 +340,10 @@ class ModulesTests(unittest.TestCase):
         ensure: mock.Mock,
     ) -> None:
         modules._health_fail_count = 3
-        with mock.patch.object(modules, "_active_port_from_upstream", return_value=18080):
-            result = modules.supervise_modules_once()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(modules, "OWUI_READY_FLAG", Path(tmp) / "owui-ready"), \
+                    mock.patch.object(modules, "_active_port_from_upstream", return_value=18080):
+                result = modules.supervise_modules_once()
         self.assertEqual(result["state"], "ready")
         self.assertEqual(modules._health_fail_count, 0)
         ensure.assert_called_once_with(force_update=False)
@@ -350,8 +356,10 @@ class ModulesTests(unittest.TestCase):
         ensure: mock.Mock,
     ) -> None:
         modules._health_fail_count = 2
-        with mock.patch.object(modules, "_active_port_from_upstream", return_value=18080):
-            modules.supervise_modules_once()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(modules, "OWUI_READY_FLAG", Path(tmp) / "owui-ready"), \
+                    mock.patch.object(modules, "_active_port_from_upstream", return_value=18080):
+                modules.supervise_modules_once()
         self.assertEqual(modules._health_fail_count, 0)
         ensure.assert_called_once_with(force_update=False)
 
@@ -366,13 +374,15 @@ class ModulesTests(unittest.TestCase):
     ) -> None:
         ensure.return_value = {"state": "ready"}
         modules._health_fail_count = 0
-        with mock.patch.object(modules, "_active_port_from_upstream", return_value=18080):
-            for i in range(1, modules.HEALTH_FAIL_LIMIT):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(modules, "OWUI_READY_FLAG", Path(tmp) / "owui-ready"), \
+                    mock.patch.object(modules, "_active_port_from_upstream", return_value=18080):
+                for i in range(1, modules.HEALTH_FAIL_LIMIT):
+                    result = modules.supervise_modules_once()
+                    self.assertEqual(result["state"], "starting")
+                    self.assertEqual(modules._health_fail_count, i)
+                    ensure.assert_not_called()
                 result = modules.supervise_modules_once()
-                self.assertEqual(result["state"], "starting")
-                self.assertEqual(modules._health_fail_count, i)
-                ensure.assert_not_called()
-            result = modules.supervise_modules_once()
         ensure.assert_called_once_with(force_update=True)
         self.assertEqual(modules._health_fail_count, 0)
 

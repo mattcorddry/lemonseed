@@ -20,46 +20,53 @@ let
     unique
     ;
 
-  selectRoot = pkgs.writeShellScript "lemonseed-select-root" ''
-    set -euo pipefail
-    slot=a
-    if [[ -r /proc/cmdline ]]; then
-      # shellcheck disable=SC2013
-      for arg in $(cat /proc/cmdline); do
-        case "$arg" in
-          lemonseed.slot=*)
-            slot="''${arg#lemonseed.slot=}"
-            ;;
-        esac
-      done
-    fi
-    case "$slot" in
-      a|b) ;;
-      *)
-        echo "lemonseed-select-root: invalid slot '$slot'; using a" >&2
-        slot=a
-        ;;
-    esac
-
-    target=""
-    n=0
-    while [[ "$n" -lt 120 ]]; do
-      if [[ -e "/dev/disk/by-partlabel/root-$slot" ]]; then
-        target="$(readlink -f "/dev/disk/by-partlabel/root-$slot")"
-        break
+  selectRoot = pkgs.writeShellApplication {
+    name = "lemonseed-select-root";
+    runtimeInputs = with pkgs; [ coreutils ];
+    text = ''
+      set -euo pipefail
+      slot=a
+      if [[ -r /proc/cmdline ]]; then
+        # shellcheck disable=SC2013
+        for arg in $(cat /proc/cmdline); do
+          case "$arg" in
+            lemonseed.slot=*)
+              slot="''${arg#lemonseed.slot=}"
+              ;;
+          esac
+        done
       fi
-      sleep 0.25
-      n=$((n + 1))
-    done
-    if [[ -z "$target" || ! -b "$target" ]]; then
-      echo "lemonseed-select-root: PARTLABEL=root-$slot not found" >&2
-      exit 1
-    fi
+      case "$slot" in
+        a|b) ;;
+        *)
+          # No lemonseed.slot= on the kernel cmdline (e.g. QEMU boots with
+          # root=/dev/vda). The initrd generator no-ops in this case, so the
+          # stage-2 alias is never consumed; succeed without touching it.
+          echo "lemonseed-select-root: no lemonseed.slot= on cmdline; nothing to do"
+          exit 0
+          ;;
+      esac
 
-    mkdir -p /dev/disk/by-partlabel
-    ln -sfn "$target" /dev/disk/by-partlabel/lemonseed-root
-    echo "lemonseed-select-root: slot=$slot -> $target"
-  '';
+      target=""
+      n=0
+      while [[ "$n" -lt 120 ]]; do
+        if [[ -e "/dev/disk/by-partlabel/root-$slot" ]]; then
+          target="$(readlink -f "/dev/disk/by-partlabel/root-$slot")"
+          break
+        fi
+        sleep 0.25
+        n=$((n + 1))
+      done
+      if [[ -z "$target" || ! -b "$target" ]]; then
+        echo "lemonseed-select-root: PARTLABEL=root-$slot not found" >&2
+        exit 1
+      fi
+
+      mkdir -p /dev/disk/by-partlabel
+      ln -sfn "$target" /dev/disk/by-partlabel/lemonseed-root
+      echo "lemonseed-select-root: slot=$slot -> $target"
+    '';
+  };
 
   # Runs at systemd generator time (before any units). Writes sysroot.mount
   # pointing at the real GPT label so udev can activate the .device unit.
@@ -159,7 +166,7 @@ in
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
-          ExecStart = selectRoot;
+          ExecStart = "${selectRoot}/bin/lemonseed-select-root";
           StandardOutput = "journal+console";
           StandardError = "journal+console";
         };

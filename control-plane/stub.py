@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 from zoneinfo import available_timezones
 
+import auth
 import chat_ready
 import data_services
 import hardware
@@ -52,9 +53,12 @@ BRAND_MIME = {
     ".webp": "image/webp",
 }
 TIMEZONES = sorted(
-    timezone
-    for timezone in available_timezones()
-    if "/" in timezone and not timezone.startswith(("Etc/", "posix/", "right/"))
+    ["UTC"]
+    + [
+        timezone
+        for timezone in available_timezones()
+        if "/" in timezone and not timezone.startswith(("Etc/", "posix/", "right/"))
+    ]
 )
 
 
@@ -533,6 +537,9 @@ def page_setup(
     error: str = "",
     done: bool = False,
     review_required: bool = False,
+    admin_reset: bool = False,
+    auth_admin_required: bool = False,
+    auth_active: bool = False,
 ) -> bytes:
     rows = []
     units = snap.get("units") or {}
@@ -578,8 +585,25 @@ def page_setup(
         for timezone in TIMEZONES
     )
     err_html = f'<p class="err">{escape(error)}</p>' if error else ""
+    show_form = review_required or admin_reset or not setup_complete()
+    heading = (
+        "Reset admin credentials" if admin_reset else
+        "Review setup" if review_required else "Initial setup"
+    )
+    submit_label = (
+        "Reset and continue" if admin_reset else
+        "Confirm and continue" if review_required else "Finish setup"
+    )
+    admin_fields = ""
+    if auth_admin_required:
+        admin_fields = f"""
+<label for="admin_username">Admin username</label>
+<input id="admin_username" name="admin_username" maxlength="64" autocomplete="off" value="admin" required/>
+<label for="admin_password">Admin password</label>
+<input id="admin_password" name="admin_password" type="password" minlength="8" maxlength="128" autocomplete="new-password" required/>
+"""
     review_html = f"""<section class="panel">
-<h2>{"Review setup" if review_required else "Initial setup"}</h2>
+<h2>{heading}</h2>
 <form method="POST" action="/setup" autocomplete="off">
 <label for="name">Name</label>
 <input id="name" name="name" maxlength="64" autocomplete="off" value="{escape(name, quote=True)}" required/>
@@ -587,12 +611,19 @@ def page_setup(
 <label for="timezone">Timezone</label>
 <select id="timezone" name="timezone" required>
 {timezone_options}
-</select>
-<button class="cta" type="submit">{"Confirm and continue" if review_required else "Finish setup"}</button>
+</select>{admin_fields}
+<button class="cta" type="submit">{submit_label}</button>
 </form>
 {err_html}{'<p class="okmsg">Settings saved. Waiting for services…</p>' if done else ""}
 </section>"""
-    redirect_url = f"http://{mdns_name(str(setup.get('name') or name))}.local/"
+    # Once auth is active the portal is gated; land on the Authelia sign-in so
+    # the browser establishes a session before the chat frame loads (M6.2).
+    # rd=/ is a relative target: Authelia validates it against the (https) cookie
+    # domain, then echoes it back unchanged, so the browser navigates to /
+    # over its own http scheme. An absolute http URL would be rejected as
+    # "unsafe" and Authelia would fall back to its https default_redirection_url.
+    base_url = f"http://{mdns_name(str(setup.get('name') or name))}.local"
+    redirect_url = f"{base_url}/auth/?rd=%2F" if auth_active else f"{base_url}/"
     # Manual escape hatch: mDNS propagation or a slow unit must not trap the user.
     continue_html = (
         '<p class="lede" style="margin-top:0.85rem">If this page does not continue on its own, open '
@@ -622,7 +653,7 @@ waitForStartup();
 </script>"""
     # Preserve any edits on a review form. The completed or regular boot view
     # may poll until all required services, including lemond health, are ready.
-    poll_script = boot_script if done or not review_required else ""
+    poll_script = boot_script if done or not (review_required or admin_reset) else ""
     body = f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -632,8 +663,8 @@ waitForStartup();
 <img class="logo" src="/_lemonseed/brand/lemon-128.png" width="52" height="52" alt=""/>
 <span class="wordmark">LEMONSEED</span>
 </div>
-<h1>{"Review setup" if review_required else "Starting Lemonseed"}</h1>
-<p class="lede">{"Confirm the preserved appliance settings before continuing." if review_required else "Waiting for appliance services to become ready."}</p>
+<h1>{"Reset admin credentials" if admin_reset else "Review setup" if review_required else "Starting Lemonseed"}</h1>
+<p class="lede">{"This appliance was reinstalled with a pending admin reset. Choose the new admin account; other users and data are preserved." if admin_reset else "Confirm the preserved appliance settings before continuing." if review_required else "Waiting for appliance services to become ready."}</p>
 <section class="panel">
 <h2>Startup</h2>
 <p class="lede"><span id="startup-label">Starting services</span> · {ready_count} of {total_count} ready</p>
@@ -645,7 +676,7 @@ waitForStartup();
 <p class="lede" style="margin-top:0.85rem">Version {snap.get("version","unknown")}</p>
 {continue_html}
 </section>
-{review_html if review_required or not setup_complete() else ""}
+{review_html if show_form else ""}
 {poll_script}
 <script>
 const nameInput = document.getElementById('name');
@@ -1074,13 +1105,18 @@ def apply_identity(name_slug: str) -> None:
     )
 
 
-def complete_setup(name: str, timezone: str) -> None:
+def complete_setup(
+    name: str, timezone: str, admin_username: str = "", admin_password: str = ""
+) -> None:
     name = name.strip()[:64]
     timezone = timezone.strip()[:64] or "UTC"
     if not name:
         raise ValueError("name required")
     if timezone not in TIMEZONES:
         raise ValueError("select a valid timezone")
+    admin_username = (admin_username or "").strip()
+    if auth.admin_bootstrap_required() and (not admin_username or not admin_password):
+        raise ValueError("admin username and password are required")
     name_slug = mdns_name(name)
     if mdns_conflict(name_slug):
         raise ValueError(
@@ -1112,6 +1148,10 @@ def complete_setup(name: str, timezone: str) -> None:
         raise
 
     run_best_effort(["timedatectl", "set-timezone", timezone])
+    if admin_username and admin_password:
+        # Synchronous first-admin bootstrap: waits bounded for Postgres, then
+        # derives the Authelia file backend and flips the nginx gate.
+        auth.create_admin(admin_username, admin_password)
     marker = SETUP_COMPLETE_FILE.with_suffix(".tmp")
     marker.write_text(payload["completed_at"] + "\n", encoding="utf-8")
     marker.replace(SETUP_COMPLETE_FILE)
@@ -1136,6 +1176,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json(self, code: int, obj: Any) -> None:
         self._send(code, (json.dumps(obj) + "\n").encode(), "application/json")
+
+    def _require_admin(self) -> bool:
+        """Return True (and send 403) if the caller is not in the admin group.
+
+        nginx sets X-Forwarded-Groups from Authelia's Remote-Groups header
+        (via auth_request_set + proxy_set_header). When the auth gate is
+        disabled (pre-admin) the header is absent, which is fine: setup is
+        not yet complete and /settings/ redirects to /setup anyway.
+        """
+        groups = self.headers.get("X-Forwarded-Groups", "")
+        parts = {g.strip() for g in groups.split(",") if g.strip()}
+        if "admin" not in parts:
+            self._send(403, b"forbidden\n", "text/plain; charset=utf-8")
+            return False
+        return True
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
@@ -1215,6 +1270,7 @@ class Handler(BaseHTTPRequestHandler):
                     "chat": chat_ready.chat_snapshot(),
                     "data": data_services.data_snapshot(),
                     "modules": modules.modules_snapshot(),
+                    "auth": auth.auth_status(),
                     "telemetry": telemetry_snapshot(),
                     "portal_url": f"http://{primary_mdns_slug()}.local/",
                 },
@@ -1223,11 +1279,13 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/settings/content", "/settings/content/"):
             if redirect_off_factory_mdns(self, "/settings/"):
                 return
-            if not setup_complete():
+            if not setup_complete() or auth.reset_marker_present():
                 self.send_response(302)
                 self.send_header("Location", "/setup")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
+                return
+            if not self._require_admin():
                 return
             snap = boot_snapshot()
             snap["chat"] = chat_ready.chat_snapshot()
@@ -1238,11 +1296,13 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/settings", "/settings/"):
             if redirect_off_factory_mdns(self, "/settings/"):
                 return
-            if not setup_complete():
+            if not setup_complete() or auth.reset_marker_present():
                 self.send_response(302)
                 self.send_header("Location", "/setup")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
+                return
+            if not self._require_admin():
                 return
             snap = boot_snapshot()
             snap["chat"] = chat_ready.chat_snapshot()
@@ -1265,7 +1325,8 @@ class Handler(BaseHTTPRequestHandler):
                 not setup_complete()
                 or setup.get("confirmed_version") != appliance_version()
             )
-            if setup_complete() and not review_required:
+            admin_reset = auth.reset_marker_present()
+            if setup_complete() and not review_required and not admin_reset:
                 chat_ready.ensure_chat_worker()
                 modules.ensure_module_worker()
                 # Shell is available even while startup_ready is still warming up.
@@ -1273,7 +1334,12 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(
                     200,
-                    page_setup(snap, review_required=review_required),
+                    page_setup(
+                        snap,
+                        review_required=review_required,
+                        admin_reset=admin_reset,
+                        auth_admin_required=auth.admin_bootstrap_required(),
+                    ),
                     "text/html; charset=utf-8",
                 )
             return
@@ -1296,17 +1362,31 @@ class Handler(BaseHTTPRequestHandler):
             complete_setup(
                 str(data.get("name", "")),
                 str(data.get("timezone", "UTC")),
+                str(data.get("admin_username", "")),
+                str(data.get("admin_password", "")),
             )
         except (ValueError, json.JSONDecodeError) as exc:
             self._send(
                 200,
-                page_setup(boot_snapshot(), error=str(exc), review_required=True),
+                page_setup(
+                    boot_snapshot(),
+                    error=str(exc),
+                    review_required=True,
+                    admin_reset=auth.reset_marker_present(),
+                    auth_admin_required=auth.admin_bootstrap_required(),
+                ),
                 "text/html; charset=utf-8",
             )
             return
+        except Exception as exc:  # noqa: BLE001 — service boundary: log + 500
+            import traceback
+
+            traceback.print_exc()
+            self._json(500, {"error": f"internal error: {exc}"})
+            return
         self._send(
             200,
-            page_setup(boot_snapshot(), done=True),
+            page_setup(boot_snapshot(), done=True, auth_active=auth.admin_exists() is True),
             "text/html; charset=utf-8",
         )
 
@@ -1318,6 +1398,7 @@ def main() -> None:
     chat_ready.ensure_chat_worker()
     data_services.ensure_provision_worker()
     modules.ensure_module_worker()
+    auth.ensure_auth_gate_worker()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"appliance-control-plane listening on http://{HOST}:{PORT}", flush=True)
     server.serve_forever()

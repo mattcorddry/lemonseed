@@ -49,12 +49,19 @@ def get_state() -> dict[str, Any]:
         return dict(_state)
 
 
-def install_worker(disk_path: str, preserve_user_data: bool) -> None:
+def install_worker(
+    disk_path: str, preserve_user_data: bool, reset_admin_credentials: bool
+) -> None:
     def progress(**kwargs: Any) -> None:
         _set(**kwargs)
 
     try:
-        run_install(disk_path, progress=progress, preserve_user_data=preserve_user_data)
+        run_install(
+            disk_path,
+            progress=progress,
+            preserve_user_data=preserve_user_data,
+            reset_admin_credentials=reset_admin_credentials,
+        )
     except InstallError as exc:
         _set(
             phase="error",
@@ -73,7 +80,12 @@ def install_worker(disk_path: str, preserve_user_data: bool) -> None:
         traceback.print_exc()
 
 
-def start_install(disk_path: str, preserve_user_data: bool) -> tuple[int, dict[str, Any]]:
+def start_install(
+    disk_path: str, preserve_user_data: bool, reset_admin_credentials: bool = False
+) -> tuple[int, dict[str, Any]]:
+    # Only meaningful with preserve (fresh installs create the first admin at
+    # /setup anyway; a marker on a fresh box would be noise).
+    reset_admin_credentials = reset_admin_credentials and preserve_user_data
     with _lock:
         if _state["phase"] not in ("idle", "error", "await_usb"):
             return 409, {"error": "install already in progress", "state": dict(_state)}
@@ -85,12 +97,15 @@ def start_install(disk_path: str, preserve_user_data: bool) -> tuple[int, dict[s
                 "error": None,
                 "disk": {"path": disk_path},
                 "preserve_user_data": preserve_user_data,
+                "reset_admin_credentials": reset_admin_credentials,
                 "can_reboot": False,
                 "version": None,
             }
         )
     threading.Thread(
-        target=install_worker, args=(disk_path, preserve_user_data), daemon=True
+        target=install_worker,
+        args=(disk_path, preserve_user_data, reset_admin_credentials),
+        daemon=True,
     ).start()
     return 202, {"ok": True, "state": get_state()}
 
@@ -156,6 +171,13 @@ INDEX_HTML = """<!DOCTYPE html>
         <span>
           <strong>Preserve existing user information on this appliance</strong>
           <small>Keep chats, settings, workers, and downloaded models. Lemonseed system software will be replaced.</small>
+          <span id="reset-admin-row" class="preserve nested hidden">
+            <input id="reset-admin" type="checkbox" />
+            <span>
+              <strong>Reset admin credentials</strong>
+              <small>Ask for a new admin account after reinstall. Other users and their data are kept.</small>
+            </span>
+          </span>
         </span>
       </label>
       <button id="start" class="cta" disabled>Install Lemonseed</button>
@@ -270,7 +292,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "disk required"})
                 return
             preserve_user_data = bool(body.get("preserve_user_data"))
-            code, payload = start_install(disk, preserve_user_data)
+            reset_admin_credentials = bool(body.get("reset_admin_credentials"))
+            code, payload = start_install(
+                disk, preserve_user_data, reset_admin_credentials
+            )
             self._json(code, payload)
             return
         if path == "/api/reboot":

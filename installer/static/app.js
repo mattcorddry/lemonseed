@@ -5,6 +5,8 @@
   const diskPanel = document.getElementById("disk-panel");
   const preserveRow = document.getElementById("preserve-row");
   const preserveCheck = document.getElementById("preserve-user-data");
+  const resetAdminRow = document.getElementById("reset-admin-row");
+  const resetAdminCheck = document.getElementById("reset-admin");
   const progressPanel = document.getElementById("progress-panel");
   const phaseTitle = document.getElementById("phase-title");
   const phaseMsg = document.getElementById("phase-msg");
@@ -123,7 +125,20 @@
     const available = Boolean(disk && disk.preservable_user_data);
     preserveRow.classList.toggle("hidden", !available);
     preserveCheck.checked = available;
+    // Reset-admin only makes sense alongside preserve (a fresh install
+    // creates the first admin at /setup regardless). It is nested under
+    // preserve and greyed out until preserve is checked.
+    resetAdminRow.classList.toggle("hidden", !available);
+    syncResetAdmin();
   }
+
+  function syncResetAdmin() {
+    const enabled = preserveCheck.checked;
+    resetAdminRow.classList.toggle("off", !enabled);
+    if (!enabled) resetAdminCheck.checked = false;
+  }
+
+  preserveCheck.addEventListener("change", syncResetAdmin);
 
   function showProgress() {
     diskPanel.classList.add("hidden");
@@ -252,6 +267,12 @@
         disk: selected,
         preserve_user_data: Boolean(
           selectedDisk && selectedDisk.preservable_user_data && preserveCheck.checked
+        ),
+        reset_admin_credentials: Boolean(
+          selectedDisk &&
+            selectedDisk.preservable_user_data &&
+            preserveCheck.checked &&
+            resetAdminCheck.checked
         ),
       }),
     });

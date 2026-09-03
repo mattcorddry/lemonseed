@@ -53,7 +53,7 @@ Lemonseed is a **local, multi-user home AI hub** — not a cloud client and not 
 - Shipping application container images inside the base SquashFS
 - Writable overlay / tmpfs overlay on root
 - Cloud model burst / anonymized cloud GPU relay (Concept “future”; not M5)
-- Multi-user auth via **nginx proxy auth** (Lemonseed session); Open WebUI native login **disabled**; no per-container OAuth
+- Delegated auth inside modules (per-container OAuth / OpenID) — auth happens only at the nginx edge (M6.2, Authelia); Open WebUI native login **disabled**
 - LUKS/encrypted user-data (deferred past M6; plan later)
 
 ---
@@ -69,10 +69,10 @@ Lemonseed is a **local, multi-user home AI hub** — not a cloud client and not 
 | **M4 — USB installer** | **Nearly done** — install + portal + first-boot setup; polish remaining |
 | **M4.1 — Preserve known user-data on reinstall** | **Done** — namespaced storage identity; preserve checkbox; layout-compatible reinstall |
 | **M5 — Hardware-aware local chat** | **Done** — `lemond` + NVIDIA/CUDA; inventory + catalog planner + CP pull/load/pin + portal “Local chat ready”; unit tests + QEMU API smoke |
-| **M6 — Open WebUI household UX** | **In progress** — M6.1 done; **M6.3a** policy+brand done; next **M6.2** nginx proxy auth (SearXNG/ComfyUI after basics) |
+| **M6 — Open WebUI household UX** | **In progress** — M6.1 + M6.3a done; next **M6.2** edge auth (Authelia, file backend + Valkey sessions); SearXNG/ComfyUI after auth |
 | **M6+ (later)** | Conduit/mobile polish, AMD/UMA profiles, heterogeneous GPU planner, encryption, offline install, Secure Boot/TPM |
 
-**Immediate next step:** **M6.2** nginx proxy auth before multi-user / shared-LAN features. SearXNG / ComfyUI can follow once auth and policy basics are in place.
+**Immediate next step:** **M6.2a** — edge auth via **Authelia (file backend)** behind nginx at `/auth/`, first-admin bootstrap via `/setup` (the USB installer only supplies the lockout reset marker), Valkey session store. Multi-user / shared-LAN features (SearXNG, channels/calendar, ComfyUI) follow once the edge is authenticated.
 
 ### M6 — Open WebUI as primary UX (decided)
 
@@ -89,24 +89,27 @@ Lemonseed is a **local, multi-user home AI hub** — not a cloud client and not 
 - Open WebUI runs as a **Docker module** managed by the control plane; nginx :80 is the only LAN entry.
 - **Primary UX** is a **Lemonseed app shell** (CP-served) that embeds Open WebUI in an iframe — not DOM injection into OWUI, and not “OWUI as the whole product.”
 - **Module and CP durable state** live in shared **PostgreSQL** (and **Valkey** where needed) — not bind-mounted SQLite files inside containers.
-- CP owns catalog, model load, `chat-ready`, module lifecycle, DB/credential provisioning, and (later) Lemonseed user sessions at nginx.
+- CP owns catalog, model load, `chat-ready`, module lifecycle, DB/credential provisioning, group/user accounts (Postgres), and the edge-auth gate at nginx (M6.2).
 
 ```
 Browser / Conduit (later)
         │
         ▼
-   nginx :80  ── routing now; proxy auth later (not OAuth inside modules)
+   nginx :80  ── routing + edge auth via Authelia (M6.2; modules stay auth-naive)
         │
-        ├── /              → Lemonseed shell (document) or OWUI (iframe / ?embed=1)
-        ├── /settings/…    → control plane portal (admin, status)
-        ├── /setup, /healthz, /api/{boot,status,…} → CP
-        └── /*             → Open WebUI (assets, /api/v1, /c/…, websockets)
+        ├── /              → Lemonseed shell (document) or OWUI (iframe / ?embed=1)   [gated]
+        ├── /auth/         → Authelia (sign-in UI; /auth/api/verify internal)
+        ├── /settings/…    → control plane portal (admin, status)                     [gated; admin group]
+        ├── /setup, /healthz, /api/{boot,status,…} → CP            (open; rest of /api/* gated)
+        └── /*             → Open WebUI (assets, /api/v1, /c/…, websockets)           [gated]
 
 Open WebUI (Docker) ──► nginx /_lemonseed/lemond/ ──► lemond 127.0.0.1:13305/v1
                      └──► PostgreSQL (+ pgvector)
 
-CP ──► PostgreSQL (appliance + module metadata, users when auth lands)
-SearXNG / ComfyUI ──► sidecar modules when enabled (VRAM/policy)
+CP ──► PostgreSQL (appliance + module metadata + user/group accounts)
+       └──► derives users.yaml, gate snippets, module env/secrets (see §3)
+Authelia (SquashFS, 127.0.0.1:9091) ──► users.yaml (file backend)
+                                └─────► Valkey (sessions; key TTL → auto-GC)
 ```
 
 **Shell chrome (M6.1):** thin brand bar, Chat / Modules nav, settings gear, load/storage meters; Open WebUI kept alive in a background iframe when switching tabs.
@@ -141,12 +144,79 @@ Failed health-check → old container keeps serving; appliance stays up.
 
 #### Gateway & auth
 
-**M6.1 (done):** **Fully disable Open WebUI authentication** — no OWUI login screen, no OAuth hooks inside the module. LAN access matches current bring-up trust model until nginx auth ships.
+**M6.1 (done):** **Fully disable Open WebUI authentication** — no OWUI login screen, no OAuth hooks inside the module. LAN access matches the bring-up trust model until M6.2 edge auth ships.
 
-**M6.2+ (planned):** **Proxy-style auth in nginx only** — Lemonseed user management validates the session at the edge; trusted identity forwarded to upstreams via headers (exact header scheme TBD). **Do not** delegate OAuth/OpenID to each container; modules stay auth-naive behind nginx.
+**M6.2 (design locked):** **Authelia (file backend) at the nginx edge** — full design below. **Do not** delegate OAuth/OpenID to containers; modules stay auth-naive behind nginx.
 
 - Open WebUI container receives Lemonade URL + API key + Postgres/Valkey DSN via env/secrets from CP.
-- No host network; no direct LAN exposure of `lemond` or Postgres.
+- No host network; no direct LAN exposure of `lemond`, Postgres, Valkey, or Authelia (all `127.0.0.1`-bound; Authelia is only reachable via nginx `/auth/`).
+
+#### M6.2 — Edge auth (Authelia, file backend) (design)
+
+**Decision (2026-08):** Reuse **Authelia** as the edge auth provider instead of building session/credential security in-house. Authelia is a mature, open-source auth server (JWT sessions, bcrypt, TOTP, file or SQL backends); we take its sign-in / verify / session machinery while **Lemonseed account data stays in CP/Postgres** (the file backend is a derived artifact, see §3).
+
+**Placement — NixOS service in SquashFS, not a Docker module:**
+- `authelia.service` (`nixos/modules/authelia.nix`), bound to `127.0.0.1:9091` only; `pkgs.authelia` from the pinned nixpkgs flake input (explicit version — never `:latest`).
+- Auth is critical edge infrastructure: it must come up whenever nginx does, independent of CP/Docker health. A CP-managed container would lock the box out when CP is down.
+- Not the nixpkgs `services.authelia` module: its config must exist at build time, but the JWT secret is generated at provisioning. Custom unit; all Authelia state on user-data.
+
+**Backends (reusing the existing data plane):**
+
+| Concern | Store | Why |
+|---------|-------|-----|
+| User accounts | **File backend** `users.yaml` | Simple, stable schema; content is **derived from CP/Postgres** — Authelia never owns account truth |
+| Sessions | **Valkey** (Redis) at `127.0.0.1:6379`, dedicated `db_index` | No on-disk session files; **key TTL = token expiry → stale sessions auto-GC by Valkey** |
+
+- Authelia config at `/var/lib/authelia/config.yml` (0640, generated once at first-admin bootstrap: JWT secret + paths + policy); `users.yaml` is rewritten by CP on every account change (Authelia file watcher hot-reloads — no restart).
+- Ordering: `authelia.service` after `lemonseed-valkey.service`; if Valkey is down, Authelia restart-loops — harmless pre-setup (gate off) and transient post-setup (data services are resilient).
+
+**Gateway (nginx) integration:**
+- Functional (not product-named) URL surface: `location /auth/` → `127.0.0.1:9091/auth/` (sign-in UI + API). Authelia configured with `server.authentication.path: /auth` so the backend can be swapped later without touching the LAN surface.
+- Internal `location = /_lemonseed/auth-verify` → `GET /auth/api/verify` with `Authorization`, `X-Original-URL`, `X-Original-Method`; 401 → `302 /auth/?rd=$request_uri`.
+- **Reloadable gate** (same pattern as `owui-upstream.conf`): protected locations `include /run/lemonseed/auth-gate.conf` (empty at boot, seeded by a oneshot before nginx; CP writes `auth_request` + `auth_request_set` lines and reloads nginx once the first admin exists). `/settings/` additionally includes `/run/lemonseed/auth-admin.conf` (requires `admin` group, else 403).
+- **X-Forwarded-\* hygiene:** identity headers `X-Forwarded-User`, `X-Forwarded-Email`, `X-Forwarded-Groups` are set **only** from `auth_request_set` variables in the proxy snippets. nginx `proxy_set_header` overrides any client-supplied value of the same name, so **Authelia is the only origin** of these headers (never `proxy_pass_header` them; empty pre-auth → header omitted).
+
+**Access policy:** `default_policy: one_factor`, **no domain rules** (single-appliance trust; keeps QEMU `127.0.0.1` Host working). TOTP self-service per account (issuer "Lemonseed"). No email notifier (no SMTP on appliance) → all credential recovery goes through CP (below) or physical reinstall.
+
+**Open (bypass) vs gated:**
+- Open: `/healthz`, `/health`, `/setup`, `/api/boot`, `/api/status`, `/_lemonseed/brand/`, `/favicon.ico`, `/auth/`, `/_lemonseed/lemond/` (API key + Docker-range ACL, unchanged).
+- Gated: `/` (shell + OWUI), OWUI catch-all, `/ws/` (auth_request works on socket.io upgrades), `/settings/` (+ admin group), remaining `/api/*`.
+- Modules receive identity via `X-Forwarded-*`; OWUI stays auth-disabled — per-user prompt/context layers can consume the headers later.
+
+**Admin bootstrap — single path (`/setup`); no singular “owner”:**
+- **One credential path, no interstitial:** the only way to create the first admin is the first-boot **`/setup`** form (name + timezone + admin username + password), submitted over the appliance's own LAN web UI. It is handled **synchronously in the `/setup` POST handler** (the existing name/timezone `complete_setup` path) — no background consume worker, and the installer does **no** auth work for a fresh install.
+- **Bootstrap gate:** `/setup` offers admin-creation **iff the `admin` group is empty**. This generalizes the old “no owner exists.” Once ≥ 1 admin exists, `/setup` no longer creates admins; additional admins are added by an existing admin through `/api/auth` (M6.2b).
+- **First-admin consume:** on submit, CP creates the admin user (default `admin` + `users` group mappings), derives `users.yaml` / `config.yml`, flips the gate snippets, and runs `nginx -s reload`. CP waits for the data-services readiness signal (Postgres up) before acting — same pattern as existing workers.
+- **Lockout recovery — installer reset marker (physical access only):** the USB installer adds a **“Reset admin credentials”** checkbox (default off; only meaningful with *preserve*). When set, `seed_esp` (which already mounts the ESP rw and reformats it each install) drops a tiny marker `ESP/lemonseed-reset-admin`. A first-boot **oneshot** (same pattern as `lemonseed-owui-upstream-seed`) relocates it to persistent **`/var/lib/lemonseed/reset-admin`** (CP-writable; survives a reboot). On the next `/setup` submit, CP **clears the `admin` group** (drops admin-group membership, leaving user accounts and data intact) so the bootstrap gate reopens and the physical owner recreates the admin. Requires physical access, so a remote attacker cannot trigger credential recovery.
+- **Installer stays lean:** **Authelia is not added to the installer image** and the installer never handles passwords (no `mkpasswd`/bcrypt there); all hashing happens in the CP.
+
+**Accounts & CP surface — standard users + groups model (Linux `/etc/passwd` + `/etc/group` style; not reinventing the wheel):**
+- Separate **users** and **groups** with a **many:many** mapping, stored in the CP database (`lemonseed_cp`, isolated from module DBs): `users` (username PK, display name, email, password hash, disabled, reserved nullable `account_type` for future child/adult content filters), `groups` (name PK), `user_groups` (user↔group join).
+- **No singular “owner”:** elevation is pure **group membership** in the privileged **`admin` group** — a privilege level with any number of members (name it `admin`, not `owner`; a designated commercial owner can be added later as an account attribute if ever needed). `admin` ⇒ full `/settings/` + `/api/auth` management. Default groups: `admin` (privileged) + `users` (baseline).
+- Example: `Matt` ∈ {`admin`, `corddry_family`, `matt_friends`}; partner `Jill` ∈ {`corddry_family`}; a second power-user `Ade` ∈ {`admin`, `corddry_family`}.
+- Bootstrap (`/setup`, above) creates the first admin and ensures the `admin` + `users` groups exist, mapping the admin to both.
+- `GET/POST /api/auth` (`admin`-gated, M6.2b): user management (add / reset password / enable / disable / remove) and group management (create / remove groups, map users ↔ groups) → Postgres + regenerate `users.yaml` (each Authelia entry's `groups:` = that user's mapped groups). **Guardrail:** refuse to remove **or disable** the **last remaining enabled `admin`** via the API, so the only ways to reach “no active admin” are a fresh box or the physical reset marker (keeps the `/setup` admin-creation gate honest). Settings portal gets a **Users & Groups** section.
+- `/api/status` gains `auth: {state: enabled|disabled, admins: N, users: N, service: healthy|…}` via a cheap live probe of `127.0.0.1:9091`.
+
+**Phases:**
+
+| Phase | Deliverable |
+|-------|-------------|
+| **M6.2a** | Authelia service + Valkey session store + `/auth/` gateway gate + first-admin bootstrap via `/setup` (installer supplies only the lockout reset marker) + identity headers. Appliance locks once the first `admin` exists. |
+| **M6.2b** | `/api/auth` users & groups management (user add / reset / disable / remove; group create / map) + portal Users & Groups section. |
+
+**Testing:**
+- **Unit** (`make test`): `users.yaml` rendering, reset-marker relocate/consume idempotency, bootstrap gate (`admin` group empty vs. non-empty), gate/admin snippet contents, `/api/auth` handlers (incl. last-admin guardrail) — subprocess/psycopg2 mocked.
+- **QEMU smoke (new auth phase):** fresh box → gate empty → all existing probes unchanged. Then `POST /setup` (name + timezone + admin creds) → wait for `auth.state=enabled` → assert: unauth `GET /` → 302 `/auth/`; sign-in via `/auth/api/authorize?form=true` + cookie jar → `GET /` 200; `GET /settings/` 200 as admin; `/healthz` + `/api/status` still open. M6.2b adds a non-admin member → 403 on `/settings/`.
+
+**Risks / accepted:**
+- Authelia version + config schema come from the nixpkgs pin; Authelia validates config at boot — QEMU smoke is the tripwire.
+- No SMTP / no email reset links → recovery is an admin CP reset (M6.2b) or the physical reset marker (above).
+- Docker modules can reach `/auth/` via `host.docker.internal:80` (first-party containers only) — accepted.
+- Pre-admin window: gate off = today's LAN trust model; it closes the moment the first `admin` is created via `/setup`. The box is already on the LAN and bouncing to `/setup` during first-boot setup, so this is the same window that exists today — no new exposure.
+- No singular owner: `admin` is a group; removal of all admins is backstopped by the physical reset marker, and the API guardrail (no last-active-admin removal/disable) prevents soft-lockout via `/api/auth`.
+- **HTTP-only Authelia workaround (4.x):** Authelia 4.x hardcodes `Secure` on the session cookie and requires `https`/`wss` for `authelia_url`, `default_redirection_url`, and the `X-Original-URL` target — none configurable. Since the appliance is HTTP-only on the LAN, nginx (a) forces `X-Original-URL "https://$http_host$request_uri"` in the internal auth-verify location, (b) the CP writes `authelia_url`/`default_redirection_url` as `https://{domain}/…` (used only for cookie-domain selection + redirect validation, not by the browser), and (c) strips the `Secure` flag via `proxy_cookie_flags authelia_session nosecure`. SameSite=Lax + HttpOnly are retained. If the appliance ever serves HTTPS (TLS at the gateway), these workarounds should be revisited.
+- **Known QEMU smoke artifact:** the QEMU smoke's `GET /settings/` (admin-gated) can return 403 while `GET /` and `/api/data` pass with the same session cookie — a test-environment quirk (Host/`--resolve` port + cookie-domain interaction), **not** a product bug; `/settings/` is verified working on a real VM appliance. Do not chase it in the QEMU loop.
 
 #### Open WebUI container policy
 
@@ -196,12 +266,13 @@ Default appliance image: **no** community plugins until reviewed; optional “en
 | **M6.0** | **Done** — UX decision recorded (this section) |
 | **M6.0a** | **Done** — shared PostgreSQL (+ pgvector) + Valkey; CP credential provisioning; CP state in Postgres; QEMU + hardware smoke |
 | **M6.1** | **Done** — Open WebUI on Postgres; auth disabled; Lemonade wired; Lemonseed shell + blue/green; durable chat history |
-| **M6.2** | nginx **proxy auth** (Lemonseed sessions); OWUI remains authless behind nginx |
+| **M6.2a** | **Authelia (file backend)** edge auth at nginx `/auth/`; Valkey session store (TTL-GC); first-admin bootstrap via `/setup` (installer supplies only the lockout reset marker); identity headers; OWUI remains authless behind nginx |
+| **M6.2b** | `/api/auth` users & groups management (user add / reset / disable / remove; group create / map) + portal Users & Groups section |
 | **M6.3** | OWUI policy seeding (**M6.3a** done for env defaults); SearXNG sidecar; calendar/channel defaults |
 | **M6.4** | Household smoke; `make test` green |
 | **M6+** | Conduit mobile, ComfyUI VRAM gating, multi-model tiers, vetted community plugins |
 
-**Sequencing M6.2 vs OWUI expansion (M6.3):** Prefer a short **M6.3a policy-seed** pass (autocomplete off, automations on, workspace defaults, Lemonseed system prompt) that does not need auth, then **M6.2 proxy auth** before multi-user / shared-LAN features that assume distinct people. **SearXNG**, channels/calendar, and ComfyUI wait until after auth if they create shared durable state or widen the attack surface on an open LAN. If the next demo is still single-trust LAN, finishing M6.3a then SearXNG before auth is acceptable — do not block light OWUI polish on M6.2.
+**Sequencing:** M6.3a policy seed is done; **M6.2 edge auth is next**, before any multi-user / shared-LAN feature that assumes distinct people. **SearXNG**, channels/calendar, and ComfyUI wait until after M6.2 — they create shared durable state or widen the attack surface on an open LAN.
 
 **M6.3a (done):** Open WebUI env seeds via `enrich_open_webui_secrets()` with `ENABLE_PERSISTENT_CONFIG=False`: autocomplete off; automations on (incl. non-admin permission); workspace access off; notes/memory on; channels off until shared-channel seeding; web search / image gen / community sharing off until sidecars; `DEFAULT_MODEL_PARAMS` Lemonseed identity prompt + `function_calling=legacy` (v0.11 native tools caused empty KB/file queries); `DEFAULT_MODEL_METADATA` disables builtin_tools / knowledge / files until curated sources exist; `ENABLE_VERSION_UPDATE_CHECK=False` (with `OFFLINE_MODE`) to suppress update/What’s New noise. Shell/setup/installer use the lemon brand mark under `/_lemonseed/brand/` (installer: `/static/brand/`). Open WebUI image pin rebased to **v0.11.0** (latest stable at bump time). Shell **Getting Ready** bubble gates the OWUI iframe on **both** module `http_ready` and `chat.state=ready` (model pulled, loaded, and verified via a short Lemonade completion).
 
@@ -210,12 +281,16 @@ Default appliance image: **no** community plugins until reviewed; optional “en
 - **OWUI model/policy via API:** evaluate configuring models through Open WebUI’s admin/API instead of (or in addition to) `DEFAULT_MODEL_*` env seeds — may survive container recreate more cleanly and avoid env/UI drift; keep env for bootstraps that must work before first login.
 - **CP-owned module lifecycle:** Docker module containers use `--restart no`; CP starts/replaces them after boot and on policy drift (blue/green + nginx reload). A long-lived supervisor starts a missing container and force-recreates after **5 contiguous** failed HTTP health probes. Continue hardening rollback (failed cutover keeps old slot) rather than relying on Docker auto-start of stale Envs.
 - **CP model picker:** let households choose/experiment with alternate catalog models from the control panel (not only the automatic planner pick).
+- **Account types (child/adult):** per-account indicator for content filtering (OWUI policy/prompt layering); `users.account_type` column reserved in M6.2, population + policy later.
 - **Local Wikipedia cache:** experimental indexed Wikipedia snapshot on spacious, well-connected appliances as an optional knowledge source for OWUI (when native KB tools are re-enabled).
 - **Live API health:** CP status fields (`/api/data`, `/api/status`, subsystem snapshots) should report **current health** via cheap live checks (e.g. `pg_isready` / `SELECT 1`, Valkey PING, HTTP ready), not a one-shot or cached reflection of “daemon started once.” If Postgres stops accepting connections after boot, the API should flip to unhealthy.
 - **Module catalog specs:** Define a Lemonseed **module configuration file** (one file per module under a catalog directory in-tree). Each spec encapsulates execution params (docker-compose fragment / pinned image), UX (logo, name, description, help), and dependencies (Postgres, Valkey, future object store). Catalog entries are what users see and what the CP downloads/sets up. The catalog itself needs a **test/release cycle**: pull candidate images → integration test → advance the version pin only when validated.
 - **Module image pins (strategy):** Every Docker module tracks the **newest upstream stable** tag we have validated. Keep an explicit pin in code (Open WebUI: `ghcr.io/open-webui/open-webui:v0.11.0` via `OWUI_IMAGE_DEFAULT` in `control-plane/modules.py`) so field appliances never float on `:latest` / `:main`. The build/rebase pipeline should regularly bump pins to current stable, run unit + QEMU smoke (and hardware when the module is user-facing), then land the pin — not leave modules on stale releases for “safety.” Lab overrides use `LEMONSEED_OWUI_IMAGE` only.
 - **Backup / restore:** Transactionally clean, space/time-efficient backup including Postgres dump, Valkey dump, and per-module **durable** volumes declared in the module spec. Targets: USB (preflight free-space check; optional encryption) and local SMB/NAS shares.
 - **Installer stream-to-disk:** partition first, stream squashfs to `root-a`, avoid multi-GB RAM staging on the live ISO.
+- **Internationalization &amp; accessibility:** Support for multiple languages and dialects, number units, and for assistive technology (e.g. image ALT tags, screen reader support).
+- **UX Theme Support:** Enable multiple preset themes (e.g. light mode, dark mode, professional, playful) to give the website a specific look and feel to align with the user preferences.
+
 #### M6 acceptance checklist
 
 - [x] Written UX decision: Open WebUI primary; NanoClaw-style UI deferred
@@ -227,6 +302,11 @@ Default appliance image: **no** community plugins until reviewed; optional “en
 - [x] Policy defaults applied (autocomplete off, automations on, workspace off, etc.)
 - [x] `make test` still green
 - [x] No second co-equal “main” UI shipped by default (shell embeds OWUI)
+- [ ] M6.2a: Authelia (file backend) + Valkey sessions behind the nginx `/auth/` gate; locked once the first `admin` exists
+- [ ] Admin bootstrap: single `/setup` path (name + timezone + admin creds, synchronous); installer supplies only the lockout reset marker (`ESP/lemonseed-reset-admin` → `/var/lib/lemonseed/reset-admin`)
+- [ ] Identity `X-Forwarded-*` sourced only from Authelia (client-supplied overridden); `/settings/` admin-gated
+- [ ] M6.2b: `/api/auth` users & groups management + portal Users & Groups section
+- [ ] QEMU auth phase green (redirect → sign-in → authenticated 200s; status endpoints stay open)
 
 ### M3 verification
 
@@ -469,6 +549,8 @@ Open WebUI, gateway auth Phase 2, ComfyUI/sd-cpp images, Lemonade web/desktop UI
                          └── Docker modules later (Open WebUI, …)
 ```
 
+**Configuration authority (M6 principle):** The **control plane + Postgres is the source of truth** for appliance intent — user/group accounts, module registry, model pins, credentials. Configuration files and environment variables (OWUI env/secrets, Authelia `users.yaml`, nginx gate/upstream snippets, `lemond.env`, data-service secrets) are **derived artifacts**, regenerated by CP on change and reconciled at boot. Nothing downstream of CP is hand-edited as truth.
+
 ---
 
 ## 4. Disk layout (EFI-first GPT)
@@ -705,6 +787,7 @@ Distribution may later wrap this as a tarball or serve discrete objects; layout 
 | Transport / update authenticity | HTTPS + **detached signatures** on artifacts |
 | Root filesystem | Read-only SquashFS; no overlay |
 | Mutable state | Minimal btrfs binds; restrictive mount flags |
+| Edge auth (M6.2) | **Authelia (file backend)** behind nginx `auth_request` at `/auth/`; sessions in **Valkey** (key TTL → auto-GC); identity `X-Forwarded-*` only from Authelia; modules auth-naive |
 | Privileged ops | Isolated control-plane daemon vs UI |
 | Boot trust / TPM / Secure Boot | Deferred |
 | Driver redistribution | All-in-image for simplicity; revisit if licensing blocks redistribution |
@@ -745,7 +828,7 @@ Resolved for early milestones where noted; remaining items do not block M5 start
 6. **HTTP channel details** — versioned dirs + `manifest.json` (current CDN path).
 7. **NVIDIA open module + nixpkgs kernel pin + CUDA `llama-cpp`** — **blocks M5 GPU tests**; lock a known-good combo on the NVIDIA prototype before catalog load work.
 8. **Model download timing** — **background after setup** (M5 decision).
-9. **Encryption** — deferred past M5; document a later LUKS/migration plan before friends-and-family data.
+9. **Encryption** — deferred past M5; document a later LUKS/migration plan before friends-and-family data. See `./AUTH-TOTP.md` for one idea.
 10. **ComfyUI vs Lemonade sd-cpp** — ComfyUI preferred when image gen lands; skip images in M5.
 11. **Heterogeneous GPU planner** — inventory-ready schema now; scheduling later.
 12. **`lemond` packaging** — from-source Nix derivation (nix-amd-ai patterns); whether to flake-input `nix-amd-ai` later for AMD only, or vendor a slim copy.
@@ -763,7 +846,7 @@ Resolved for early milestones where noted; remaining items do not block M5 start
 | Bootloader | GRUB EFI |
 | A/B | GRUB `grubenv` one-shot + lock-in |
 | Root | SquashFS via `dd`; no overlay |
-| User-data | Installer creates LVM PV; initrd/stage-2 provisioner creates VG/LV/btrfs |
+| User-data | Installer creates the LVM PV only; the first-boot initrd provisioner runs the idempotent VG/LV/btrfs provisioning (no installer-side provisioner, no interstitial) |
 | Mutable state | btrfs subvols `@etc`/`@var` mounted on `/etc`/`/var` |
 | `/tmp` | size-capped tmpfs (128M) |
 | ESP | On-demand mount only |
@@ -781,9 +864,12 @@ Resolved for early milestones where noted; remaining items do not block M5 start
 | Partition config | YAML source → systemd-repart as apply engine |
 | Signing | Layout ready; detached sigs; optional/local keys in M1 |
 | Distribution | HTTP; versioned artifact directory |
-| Installer | M4; partitions only (no btrfs format); reinstall releases LVM/DM |
+| Installer | M4; partitions (+ optional lockout reset marker, M6.2); no auth work for fresh installs; reinstall releases LVM/DM |
 | Encryption | Deferred past M5 |
-| Open WebUI / auth | **M6.1:** OWUI auth off. **M6.2+:** nginx proxy auth only |
+| Open WebUI / auth | **M6.1:** OWUI auth off. **M6.2:** edge auth only at the nginx boundary — modules stay auth-naive (no per-container OAuth) |
+| Edge auth (M6.2) | **Authelia, file backend** (`users.yaml` derived from CP); **Valkey** session store (TTL auto-GC); NixOS service on `127.0.0.1:9091` (not Docker); nginx `auth_request` at functional path `/auth/` |
+| CP authority | **CP + Postgres is the source of truth** (accounts = standard **users + groups**, many:many, Linux-style; elevation = `admin` group, no singular owner); config files / env / secrets are derived and regenerated (see §3) |
+| Admin bootstrap | **Single `/setup` path** (synchronous; name + timezone + admin creds) — first admin only while the `admin` group is empty; no installer interstitial, no Authelia/`mkpasswd` in the installer; lockout = preserve-reinstall + “Reset admin credentials” marker (physical access) clears the `admin` group so `/setup` reopens |
 
 ---
 
@@ -813,7 +899,8 @@ Historical M1 checklist (kept for archive):
 - [x] UX evaluation complete — Open WebUI primary; NanoClaw-style UI deferred
 - [x] Conduit noted as future mobile path
 - [x] Shared Postgres + Valkey + pgvector; minimal bind mounts; blue/green module updates
-- [x] Auth: OWUI disabled for M6.1; nginx proxy auth planned (not container OAuth)
+- [x] Auth: OWUI disabled for M6.1; edge auth via Authelia at nginx (M6.2 design locked; not container OAuth)
 - [x] M6.0a data services + CP credential provisioning
 - [x] M6.1 Open WebUI on Postgres + Lemonade backend + Lemonseed shell
-- [ ] M6.2 nginx proxy auth
+- [ ] M6.2a: Authelia (file backend) + Valkey sessions + `/auth/` gate + first-admin bootstrap via `/setup` (installer supplies only the lockout reset marker)
+- [ ] M6.2b: `/api/auth` users & groups management (user add / reset / disable / remove; group create / map) + portal Users & Groups section

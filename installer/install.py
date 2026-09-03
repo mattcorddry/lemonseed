@@ -374,7 +374,12 @@ def partition_disk(
     _progress(progress, phase="partition", message="Partitions ready", progress=55)
 
 
-def seed_esp(disk: str, files: dict[str, Path], progress: ProgressFn | None) -> None:
+def seed_esp(
+    disk: str,
+    files: dict[str, Path],
+    progress: ProgressFn | None,
+    reset_admin_credentials: bool = False,
+) -> None:
     esp = wait_part(disk, "ESP")
     ESP_MOUNT.mkdir(parents=True, exist_ok=True)
     mounted = False
@@ -427,6 +432,13 @@ def seed_esp(disk: str, files: dict[str, Path], progress: ProgressFn | None) -> 
 
         if AB_HELPER.is_file():
             _run(["bash", str(AB_HELPER), "init", "--esp", str(ESP_MOUNT)])
+
+        if reset_admin_credentials:
+            # Physical-access-only lockout recovery: the first-boot
+            # lemonseed-auth-reset-seed unit relocates this to user-data, and
+            # /setup then re-arms admin creation. ESP is wiped every install,
+            # so a stale marker never survives a reinstall that lacks the flag.
+            (ESP_MOUNT / "lemonseed-reset-admin").write_text("1\n", encoding="utf-8")
 
         partn = partition_number(esp)
         loader = "\\EFI\\lemonseed\\" + efi_bin.name
@@ -485,7 +497,10 @@ def seed_esp(disk: str, files: dict[str, Path], progress: ProgressFn | None) -> 
 
 
 def run_install(
-    disk_path: str, progress: ProgressFn | None = None, preserve_user_data: bool = False
+    disk_path: str,
+    progress: ProgressFn | None = None,
+    preserve_user_data: bool = False,
+    reset_admin_credentials: bool = False,
 ) -> None:
     _progress(
         progress,
@@ -514,7 +529,7 @@ def run_install(
     _progress(progress, phase="write", message="Writing system image to root-a", progress=58)
     write_raw(files["root.squashfs"], root_a, progress, 58, 84)
     _progress(progress, phase="write", message="System image written", progress=85)
-    seed_esp(disk_path, files, progress)
+    seed_esp(disk_path, files, progress, reset_admin_credentials=reset_admin_credentials)
     # Flush target disk before inviting media removal — the live installer
     # root is still on that CD/USB and will vanish when it is ejected.
     _progress(

@@ -63,6 +63,19 @@ let
     }
   '';
 
+  # nginx has no built-in auth_user/auth_email/auth_groups variables: the
+  # auth_request_set directives in the gate snippet assign them, but the
+  # proxy_set_header directives in the vhost locations reference them at
+  # config-parse time. `set` is only allowed in server/location/if scopes
+  # (not http), so declare them at server scope via extraConfig.
+  authVarDecls = ''
+    set $auth_user "";
+    set $auth_email "";
+    set $auth_groups "";
+  '';
+
+
+
   seedOwuiUpstream = pkgs.writeShellApplication {
     name = "lemonseed-owui-upstream-seed";
     runtimeInputs = [ pkgs.coreutils ];
@@ -72,8 +85,33 @@ let
       if [[ ! -s /run/lemonseed/owui-upstream.conf ]]; then
         install -m 0644 ${defaultOwuiUpstream} /run/lemonseed/owui-upstream.conf
       fi
+      # OWUI is down at boot: start with the flag absent so nginx serves the
+      # shell (interstitial) for document requests until the control plane marks
+      # OWUI ready (M6.2). Never create it here — only CP creates/removes it.
+      rm -f /run/lemonseed/owui-ready
     '';
   };
+
+  # Edge-auth identity headers (M6.2): set ONLY from auth_request_set
+  # variables populated by Authelia. An empty variable makes nginx omit the
+  # header, and these directives replace any client-supplied value of the
+  # same name — so client X-Forwarded-User/-Email/-Groups are always dropped.
+  identityHeaders = ''
+    proxy_set_header X-Forwarded-User $auth_user;
+    proxy_set_header X-Forwarded-Email $auth_email;
+    proxy_set_header X-Forwarded-Groups $auth_groups;
+  '';
+
+  # Reloadable edge-auth gate (seeded empty before nginx; CP writes it after
+  # the first admin exists). Included by every protected location.
+  authGate = ''
+    include /run/lemonseed/auth-gate.conf;
+  '';
+
+  # Admin-group gate for /settings/ and other privileged surfaces (M6.2).
+  adminGate = ''
+    include /run/lemonseed/auth-admin.conf;
+  '';
 
   cpProxy = ''
     proxy_http_version 1.1;
@@ -81,6 +119,7 @@ let
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
+    ${identityHeaders}
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection $connection_upgrade;
     proxy_read_timeout 3600s;
@@ -95,6 +134,7 @@ let
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
+    ${identityHeaders}
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection $connection_upgrade;
     proxy_read_timeout 3600s;
@@ -126,6 +166,7 @@ let
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
+    ${identityHeaders}
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection $connection_upgrade;
     proxy_read_timeout 3600s;
@@ -134,6 +175,54 @@ let
     proxy_hide_header X-Frame-Options;
     proxy_hide_header Content-Security-Policy;
   '';
+
+  # Authelia sign-in UI + API (public; the gate itself is not protected).
+  # Mirrors the official Authelia+nginx guide. No proxy_set_header Host: the
+  # original Host header is passed through by default, and setting it again
+  # produces a duplicate that Authelia rejects (400).
+  #
+  # Authelia 4.x hardcodes the `Secure` attribute on the session cookie
+  # (internal/session/provider_config.go: c.Secure = true) because it expects
+  # a TLS-terminated authelia_url. The appliance is HTTP-only on the LAN, so a
+  # `Secure` cookie is rejected by browsers and curl. Strip it here so the
+  # session cookie works over plain HTTP. SameSite=Lax + HttpOnly are kept.
+  authProxy = ''
+    proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-URI $request_uri;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_cookie_flags authelia_session nosecure;
+    client_body_buffer_size 128k;
+    proxy_next_upstream error timeout invalid_header http_500 http_502 http_503;
+    proxy_redirect http:// $scheme://;
+    proxy_http_version 1.1;
+    proxy_cache_bypass $cookie_session;
+    proxy_no_cache $cookie_session;
+    proxy_buffers 64 256k;
+    send_timeout 5m;
+    proxy_read_timeout 360;
+    proxy_send_timeout 360;
+    proxy_connect_timeout 360;
+  '';
+
+  # Empty gate snippets until the control plane flips them after the first
+  # admin exists (same reloadable-file pattern as owui-upstream.conf).
+  seedAuthGate = pkgs.writeShellApplication {
+    name = "lemonseed-auth-gate-seed";
+    runtimeInputs = [ pkgs.coreutils ];
+    text = ''
+      set -euo pipefail
+      install -d -m 0755 /run/lemonseed
+      for f in auth-gate.conf auth-admin.conf; do
+        if [[ ! -e /run/lemonseed/$f ]]; then
+          : > /run/lemonseed/$f
+          chmod 0644 /run/lemonseed/$f
+        fi
+      done
+    '';
+  };
 in
 {
   networking.firewall.allowedTCPPorts = [ 80 ];
@@ -142,6 +231,9 @@ in
   services.avahi = {
     enable = true;
     nssmdns4 = true;
+    # mDNS only on physical LAN links — not loopback, Docker bridges, or
+    # veth pairs (the appliance runs containers with host networking).
+    denyInterfaces = [ "lo" "docker" "br-" "veth" ];
     openFirewall = true;
     publish = {
       enable = true;
@@ -246,17 +338,87 @@ in
         }
       ];
 
-      # Exact root: shell for browsers, OWUI for the app iframe.
+      # Unauthenticated requests on gated locations land here (Authelia
+      # sign-in page handles ?rd= for the post-login redirect). When OWUI is
+      # not yet running, 502/503/504 from the dead upstream are rewritten to
+      # the CP shell (which shows a "Getting Ready" interstitial and
+      # auto-loads OWUI once it is healthy).
+      extraConfig = ''
+        ${authVarDecls}
+        location @auth_unauthorized {
+          return 302 /auth/?rd=$request_uri;
+        }
+        location @owui_loading {
+          proxy_pass http://127.0.0.1:8080;
+          proxy_http_version 1.1;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          ${identityHeaders}
+        }
+      '';
+
+      # Exact root: shell for browsers, OWUI for the app iframe. [gated]
       locations."= /" = {
         extraConfig = ''
+          ${authGate}
+          error_page 502 503 504 = @owui_loading;
           proxy_pass $lemonseed_root_upstream;
           ${rootProxy}
         '';
       };
       locations."= /index.html" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = cpProxy;
+        extraConfig = "${authGate}\n${cpProxy}";
       };
+
+      # Edge auth (Authelia): functional path so the backend can be swapped.
+      locations."= /auth" = {
+        return = "302 /auth/";
+      };
+      locations."/auth/" = {
+        proxyPass = "http://127.0.0.1:9091/auth/";
+        extraConfig = authProxy;
+      };
+      # Internal auth_request target (never LAN-facing). Mirrors the official
+      # Authelia+nginx guide's /internal/authelia/authz location. The
+      # auth_request subrequest inherits the original request's headers by
+      # default (proxy_pass_request_headers on), so the Authelia session cookie
+      # reaches Authelia without an explicit proxy_set_header Cookie.
+      #
+      # Authelia 4.x 'auth-request' endpoint: always 401 when unauthenticated
+      # (no 3xx for browsers) and requires an absolute X-Original-URL with a
+      # secure scheme (https/wss). The appliance is HTTP-only on the LAN, so we
+      # force the https scheme here — it is only used by Authelia for cookie
+      # domain selection and validation; the browser follows the real http URL.
+      locations."= /_lemonseed/auth-verify" = {
+        extraConfig = ''
+          internal;
+          set $upstream_authelia http://127.0.0.1:9091;
+          set $authz "/auth/api/authz/auth-request";
+          proxy_pass $upstream_authelia$authz;
+          proxy_set_header X-Original-Method $request_method;
+          proxy_set_header X-Original-URL "https://$http_host$request_uri";
+          proxy_set_header X-Forwarded-For $remote_addr;
+          proxy_set_header Content-Length "";
+          proxy_set_header Connection "";
+          proxy_pass_request_body off;
+          proxy_next_upstream error timeout invalid_header http_500 http_502 http_503;
+          proxy_redirect http:// $scheme://;
+          proxy_http_version 1.1;
+          proxy_cache_bypass $cookie_session;
+          proxy_no_cache $cookie_session;
+          proxy_buffers 4 32k;
+          client_body_buffer_size 128k;
+          send_timeout 5m;
+          proxy_read_timeout 240;
+          proxy_send_timeout 240;
+          proxy_connect_timeout 240;
+        '';
+      };
+
+      # First-boot setup + health probes stay open (pre-admin trust window).
       locations."= /setup" = {
         proxyPass = "http://127.0.0.1:8080";
         extraConfig = cpProxy;
@@ -271,13 +433,16 @@ in
       };
       locations."/settings/" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = cpProxy;
+        # Gated + admin group required (M6.2).
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}";
       };
       locations."= /settings" = {
         return = "302 /settings/";
       };
 
       # Reserved Lemonseed JSON APIs (must win over OWUI /api/*).
+      # /api/boot + /api/status stay open (installer handoff, status probes);
+      # the rest are gated (M6.2).
       locations."= /api/boot" = {
         proxyPass = "http://127.0.0.1:8080";
         extraConfig = cpProxy;
@@ -288,23 +453,23 @@ in
       };
       locations."= /api/hardware" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = cpProxy;
+        extraConfig = "${authGate}\n${cpProxy}";
       };
       locations."= /api/plan" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = cpProxy;
+        extraConfig = "${authGate}\n${cpProxy}";
       };
       locations."= /api/data" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = cpProxy;
+        extraConfig = "${authGate}\n${cpProxy}";
       };
       locations."= /api/modules" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = cpProxy;
+        extraConfig = "${authGate}\n${cpProxy}";
       };
       locations."= /api/chat" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = cpProxy;
+        extraConfig = "${authGate}\n${cpProxy}";
       };
 
       # Brand icons (shell / setup / favicon) — must not fall through to OWUI.
@@ -337,17 +502,29 @@ in
         return = "302 /?embed=1";
       };
 
-      # Socket.IO / websockets (explicit; Upgrade headers already in owuiProxy).
+      # Socket.IO / websockets (auth_request works on the upgrade handshake).
       locations."/ws/" = {
         proxyPass = "http://lemonseed_owui";
-        extraConfig = owuiProxy;
+        extraConfig = "${authGate}\nerror_page 502 503 504 = @owui_loading;\n${owuiProxy}";
       };
 
-      # Everything else (SPA assets, OWUI /api/v1, /c/…, …) → Open WebUI.
+      # Everything else (SPA assets, OWUI /api/v1, /c/…, …) → Open WebUI. [gated]
       locations."/" = {
         proxyPass = "http://lemonseed_owui";
-        extraConfig = owuiProxy;
+        extraConfig = "${authGate}\nerror_page 502 503 504 = @owui_loading;\n${owuiProxy}";
       };
+    };
+  };
+
+  systemd.services.lemonseed-auth-gate-seed = {
+    description = "Seed empty Authelia gate snippets";
+    wantedBy = [ "multi-user.target" ];
+    before = [ "nginx.service" ];
+    after = [ "local-fs.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      ExecStart = "${seedAuthGate}/bin/lemonseed-auth-gate-seed";
     };
   };
 
@@ -356,11 +533,13 @@ in
       "network-online.target"
       "appliance-control-plane.service"
       "lemonseed-owui-upstream-seed.service"
+      "lemonseed-auth-gate-seed.service"
     ];
     wants = [
       "network-online.target"
       "appliance-control-plane.service"
       "lemonseed-owui-upstream-seed.service"
+      "lemonseed-auth-gate-seed.service"
     ];
   };
 

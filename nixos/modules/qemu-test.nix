@@ -1,8 +1,18 @@
 # QEMU smoke-test profile: virtio root + user-data disk (see make run-qemu).
 # Production images must NOT use this module (see DESIGN.md).
 
-{ lib, ... }:
+{ lib, pkgs, ... }:
 
+let
+  # Forward journal to the serial console so `make test-qemu` captures
+  # journald in the serial log (no console access to log in otherwise).
+  journaldConf = pkgs.writeText "journald-console.conf" ''
+    [Journal]
+    ForwardToConsole=yes
+    TTYPath=/dev/console
+    MaxLevelConsole=info
+  '';
+in
 {
   imports = [ ./qemu-docker-cache.nix ];
 
@@ -25,4 +35,9 @@
   # Allow serial login for interactive debugging in QEMU.
   services.getty.autologinUser = "root";
   users.users.root.hashedPassword = lib.mkForce ""; # empty password in qemu only
+
+  # Console logging for the smoke-test serial log (see journaldConf).
+  systemd.services.systemd-journald.serviceConfig = {
+    ExtraConfig = [ journaldConf ];
+  };
 }

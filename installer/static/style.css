@@ -118,6 +118,15 @@ html, body {
 .preserve input { margin-top: 0.2rem; accent-color: var(--accent); }
 .preserve strong, .preserve small { display: block; }
 .preserve small { margin-top: 0.25rem; color: var(--muted); line-height: 1.35; }
+/* Nested option (reset admin under preserve): indented, no box, greyed out
+   until the parent is checked (JS toggles .off). */
+.preserve.nested {
+  margin: 0.5rem 0 0 1.4rem;
+  padding: 0.4rem 0.6rem 0.4rem 0;
+  border: 0;
+  border-radius: 0;
+}
+.preserve.nested.off { opacity: 0.45; pointer-events: none; }
 
 .cta {
   margin-top: 1rem;

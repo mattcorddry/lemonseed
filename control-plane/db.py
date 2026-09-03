@@ -13,7 +13,7 @@ POSTGRES_ENV = Path("/var/lib/lemonseed/data/secrets/postgres.env")
 SECRETS_MODULES = Path("/var/lib/lemonseed/data/secrets/modules")
 CP_DB_NAME = "lemonseed_cp"
 CP_ROLE = "lemonseed_cp"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 RESERVED_MODULES = (
     {
@@ -158,6 +158,36 @@ def _apply_cp_schema(conn) -> None:
             )
             """
         )
+        # Edge-auth accounts (M6.2): standard users + groups, many:many.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+              username TEXT PRIMARY KEY,
+              display_name TEXT NOT NULL DEFAULT '',
+              email TEXT NOT NULL DEFAULT '',
+              password_hash TEXT NOT NULL,
+              disabled BOOLEAN NOT NULL DEFAULT FALSE,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS groups (
+              name TEXT PRIMARY KEY,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_groups (
+              username TEXT NOT NULL REFERENCES users (username) ON DELETE CASCADE,
+              name TEXT NOT NULL REFERENCES groups (name) ON DELETE CASCADE,
+              PRIMARY KEY (username, name)
+            )
+            """
+        )
         cur.execute(
             """
             INSERT INTO cp_meta (key, value)
@@ -232,6 +262,11 @@ def provision_data_plane() -> dict[str, Any]:
         }
     except Exception as exc:  # noqa: BLE001
         return {"state": "error", "error": str(exc)}
+
+
+def cp_connect():
+    """Connect to the CP state database (lemonseed_cp)."""
+    return _connect(CP_DB_NAME)
 
 
 def cp_get_meta(key: str) -> Any:

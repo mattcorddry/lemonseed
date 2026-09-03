@@ -22,6 +22,10 @@ OWUI_IMAGE_DEFAULT = "ghcr.io/open-webui/open-webui:v0.11.0"
 OWUI_IMAGE = os.environ.get("LEMONSEED_OWUI_IMAGE", OWUI_IMAGE_DEFAULT)
 MODULE_ID = "open-webui"
 UPSTREAM_FILE = Path("/run/lemonseed/owui-upstream.conf")
+# nginx serves the Lemonseed shell (not the OWUI upstream) for document requests
+# while this flag is absent — so a direct navigation to / before OWUI is up shows
+# the "Getting Ready" interstitial instead of a 502 (M6.2).
+OWUI_READY_FLAG = Path("/run/lemonseed/owui-ready")
 SLOT_PORTS = (18080, 18081)
 CONTAINER_PREFIX = "lemonseed-owui"
 LEMON_NETWORK = "lemon"
@@ -123,6 +127,12 @@ def write_upstream(port: int) -> None:
     tmp = UPSTREAM_FILE.with_suffix(".tmp")
     tmp.write_text(body, encoding="utf-8")
     tmp.replace(UPSTREAM_FILE)
+    # Mark OWUI ready so nginx routes document requests to it. write_upstream is
+    # only called after http_ready_stable() passes, so the flag is accurate.
+    try:
+        OWUI_READY_FLAG.write_text("1\n", encoding="utf-8")
+    except OSError as exc:  # noqa: BLE001 — non-fatal; shell falls back to 502
+        print(f"owui-ready flag: {exc}", flush=True)
 
 
 def reload_nginx() -> bool:
@@ -590,6 +600,16 @@ def supervise_modules_once() -> dict[str, Any]:
     name = _container_name(active)
     running = _container_running(name)
     ready = http_ready(active, timeout=1.5) if running else False
+
+    # nginx serves the shell (not the OWUI upstream) for document requests while
+    # OWUI is down, so a direct / navigation shows the interstitial, not a 502.
+    if ready:
+        try:
+            OWUI_READY_FLAG.write_text("1\n", encoding="utf-8")
+        except OSError:  # noqa: BLE001
+            pass
+    else:
+        OWUI_READY_FLAG.unlink(missing_ok=True)
 
     if running and ready:
         _health_fail_count = 0

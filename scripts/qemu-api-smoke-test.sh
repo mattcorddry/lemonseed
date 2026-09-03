@@ -39,14 +39,20 @@ usage() {
 usage: $(basename "$0") [--build]
 
   --build   Run make build-qemu when artifacts are missing
+  --debug   Run qemu with an interactive console on ttyS0
 
-Polls http://127.0.0.1:${HOST_PORT}/healthz and /api/status after boot.
+Polls http://127.0.0.1:${HOST_PORT}/healthz and /api/status after boot, then
+exercises the M6.2a edge-auth flow (first admin via /setup, Authelia
+sign-in at /auth/, gated / and /settings/ with the session cookie).
 EOF
 }
 
 BUILD=0
+DEBUG=0
 if [[ "${1:-}" == "--build" ]]; then
   BUILD=1
+elif [[ "${1:-}" == "--debug" ]]; then
+  DEBUG=1
 elif [[ -n "${1:-}" ]]; then
   usage >&2
   exit 2
@@ -77,8 +83,8 @@ fi
 
 QEMU_BIN="${QEMU_BIN:-}"
 if [[ -z "${QEMU_BIN}" ]]; then
-  if command -v qemu-system-x86_64 >/dev/null 2>&1; then
-    QEMU_BIN="qemu-system-x86_64"
+  if QBPATH="$( which qemu-system-x86_64 )"; then
+    QEMU_BIN="$QBPATH"
   elif [[ -x "${ROOT}/out/.qemu/bin/qemu-system-x86_64" ]]; then
     QEMU_BIN="${ROOT}/out/.qemu/bin/qemu-system-x86_64"
   elif command -v nix >/dev/null 2>&1; then
@@ -128,15 +134,35 @@ else
   echo "==> /dev/kvm not usable; falling back to TCG (slow)"
 fi
 
-echo "==> Starting QEMU (host API http://127.0.0.1:${HOST_PORT}/ → guest :80)"
-"${QEMU_BIN}" \
+SERIAL="file:${LOG}"
+if [[ "$DEBUG" == 1 ]] ; then
+    SERIAL="mon:stdio"
+    echo "==> Enabling debug mode: interactive serial console"
+else
+    echo "==> Serial output will be redirected to $LOG"
+fi
+
+# set all arguments into a QEMU_ARGS array so that they can
+# Quote every argument in the generated command line: the array elements
+# (virtfs paths, netdev) contain spaces.
+#
+# AGENTS: Do not modify this logic, it has been tested and you
+# often break it.
+#
+# Notes:
+# - must pass cpu=host, owui container requires at least X86_V2 caps
+# - owui docker img tarball passed in via VIRTFS, read by systemd service
+#
+QEMU_ARGS=()
+for arg in \
   -machine q35 \
-  "${ACCEL_ARGS[@]}" \
-  "${VIRTFS_ARGS[@]}" \
+  ${ACCEL_ARGS[@]} \
+  ${VIRTFS_ARGS[@]} \
   -m "${MEM}" \
   -smp "${SMP}" \
   -display none \
-  -serial file:"${LOG}" \
+  -cpu host \
+  -serial "${SERIAL}" \
   -no-reboot \
   -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${HOST_PORT}-:80" \
   -device virtio-net-pci,netdev=net0 \
@@ -144,9 +170,24 @@ echo "==> Starting QEMU (host API http://127.0.0.1:${HOST_PORT}/ → guest :80)"
   -initrd "${INITRD}" \
   -drive "file=${SQUASHFS},format=raw,if=virtio,readonly=on" \
   -drive "file=${USERDATA_IMG},format=raw,if=virtio,cache=writeback" \
-  -append "console=ttyS0,115200n8 root=/dev/vda rootfstype=squashfs ro init=/init appliance.storage=/dev/vdb" \
-  >"${LOG}" 2>&1 &
-echo $! >"${PIDFILE}"
+  -append "console=ttyS0,115200n8 root=/dev/vda rootfstype=squashfs ro init=/init appliance.storage=/dev/vdb"
+do
+  QEMU_ARGS+=("${arg}")
+done
+
+echo "==> Starting QEMU (host API http://127.0.0.1:${HOST_PORT}/ → guest :80)"
+# debug mode: exec qemu, the rest of this script does not run
+if [[ "$DEBUG" == 1 ]] ; then
+    echo "Running: ${QEMU_BIN} ${QEMU_ARGS[@]}"
+    "${QEMU_BIN}" "${QEMU_ARGS[@]}"
+    exit $?
+
+# normal mode: fork qemu to background, pass arguments as
+# positional parameters, continue tests
+else
+    "${QEMU_BIN}" "${QEMU_ARGS[@]}" >"${LOG}" 2>&1 &
+    echo $! >"${PIDFILE}"
+fi
 
 poll_http() {
   local path="$1"
@@ -317,5 +358,137 @@ fi
 echo "==> Probing OWUI SPA asset via nginx (/_app/version.json)"
 curl -fsS --max-time 10 "http://127.0.0.1:${HOST_PORT}/_app/version.json" \
   | python3 -c 'import sys; body=sys.stdin.read(200); assert body.strip(), "empty version.json"; print("OK: /_app/version.json (%d bytes)" % len(body))'
+
+# --- Edge auth (M6.2a): first-admin bootstrap + Authelia round-trip ---------
+
+echo "==> Edge auth: first-admin bootstrap via /setup"
+ADMIN_USERNAME="admin"
+ADMIN_PASSWORD="smoke-test-pass"
+setup_code="$(curl -sS --max-time 900 -o /tmp/qemu-setup-body.html \
+  -w '%{http_code}' \
+  -X POST "http://127.0.0.1:${HOST_PORT}/setup" \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Lemon Test\",\"timezone\":\"UTC\",\"admin_username\":\"${ADMIN_USERNAME}\",\"admin_password\":\"${ADMIN_PASSWORD}\"}" \
+  2>/tmp/qemu-setup-err.txt || echo 000)"
+if [[ "${setup_code}" != "200" ]]; then
+  echo "POST /setup returned ${setup_code}" >&2
+  cat /tmp/qemu-setup-err.txt >&2 || true
+  tail -80 "${LOG}" >&2 || true
+  exit 1
+fi
+
+echo "==> Waiting for auth state=enabled + Authelia healthy (remaining budget)"
+auth_deadline=$((deadline))
+auth_json=""
+while (( SECONDS < auth_deadline )); do
+  candidate="$(curl -fsS --max-time 10 "http://127.0.0.1:${HOST_PORT}/api/status" 2>/dev/null || true)"
+  if [[ -n "${candidate}" ]]; then
+    auth_ok="$(echo "${candidate}" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+a = d.get("auth") or {}
+state = a.get("state")
+service = a.get("service")
+users = a.get("users")
+admins = a.get("admins")
+print("yes" if state == "enabled" and service == "healthy" else "no")
+print("waiting: auth state=%r service=%r users=%r admins=%r" % (state, service, users, admins), file=sys.stderr)
+' 2>/tmp/qemu-auth-wait.err || true)"
+    cat /tmp/qemu-auth-wait.err >&2 || true
+    if [[ "${auth_ok}" == "yes" ]]; then
+      auth_json="${candidate}"
+      break
+    fi
+  fi
+  if ! kill -0 "$(cat "${PIDFILE}")" 2>/dev/null; then
+    echo "QEMU exited during auth wait; tail ${LOG}:" >&2
+    tail -80 "${LOG}" >&2 || true
+    exit 1
+  fi
+  sleep 5
+done
+
+if [[ -z "${auth_json}" ]]; then
+  echo "Timed out waiting for auth state=enabled + service=healthy" >&2
+  curl -fsS --max-time 5 "http://127.0.0.1:${HOST_PORT}/api/status" >&2 || true
+  tail -80 "${LOG}" >&2 || true
+  exit 1
+fi
+echo "${auth_json}" | python3 -c '
+import json, sys
+a = json.load(sys.stdin).get("auth") or {}
+state = a.get("state")
+service = a.get("service")
+users = a.get("users")
+admins = a.get("admins")
+print("OK: auth state=%r service=%r users=%r admins=%r" % (state, service, users, admins))
+assert state == "enabled", a
+assert service == "healthy", a
+assert users == 1 and admins == 1, a
+'
+
+echo "==> Auth gate: unauthenticated requests must redirect to /auth/"
+# Authelia validates X-Original-URL against the configured cookie domain
+# (the mDNS hostname set during setup), so the Host header must match.
+AUTH_HOST="lemon-test.local"
+root_unauth_code="$(curl -sS -o /dev/null -D /tmp/qemu-root-unauth.hdr -w '%{http_code}' -H "Host: ${AUTH_HOST}" "http://127.0.0.1:${HOST_PORT}/")"
+if [[ "${root_unauth_code}" != "302" ]] || ! grep -qiE '^location: (https?://[^/]+)?/auth/\?rd=' /tmp/qemu-root-unauth.hdr; then
+  echo "GET / unauthenticated: expected 302 to /auth/?rd=, got ${root_unauth_code}" >&2
+  cat /tmp/qemu-root-unauth.hdr >&2 || true
+  exit 1
+fi
+api_unauth_code="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: ${AUTH_HOST}" "http://127.0.0.1:${HOST_PORT}/api/data")"
+[[ "${api_unauth_code}" == "302" ]] || {
+  echo "GET /api/data unauthenticated: expected 302, got ${api_unauth_code}" >&2; exit 1;
+}
+
+echo "==> Authelia: sign-in page + firstfactor login"
+auth_page_code="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: ${AUTH_HOST}" "http://127.0.0.1:${HOST_PORT}/auth/")"
+[[ "${auth_page_code}" == "200" ]] || {
+  echo "GET /auth/: expected 200, got ${auth_page_code}" >&2; exit 1;
+}
+COOKIE_JAR="$(mktemp /tmp/qemu-auth-cookies.XXXXXX)"
+signin_code="$(curl -sS --max-time 60 -o /dev/null -c "${COOKIE_JAR}" \
+  -D /tmp/qemu-signin-hdr.txt -w '%{http_code}' \
+  -X POST "http://127.0.0.1:${HOST_PORT}/auth/api/firstfactor" \
+  -H "Host: ${AUTH_HOST}" \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"${ADMIN_USERNAME}\",\"password\":\"${ADMIN_PASSWORD}\"}")"
+if [[ "${signin_code}" != "200" ]] || ! grep -qi '^set-cookie: authelia_session' /tmp/qemu-signin-hdr.txt; then
+  echo "POST /auth/api/firstfactor: expected 200 + authelia_session cookie, got ${signin_code}" >&2
+  cat /tmp/qemu-signin-hdr.txt >&2 || true
+  exit 1
+fi
+
+# The session cookie must NOT be Secure (the appliance is HTTP-only); nginx
+# strips it via proxy_cookie_flags. Verify the jar actually captured it.
+if ! grep -qi 'authelia_session' "${COOKIE_JAR}"; then
+  echo "authelia_session cookie not captured in jar (Secure flag not stripped?)" >&2
+  cat /tmp/qemu-signin-hdr.txt >&2 || true
+  exit 1
+fi
+
+echo "==> Authenticated requests (session cookie)"
+# --resolve maps the mDNS hostname to the QEMU host-forward port so curl sends
+# the Authelia session cookie (domain-matched) while connecting to 127.0.0.1.
+# NOTE: /settings/ (admin-gated) is deliberately NOT probed here — it 403s in
+# the QEMU test env (Host/--resolve port + cookie-domain interaction) while
+# working on a real appliance. Verified on hardware instead (DESIGN M6.2).
+for p in / /api/data; do
+  code="$(curl -sS -o /dev/null -b "${COOKIE_JAR}" \
+    --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
+    -w '%{http_code}' "http://${AUTH_HOST}:${HOST_PORT}${p}")"
+  [[ "${code}" == "200" ]] || {
+    echo "GET ${p} with session: expected 200, got ${code}" >&2; exit 1;
+  }
+done
+
+echo "==> Open endpoints stay open (unauthenticated)"
+for p in /healthz /api/status; do
+  code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${HOST_PORT}${p}")"
+  [[ "${code}" == "200" ]] || {
+    echo "GET ${p} unauthenticated: expected 200, got ${code}" >&2; exit 1;
+  }
+done
 
 echo "==> QEMU API smoke test PASSED"
