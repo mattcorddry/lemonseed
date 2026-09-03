@@ -146,77 +146,95 @@ Failed health-check → old container keeps serving; appliance stays up.
 
 **M6.1 (done):** **Fully disable Open WebUI authentication** — no OWUI login screen, no OAuth hooks inside the module. LAN access matches the bring-up trust model until M6.2 edge auth ships.
 
-**M6.2 (design locked):** **Authelia (file backend) at the nginx edge** — full design below. **Do not** delegate OAuth/OpenID to containers; modules stay auth-naive behind nginx.
+**M6.2 (design locked):** **CP-native login at the nginx edge** — full design below. **Do not** delegate OAuth/OpenID to containers; modules stay auth-naive behind nginx.
 
 - Open WebUI container receives Lemonade URL + API key + Postgres/Valkey DSN via env/secrets from CP.
-- No host network; no direct LAN exposure of `lemond`, Postgres, Valkey, or Authelia (all `127.0.0.1`-bound; Authelia is only reachable via nginx `/auth/`).
+- No host network; no direct LAN exposure of `lemond`, Postgres, Valkey, or CP auth endpoints (all `127.0.0.1`-bound; login is only reachable via nginx `/login`).
 
-#### M6.2 — Edge auth (Authelia, file backend) (design)
+#### M6.2 — Edge auth (CP-native login) (design)
 
-**Decision (2026-08):** Reuse **Authelia** as the edge auth provider instead of building session/credential security in-house. Authelia is a mature, open-source auth server (JWT sessions, bcrypt, TOTP, file or SQL backends); we take its sign-in / verify / session machinery while **Lemonseed account data stays in CP/Postgres** (the file backend is a derived artifact, see §3).
+**Decision (2026-09):** Replace Authelia with a **CP-native login** (signed session tokens, branded login page). Authelia 4.x hardcodes `https` requirements for `default_redirection_url`, `rd=` validation, and the `Secure` cookie flag — none configurable. The appliance is HTTP-only on the LAN; self-signed TLS produces a browser warning every new session (poor UX for less-technical users), and Let's Encrypt requires a user-owned domain (too much friction). Building a minimal login in the CP eliminates all https workarounds, gives us full control over UX/theming, and removes an external service.
 
-**Placement — NixOS service in SquashFS, not a Docker module:**
-- `authelia.service` (`nixos/modules/authelia.nix`), bound to `127.0.0.1:9091` only; `pkgs.authelia` from the pinned nixpkgs flake input (explicit version — never `:latest`).
-- Auth is critical edge infrastructure: it must come up whenever nginx does, independent of CP/Docker health. A CP-managed container would lock the box out when CP is down.
-- Not the nixpkgs `services.authelia` module: its config must exist at build time, but the JWT secret is generated at provisioning. Custom unit; all Authelia state on user-data.
+**What we keep from the Authelia implementation (M6.2a, committed):**
+- CP + Postgres is the **source of truth** for users, groups, password hashes (bcrypt). Schema: `users`, `groups`, `user_groups` (many:many, Linux-style).
+- nginx **reloadable gate** pattern: `auth-gate.conf` (empty at boot; CP writes `auth_request` + `auth_request_set` lines and reloads nginx once the first admin exists).
+- **X-Forwarded-\* hygiene:** identity headers set only from `auth_request_set` variables; nginx `proxy_set_header` overrides client-supplied values.
+- **Admin bootstrap** via `/setup` (single path; first admin only while `admin` group is empty).
+- **Lockout recovery** via installer reset marker (physical access only).
+- **OWUI interstitial** (`error_page 502/503/504 → @owui_loading → CP shell`).
 
-**Backends (reusing the existing data plane):**
+**What changes (M6.2 migration):**
 
-| Concern | Store | Why |
-|---------|-------|-----|
-| User accounts | **File backend** `users.yaml` | Simple, stable schema; content is **derived from CP/Postgres** — Authelia never owns account truth |
-| Sessions | **Valkey** (Redis) at `127.0.0.1:6379`, dedicated `db_index` | No on-disk session files; **key TTL = token expiry → stale sessions auto-GC by Valkey** |
+| Aspect | Authelia (M6.2a) | CP-native (M6.2) |
+|--------|-------------------|-------------------|
+| Login page | Authelia's (white/black, unbranded) | CP-rendered, Lemonseed-branded |
+| Session store | Valkey (Redis) with TTL | **Stateless signed token** in cookie (HMAC-SHA256) |
+| Session GC | Valkey key TTL auto-expiry | **None needed** (stateless; token has embedded expiry) |
+| Auth verify | `/_lemonseed/auth-verify` → Authelia `:9091` | `/_lemonseed/session-verify` → CP `:8080` |
+| Login endpoint | `/auth/` → Authelia `:9091` | `/login` → CP `:8080` |
+| Logout | `/auth/` → Authelia | `/logout` → CP `:8080` |
+| Password hash | bcrypt (Authelia file backend) | bcrypt (CP/Postgres, already implemented) |
+| TOTP | Authelia built-in (M6.3) | `pyotp` in CP (M6.3) |
+| External service | `authelia.service` on `:9091` | **None** (CP handles everything) |
+| https workarounds | 3 (X-Original-URL, default_redirection_url, nosecure) | **None** |
 
-- Authelia config at `/var/lib/authelia/config.yml` (0640, generated once at first-admin bootstrap: JWT secret + paths + policy); `users.yaml` is rewritten by CP on every account change (Authelia file watcher hot-reloads — no restart).
-- Ordering: `authelia.service` after `lemonseed-valkey.service`; if Valkey is down, Authelia restart-loops — harmless pre-setup (gate off) and transient post-setup (data services are resilient).
+**Session token design:**
+- **Format:** `base64url(payload).base64url(hmac_sha256(payload, secret))` where payload = `username|expiry_epoch|nonce`.
+- **Secret:** 256-bit random, generated at first-admin bootstrap, stored in `/var/lib/lemonseed/session-secret` (0600). Regenerated on admin password reset (invalidates all sessions).
+- **Cookie:** `lemonseed_session` — `HttpOnly`, `SameSite=Lax`, **no** `Secure` flag (HTTP-only LAN). Path `=/`. No user data in the cookie — just the signed token.
+- **Expiry:** 1h inactivity (CP checks `Last-Activity` header or re-issues on each request), 10h absolute. Token embeds `expiry_epoch`; CP rejects expired tokens.
+- **Verification:** `/_lemonseed/session-verify` (nginx `auth_request` target) reads the cookie, verifies HMAC + expiry, returns 200 + `X-Forwarded-User/Email/Groups` headers on success, 401 on failure.
+- **Why stateless:** no session store to GC (addresses the "GC leftover records" concern), no Valkey dependency for auth, survives CP restarts, trivially horizontal-scalable if we ever need it.
 
-**Gateway (nginx) integration:**
-- Functional (not product-named) URL surface: `location /auth/` → `127.0.0.1:9091/auth/` (sign-in UI + API). Authelia configured with `server.authentication.path: /auth` so the backend can be swapped later without touching the LAN surface.
-- Internal `location = /_lemonseed/auth-verify` → `GET /auth/api/verify` with `Authorization`, `X-Original-URL`, `X-Original-Method`; 401 → `302 /auth/?rd=$request_uri`.
-- **Reloadable gate** (same pattern as `owui-upstream.conf`): protected locations `include /run/lemonseed/auth-gate.conf` (empty at boot, seeded by a oneshot before nginx; CP writes `auth_request` + `auth_request_set` lines and reloads nginx once the first admin exists). `/settings/` additionally includes `/run/lemonseed/auth-admin.conf` (requires `admin` group, else 403).
-- **X-Forwarded-\* hygiene:** identity headers `X-Forwarded-User`, `X-Forwarded-Email`, `X-Forwarded-Groups` are set **only** from `auth_request_set` variables in the proxy snippets. nginx `proxy_set_header` overrides any client-supplied value of the same name, so **Authelia is the only origin** of these headers (never `proxy_pass_header` them; empty pre-auth → header omitted).
+**Gateway (nginx) integration (simplified from M6.2a):**
+- `location /login` → CP `:8080` (branded login page + POST handler).
+- `location /logout` → CP `:8080` (POST; clears cookie).
+- `location = /_lemonseed/session-verify` → CP `:8080` (internal `auth_request` target; replaces `/_lemonseed/auth-verify`).
+- **Remove:** `location /auth/` (Authelia proxy), `authelia.service`, `proxy_cookie_flags`, `X-Original-URL` https hack.
+- **Keep:** reloadable gate pattern, `auth_request_set` for identity headers, `error_page 401 = @auth_unauthorized` (302 to `/login?rd=$request_uri`), OWUI interstitial.
+- **Open (bypass):** `/healthz`, `/health`, `/setup`, `/login`, `/api/boot`, `/api/status`, `/_lemonseed/brand/`, `/favicon.ico`, `/_lemonseed/lemond/`.
+- **Gated:** `/` (shell + OWUI), OWUI catch-all, `/ws/`, `/settings/` (+ admin group via CP check), remaining `/api/*`, `/logout`.
 
-**Access policy:** `default_policy: one_factor`, **no domain rules** (single-appliance trust; keeps QEMU `127.0.0.1` Host working). TOTP self-service per account (issuer "Lemonseed"). No email notifier (no SMTP on appliance) → all credential recovery goes through CP (below) or physical reinstall.
+**Security requirements (login system):**
 
-**Open (bypass) vs gated:**
-- Open: `/healthz`, `/health`, `/setup`, `/api/boot`, `/api/status`, `/_lemonseed/brand/`, `/favicon.ico`, `/auth/`, `/_lemonseed/lemond/` (API key + Docker-range ACL, unchanged).
-- Gated: `/` (shell + OWUI), OWUI catch-all, `/ws/` (auth_request works on socket.io upgrades), `/settings/` (+ admin group), remaining `/api/*`.
-- Modules receive identity via `X-Forwarded-*`; OWUI stays auth-disabled — per-user prompt/context layers can consume the headers later.
+| Requirement | Implementation |
+|-------------|----------------|
+| **Credential hashing** | bcrypt (already in CP; `ps.bcrypt` in Nix pythonEnv). Argon2id is preferred but bcrypt is acceptable and already wired. |
+| **MFA (TOTP)** | M6.3: `pyotp` (pure-Python, RFC 6238). **Required for `admin` group** accounts. Device remembered once MFA complete (session token includes `mfa_verified` flag; no re-prompt within session). |
+| **Rate limiting** | CP tracks failed login attempts per source IP (in-memory sliding window, 5 min). After 5 failures → 15 min lockout for that IP. Response is always the same (see below). |
+| **Cookie security** | `HttpOnly` (no JS access), `SameSite=Lax` (CSRF protection), no `Secure` (HTTP-only LAN). Cookie contains **only** the signed token — no username, no groups, no PII. |
+| **Session expiry** | 1h inactivity / 10h absolute. Token embeds expiry; CP rejects expired tokens. Admin password reset regenerates the session secret (invalidates all active sessions). |
+| **Vague errors** | All login failures return the same message: `"Invalid username or password."` No user enumeration. Rate-limit lockout returns the same message (no "too many attempts" hint). |
+| **Admin group check** | Enforced by CP (not nginx `if` — which runs in the rewrite phase, before `auth_request` sets variables). CP reads `X-Forwarded-Groups` and returns 403 for non-admins on `/settings/`. |
 
-**Admin bootstrap — single path (`/setup`); no singular “owner”:**
-- **One credential path, no interstitial:** the only way to create the first admin is the first-boot **`/setup`** form (name + timezone + admin username + password), submitted over the appliance's own LAN web UI. It is handled **synchronously in the `/setup` POST handler** (the existing name/timezone `complete_setup` path) — no background consume worker, and the installer does **no** auth work for a fresh install.
-- **Bootstrap gate:** `/setup` offers admin-creation **iff the `admin` group is empty**. This generalizes the old “no owner exists.” Once ≥ 1 admin exists, `/setup` no longer creates admins; additional admins are added by an existing admin through `/api/auth` (M6.2b).
-- **First-admin consume:** on submit, CP creates the admin user (default `admin` + `users` group mappings), derives `users.yaml` / `config.yml`, flips the gate snippets, and runs `nginx -s reload`. CP waits for the data-services readiness signal (Postgres up) before acting — same pattern as existing workers.
-- **Lockout recovery — installer reset marker (physical access only):** the USB installer adds a **“Reset admin credentials”** checkbox (default off; only meaningful with *preserve*). When set, `seed_esp` (which already mounts the ESP rw and reformats it each install) drops a tiny marker `ESP/lemonseed-reset-admin`. A first-boot **oneshot** (same pattern as `lemonseed-owui-upstream-seed`) relocates it to persistent **`/var/lib/lemonseed/reset-admin`** (CP-writable; survives a reboot). On the next `/setup` submit, CP **clears the `admin` group** (drops admin-group membership, leaving user accounts and data intact) so the bootstrap gate reopens and the physical owner recreates the admin. Requires physical access, so a remote attacker cannot trigger credential recovery.
-- **Installer stays lean:** **Authelia is not added to the installer image** and the installer never handles passwords (no `mkpasswd`/bcrypt there); all hashing happens in the CP.
+**Accounts & CP surface (unchanged from M6.2a design):**
+- Separate **users** and **groups** with a **many:many** mapping in CP Postgres: `users` (username PK, display name, email, password hash, disabled, reserved nullable `account_type`), `groups` (name PK), `user_groups` (join).
+- **No singular "owner":** elevation = **`admin` group** membership. Default groups: `admin` + `users`.
+- `GET/POST /api/auth` (`admin`-gated, M6.2b): user + group management. **Guardrail:** refuse to remove/disable the last enabled admin.
+- `/api/status` gains `auth: {state, admins, users}` (no external service probe needed — CP knows its own state).
 
-**Accounts & CP surface — standard users + groups model (Linux `/etc/passwd` + `/etc/group` style; not reinventing the wheel):**
-- Separate **users** and **groups** with a **many:many** mapping, stored in the CP database (`lemonseed_cp`, isolated from module DBs): `users` (username PK, display name, email, password hash, disabled, reserved nullable `account_type` for future child/adult content filters), `groups` (name PK), `user_groups` (user↔group join).
-- **No singular “owner”:** elevation is pure **group membership** in the privileged **`admin` group** — a privilege level with any number of members (name it `admin`, not `owner`; a designated commercial owner can be added later as an account attribute if ever needed). `admin` ⇒ full `/settings/` + `/api/auth` management. Default groups: `admin` (privileged) + `users` (baseline).
-- Example: `Matt` ∈ {`admin`, `corddry_family`, `matt_friends`}; partner `Jill` ∈ {`corddry_family`}; a second power-user `Ade` ∈ {`admin`, `corddry_family`}.
-- Bootstrap (`/setup`, above) creates the first admin and ensures the `admin` + `users` groups exist, mapping the admin to both.
-- `GET/POST /api/auth` (`admin`-gated, M6.2b): user management (add / reset password / enable / disable / remove) and group management (create / remove groups, map users ↔ groups) → Postgres + regenerate `users.yaml` (each Authelia entry's `groups:` = that user's mapped groups). **Guardrail:** refuse to remove **or disable** the **last remaining enabled `admin`** via the API, so the only ways to reach “no active admin” are a fresh box or the physical reset marker (keeps the `/setup` admin-creation gate honest). Settings portal gets a **Users & Groups** section.
-- `/api/status` gains `auth: {state: enabled|disabled, admins: N, users: N, service: healthy|…}` via a cheap live probe of `127.0.0.1:9091`.
-
-**Phases:**
+**Phases (revised):**
 
 | Phase | Deliverable |
 |-------|-------------|
-| **M6.2a** | Authelia service + Valkey session store + `/auth/` gateway gate + first-admin bootstrap via `/setup` (installer supplies only the lockout reset marker) + identity headers. Appliance locks once the first `admin` exists. |
-| **M6.2b** | `/api/auth` users & groups management (user add / reset / disable / remove; group create / map) + portal Users & Groups section. |
+| **M6.2 (migration)** | Remove Authelia. Add CP login/logout/session-verify endpoints + branded login page. Update nginx gate to point to CP. Remove https workarounds. Keep all M6.2a account/group/bootstrap/lockout logic. |
+| **M6.2b** | `/api/auth` users & groups management + portal Users & Groups section. (Unchanged from prior plan.) |
+| **M6.3** | TOTP MFA via `pyotp`. Required for `admin` group. Device remembered per session. |
 
-**Testing:**
-- **Unit** (`make test`): `users.yaml` rendering, reset-marker relocate/consume idempotency, bootstrap gate (`admin` group empty vs. non-empty), gate/admin snippet contents, `/api/auth` handlers (incl. last-admin guardrail) — subprocess/psycopg2 mocked.
-- **QEMU smoke (new auth phase):** fresh box → gate empty → all existing probes unchanged. Then `POST /setup` (name + timezone + admin creds) → wait for `auth.state=enabled` → assert: unauth `GET /` → 302 `/auth/`; sign-in via `/auth/api/authorize?form=true` + cookie jar → `GET /` 200; `GET /settings/` 200 as admin; `/healthz` + `/api/status` still open. M6.2b adds a non-admin member → 403 on `/settings/`.
+**Testing (revised):**
+- **Unit** (`make test`): token sign/verify/expire, login POST (valid/invalid/rate-limited), session-verify endpoint, admin group check, bootstrap gate, reset-marker idempotency, `/api/auth` handlers. Subprocess/psycopg2 mocked.
+- **QEMU smoke:** fresh box → gate empty → `POST /setup` (name + timezone + admin creds) → wait for `auth.state=enabled` → assert: unauth `GET /` → 302 `/login`; `POST /login` (valid creds) → 302 + `Set-Cookie` → `GET /` 200; `GET /settings/` 200 as admin; `POST /logout` → cookie cleared → `GET /` → 302 `/login`. `/healthz` + `/api/status` still open.
+
+**Post-M6 backlog (not in M6.2):**
+- **Cloud service / DynDNS:** `<random>.client.lemonseed.ai` FQDN + Let's Encrypt DNS-01 for remote access. Part of the CLOUD-SERVICE.md zero-trust roadmap (see `proposals/CLOUD-SERVICE.md`). Requires: cloud API, DNS provider integration, cert management, E2E encryption proxy. See `proposals/AUTH-TOTP.md` for TOTP-over-HTTP security analysis.
+- **TLS at the gateway:** if/when the cloud service lands, the appliance will have a valid Let's Encrypt cert for its public FQDN. The local `.local` experience remains HTTP-only (LAN trust model). The CP-native login works over both HTTP and HTTPS without changes.
 
 **Risks / accepted:**
-- Authelia version + config schema come from the nixpkgs pin; Authelia validates config at boot — QEMU smoke is the tripwire.
-- No SMTP / no email reset links → recovery is an admin CP reset (M6.2b) or the physical reset marker (above).
-- Docker modules can reach `/auth/` via `host.docker.internal:80` (first-party containers only) — accepted.
-- Pre-admin window: gate off = today's LAN trust model; it closes the moment the first `admin` is created via `/setup`. The box is already on the LAN and bouncing to `/setup` during first-boot setup, so this is the same window that exists today — no new exposure.
-- No singular owner: `admin` is a group; removal of all admins is backstopped by the physical reset marker, and the API guardrail (no last-active-admin removal/disable) prevents soft-lockout via `/api/auth`.
-- **HTTP-only Authelia workaround (4.x):** Authelia 4.x hardcodes `Secure` on the session cookie and requires `https`/`wss` for `authelia_url`, `default_redirection_url`, and the `X-Original-URL` target — none configurable. Since the appliance is HTTP-only on the LAN, nginx (a) forces `X-Original-URL "https://$http_host$request_uri"` in the internal auth-verify location, (b) the CP writes `authelia_url`/`default_redirection_url` as `https://{domain}/…` (used only for cookie-domain selection + redirect validation, not by the browser), and (c) strips the `Secure` flag via `proxy_cookie_flags authelia_session nosecure`. SameSite=Lax + HttpOnly are retained. If the appliance ever serves HTTPS (TLS at the gateway), these workarounds should be revisited.
-- **Known QEMU smoke artifact:** the QEMU smoke's `GET /settings/` (admin-gated) can return 403 while `GET /` and `/api/data` pass with the same session cookie — a test-environment quirk (Host/`--resolve` port + cookie-domain interaction), **not** a product bug; `/settings/` is verified working on a real VM appliance. Do not chase it in the QEMU loop.
+- We are building a login system in-house. Mitigated by: keeping it minimal (~200 lines of new CP code), using well-understood primitives (bcrypt, HMAC-SHA256, RFC 6238 TOTP), and the security requirements table above. The CP already owns the user/group data — we're adding the session layer, not reinventing the entire auth stack.
+- No SMTP / no email reset links → recovery is an admin CP reset (M6.2b) or the physical reset marker.
+- Pre-admin window: gate off = today's LAN trust model; closes when the first `admin` is created via `/setup`.
+- Stateful rate limiting is in-memory (CP process). A CP restart resets the counter — acceptable for a single-appliance LAN threat model (an attacker would need to sustain the attack across a CP restart).
+- Docker modules can reach `/login` via `host.docker.internal:80` (first-party containers only) — accepted; the login page is inert without valid credentials.
 
 #### Open WebUI container policy
 
@@ -867,7 +885,7 @@ Resolved for early milestones where noted; remaining items do not block M5 start
 | Installer | M4; partitions (+ optional lockout reset marker, M6.2); no auth work for fresh installs; reinstall releases LVM/DM |
 | Encryption | Deferred past M5 |
 | Open WebUI / auth | **M6.1:** OWUI auth off. **M6.2:** edge auth only at the nginx boundary — modules stay auth-naive (no per-container OAuth) |
-| Edge auth (M6.2) | **Authelia, file backend** (`users.yaml` derived from CP); **Valkey** session store (TTL auto-GC); NixOS service on `127.0.0.1:9091` (not Docker); nginx `auth_request` at functional path `/auth/` |
+| Edge auth (M6.2) | **CP-native login** (signed session tokens, branded login page). Replaces Authelia (https workarounds were fragile). Stateless HMAC-SHA256 tokens in cookie; no session store to GC. nginx `auth_request` at `/_lemonseed/session-verify` → CP. Login at `/login`, logout at `/logout`. TOTP (M6.3) via `pyotp`, required for `admin` group. |
 | CP authority | **CP + Postgres is the source of truth** (accounts = standard **users + groups**, many:many, Linux-style; elevation = `admin` group, no singular owner); config files / env / secrets are derived and regenerated (see §3) |
 | Admin bootstrap | **Single `/setup` path** (synchronous; name + timezone + admin creds) — first admin only while the `admin` group is empty; no installer interstitial, no Authelia/`mkpasswd` in the installer; lockout = preserve-reinstall + “Reset admin credentials” marker (physical access) clears the `admin` group so `/setup` reopens |
 
@@ -899,8 +917,11 @@ Historical M1 checklist (kept for archive):
 - [x] UX evaluation complete — Open WebUI primary; NanoClaw-style UI deferred
 - [x] Conduit noted as future mobile path
 - [x] Shared Postgres + Valkey + pgvector; minimal bind mounts; blue/green module updates
-- [x] Auth: OWUI disabled for M6.1; edge auth via Authelia at nginx (M6.2 design locked; not container OAuth)
+- [x] Auth: OWUI disabled for M6.1; edge auth at nginx (M6.2 design locked; not container OAuth)
 - [x] M6.0a data services + CP credential provisioning
 - [x] M6.1 Open WebUI on Postgres + Lemonade backend + Lemonseed shell
-- [ ] M6.2a: Authelia (file backend) + Valkey sessions + `/auth/` gate + first-admin bootstrap via `/setup` (installer supplies only the lockout reset marker)
+- [x] M6.2a: Authelia (file backend) + Valkey sessions + `/auth/` gate + first-admin bootstrap via `/setup` — **superseded by CP-native login** (Authelia https workarounds were fragile; see M6.2 migration)
+- [ ] M6.2 (migration): Remove Authelia; CP-native login (signed tokens, branded page, `/login` + `/logout` + `/_lemonseed/session-verify`); remove https workarounds
 - [ ] M6.2b: `/api/auth` users & groups management (user add / reset / disable / remove; group create / map) + portal Users & Groups section
+- [ ] M6.3: TOTP MFA via `pyotp` (required for `admin` group; device remembered per session)
+- [ ] Post-M6: Cloud service / DynDNS (`proposals/CLOUD-SERVICE.md`) for remote access + Let's Encrypt
