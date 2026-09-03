@@ -1,80 +1,70 @@
-"""Edge auth via Authelia: bootstrap, derived file backend, nginx gate (M6.2a).
+"""CP-native edge auth: login, signed session tokens, nginx gate (M6.2).
 
-Account truth lives in the CP state store (db.py, Postgres). Authelia is a
-stateless verifier: users.yaml / config.yml are derived artifacts and the
-/run/lemonseed/auth-*.conf gate snippets are empty until the first admin
-exists. All credential handling stays in the control plane (no bcrypt on the
+Account truth lives in the CP state store (db.py, Postgres). Sessions are
+stateless HMAC-SHA256 signed tokens in a cookie — no session store to GC.
+All credential handling stays in the control plane (no bcrypt on the
 installer).
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import os
 import re
 import secrets
 import subprocess
 import threading
 import time
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from pathlib import Path
 from typing import Any, Optional
 
 import db
 import data_services
 
-AUTH_STATE_DIR = Path("/var/lib/authelia")
-USERS_YAML = AUTH_STATE_DIR / "users.yaml"
-CONFIG_YAML = AUTH_STATE_DIR / "config.yml"
+LEMONSEED_STATE_DIR = Path("/var/lib/lemonseed")
+SESSION_SECRET_FILE = LEMONSEED_STATE_DIR / "session-secret"
 GATE_CONF = Path("/run/lemonseed/auth-gate.conf")
 ADMIN_CONF = Path("/run/lemonseed/auth-admin.conf")
 # Staged by the USB installer (ESP) and relocated by lemonseed-auth-reset-seed.
-RESET_MARKER_FILE = Path("/var/lib/lemonseed/reset-admin")
+RESET_MARKER_FILE = LEMONSEED_STATE_DIR / "reset-admin"
 
-AUTH_HOST = "127.0.0.1"
-AUTH_PORT = 9091
-# Functional (not product-named) URL surface; the backend can be swapped later
-# without touching the LAN surface.
-AUTH_PATH = "/auth"
 ADMIN_GROUP = "admin"
 BASE_GROUP = "users"
-# Dedicated Valkey logical DB for Authelia session keys (TTL = token expiry).
-VALKEY_SESSION_DB = 1
 PG_WAIT_SECONDS = 180
+
+# Session token parameters.
+SESSION_INACTIVITY_SECONDS = 3600  # 1h
+SESSION_ABSOLUTE_SECONDS = 36000  # 10h
+SESSION_COOKIE = "lemonseed_session"
+
+# Rate limiting: 5 failures per 5-minute window per IP → 15-min lockout.
+RATE_LIMIT_MAX_FAILURES = 5
+RATE_LIMIT_WINDOW_SECONDS = 300  # 5 min
+RATE_LIMIT_LOCKOUT_SECONDS = 900  # 15 min
 
 _USERNAME_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
 
-# Set only from auth_request_set (Authelia response headers) — never from the
-# client. Empty pre-auth → nginx omits the header entirely.
+# Set only from auth_request_set (CP session-verify response headers) — never
+# from the client. Empty pre-auth → nginx omits the header entirely.
 GATE_SNIPPET = """\
-auth_request /_lemonseed/auth-verify;
-auth_request_set $auth_user $upstream_http_remote_user;
-auth_request_set $auth_email $upstream_http_remote_email;
-auth_request_set $auth_groups $upstream_http_remote_groups;
+auth_request /_lemonseed/session-verify;
+auth_request_set $auth_user $upstream_http_x_forwarded_user;
+auth_request_set $auth_email $upstream_http_x_forwarded_email;
+auth_request_set $auth_groups $upstream_http_x_forwarded_groups;
+auth_request_set $auth_name $upstream_http_x_forwarded_name;
+auth_request_set $auth_role $upstream_http_x_forwarded_role;
 error_page 401 = @auth_unauthorized;
 """
 
-# /settings/ and other admin-only surfaces. The group check is enforced by
-# the control plane (which receives X-Forwarded-Groups from nginx) because
-# nginx `if` runs in the rewrite phase — before `auth_request` (access phase)
-# sets $auth_groups. An nginx-level `if` here would always see "" and 403.
+# Admin group check is enforced by the CP (X-Forwarded-Groups), not nginx `if`
+# (which runs in the rewrite phase, before auth_request sets variables).
 ADMIN_SNIPPET = ""
 
 _gate_lock = threading.Lock()
 _gate_synced = False
-
-
-def _write_private(path: Path, content: str) -> None:
-    """Atomically write a file Authelia (group) must read: 0640 root:authelia."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    os.chmod(tmp, 0o640)
-    try:
-        import grp  # noqa: PLC0415
-
-        os.chown(tmp, 0, grp.getgrnam("authelia").gr_gid)
-    except (KeyError, OSError, AttributeError):
-        pass
-    tmp.replace(path)
 
 
 def _write_conf(path: Path, content: str) -> None:
@@ -86,101 +76,170 @@ def _write_conf(path: Path, content: str) -> None:
     tmp.replace(path)
 
 
-def _yaml_scalar(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+def _load_session_secret() -> Optional[bytes]:
+    """Read the 256-bit session signing secret (0600)."""
+    try:
+        data = SESSION_SECRET_FILE.read_bytes()
+        if len(data) == 32:
+            return data
+    except OSError:
+        pass
+    return None
 
 
-def render_users_yaml(users: list[dict[str, Any]]) -> str:
-    """Authelia 4.x file-backend YAML derived from CP users (many:many groups).
+def _save_session_secret() -> bytes:
+    """Generate and persist a new 256-bit session secret (0600)."""
+    secret = secrets.token_bytes(32)
+    SESSION_SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SESSION_SECRET_FILE.with_name(SESSION_SECRET_FILE.name + ".tmp")
+    tmp.write_bytes(secret)
+    os.chmod(tmp, 0o600)
+    tmp.replace(SESSION_SECRET_FILE)
+    return secret
 
-    4.x format: a `users` map keyed by username (not a 2.x-style list).
+
+def ensure_session_secret() -> bytes:
+    """Return the session secret, generating it if absent (first-admin bootstrap)."""
+    existing = _load_session_secret()
+    if existing is not None:
+        return existing
+    return _save_session_secret()
+
+
+def rotate_session_secret() -> None:
+    """Regenerate the session secret (invalidates all active sessions)."""
+    _save_session_secret()
+
+
+def _sign(payload: bytes, secret: bytes) -> bytes:
+    return hmac.new(secret, payload, hashlib.sha256).digest()
+
+
+def issue_token(username: str, email: str, groups: list[str], display_name: str = "") -> str:
+    """Create a signed session token: base64url(payload).base64url(hmac).
+
+    ``display_name`` (claim ``n``) is the human-readable name forwarded to OWUI
+    so it can label the account; it falls back to the username when empty.
     """
-    if not users:
-        return "users: {}\n"
-    lines = ["users:"]
-    for user in users:
-        username = str(user["username"])
-        # displayname is required by the 4.x schema; fall back to the username.
-        display_name = str(user.get("display_name") or username)
-        lines.append(f"  {_yaml_scalar(username)}:")
-        lines.append(f"    displayname: {_yaml_scalar(display_name)}")
-        email = str(user.get("email") or "")
-        if email:
-            lines.append(f"    email: {_yaml_scalar(email)}")
-        lines.append(f"    password: {_yaml_scalar(str(user['password_hash']))}")
-        lines.append(f"    disabled: {'true' if user.get('disabled') else 'false'}")
-        groups = list(user.get("groups") or [])
-        if groups:
-            lines.append("    groups:")
-            for group in groups:
-                lines.append(f"      - {_yaml_scalar(str(group))}")
-    return "\n".join(lines) + "\n"
+    secret = _load_session_secret()
+    if secret is None:
+        raise ValueError("session secret not initialized")
+    now = int(time.time())
+    payload = json.dumps(
+        {
+            "u": username,
+            "e": email,
+            "g": groups,
+            "n": display_name or username,
+            "iat": now,
+            "exp": now + SESSION_ABSOLUTE_SECONDS,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    sig = _sign(payload, secret)
+    return urlsafe_b64encode(payload).decode() + "." + urlsafe_b64encode(sig).decode()
 
 
-def render_config(session_secret: str, storage_encryption_key: str, domain: str) -> str:
-    """Authelia 4.x config: loopback-only, file backend, Valkey sessions.
+def verify_token(token: str) -> Optional[dict[str, Any]]:
+    """Verify a session token. Returns the payload dict or None if invalid/expired."""
+    secret = _load_session_secret()
+    if secret is None:
+        return None
+    try:
+        b64_payload, b64_sig = token.split(".", 1)
+        payload = urlsafe_b64decode(b64_payload.encode())
+        sig = urlsafe_b64decode(b64_sig.encode())
+    except (ValueError, UnicodeDecodeError):
+        return None
+    expected_sig = _sign(payload, secret)
+    if not hmac.compare_digest(sig, expected_sig):
+        return None
+    try:
+        data = json.loads(payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if int(data.get("exp", 0)) < int(time.time()):
+        return None
+    return data
 
-    - server.address uses the 4.x address syntax; the path is served at both /
-      and /auth so nginx can keep a stable /auth/ prefix.
-    - Password reset/change are disabled: users.yaml is a derived artifact of
-      the CP state store, and lockout recovery goes through the installer +
-      /setup (DESIGN M6.2).
-    - The NTP startup check is disabled so the appliance boots offline.
-    - session.cookies is required in 4.x; the domain is the appliance's mDNS
-      hostname (set during setup). A hostname change requires re-setup.
-    Generated once at first-admin bootstrap; the secrets persist in
-    the file so reboots keep sessions and storage valid.
-    """
-    return f"""\
-server:
-  address: 'tcp://{AUTH_HOST}:{AUTH_PORT}{AUTH_PATH}'
-  endpoints:
-    authz:
-      auth-request:
-        implementation: "AuthRequest"
 
-log:
-  level: info
+def verify_credentials(username: str, password: str) -> Optional[dict[str, Any]]:
+    """Check username/password against Postgres. Returns user dict or None."""
+    import bcrypt  # noqa: PLC0415
 
-authentication_backend:
-  password_change:
-    disable: true
-  password_reset:
-    disable: true
-  file:
-    path: {USERS_YAML}
-    watch: true
+    if not _pg_ready():
+        return None
+    try:
+        conn = db.cp_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT username, display_name, email, password_hash, disabled FROM users WHERE username = %s",
+                    (username,),
+                )
+                row = cur.fetchone()
+                if row is None or row[4]:  # not found or disabled
+                    return None
+                cur.execute(
+                    "SELECT name FROM user_groups WHERE username = %s ORDER BY name",
+                    (username,),
+                )
+                groups = [r[0] for r in cur.fetchall()]
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        if not bcrypt.checkpw(password.encode("utf-8"), row[3].encode("utf-8")):
+            return None
+    except (ValueError, TypeError):
+        return None
+    return {
+        "username": row[0],
+        "display_name": row[1],
+        "email": row[2],
+        "groups": groups,
+    }
 
-storage:
-  local:
-    path: {AUTH_STATE_DIR / 'db.sqlite3'}
-  encryption_key: {storage_encryption_key}
 
-session:
-  secret: {session_secret}
-  cookies:
-    - name: authelia_session
-      domain: {domain}
-      same_site: lax
-      inactivity: 1h
-      expiration: 10h
-      authelia_url: https://{domain}/auth/
-      default_redirection_url: https://{domain}/
-  redis:
-    host: 127.0.0.1
-    port: 6379
-    database_index: {VALKEY_SESSION_DB}
+# --- Rate limiting (in-memory, per-IP sliding window) ---
 
-access_control:
-  default_policy: one_factor
+_rate_lock = threading.Lock()
+_rate_failures: dict[str, list[float]] = {}  # ip → [timestamps]
+_rate_lockouts: dict[str, float] = {}  # ip → unlock-at timestamp
 
-notifier:
-  filesystem:
-    filename: {AUTH_STATE_DIR / 'notifications.txt'}
 
-ntp:
-  disable_startup_check: true
-"""
+def rate_limit_check(ip: str) -> bool:
+    """Return True if the IP is allowed to attempt login. False if locked out."""
+    now = time.time()
+    with _rate_lock:
+        locked_until = _rate_lockouts.get(ip, 0)
+        if now < locked_until:
+            return False
+        # Prune old failures outside the window.
+        failures = _rate_failures.get(ip, [])
+        _rate_failures[ip] = [t for t in failures if now - t < RATE_LIMIT_WINDOW_SECONDS]
+        return True
+
+
+def rate_limit_record_failure(ip: str) -> None:
+    """Record a failed login attempt; lock out if threshold exceeded."""
+    now = time.time()
+    with _rate_lock:
+        failures = _rate_failures.setdefault(ip, [])
+        failures.append(now)
+        # Prune old entries.
+        _rate_failures[ip] = [t for t in failures if now - t < RATE_LIMIT_WINDOW_SECONDS]
+        if len(_rate_failures[ip]) >= RATE_LIMIT_MAX_FAILURES:
+            _rate_lockouts[ip] = now + RATE_LIMIT_LOCKOUT_SECONDS
+            _rate_failures[ip] = []
+
+
+def rate_limit_reset(ip: str) -> None:
+    """Clear failure count on successful login."""
+    with _rate_lock:
+        _rate_failures.pop(ip, None)
+        _rate_lockouts.pop(ip, None)
 
 
 def hash_password(password: str) -> str:
@@ -261,6 +320,11 @@ def admin_bootstrap_required() -> bool:
     return admin_exists() is not True
 
 
+def role(groups: list[str]) -> str:
+    """OWUI role for a session: ``admin`` if in the admin group, else ``user``."""
+    return "admin" if ADMIN_GROUP in {g.strip() for g in groups if g.strip()} else "user"
+
+
 def account_counts() -> tuple[Optional[int], Optional[int]]:
     """(user_count, enabled_admin_count) or (None, None) when PG is not ready."""
     if not _pg_ready():
@@ -285,37 +349,6 @@ def account_counts() -> tuple[Optional[int], Optional[int]]:
             conn.close()
     except Exception:  # noqa: BLE001
         return None, None
-
-
-def sync_users_yaml() -> bool:
-    """Derive users.yaml from the CP state store (Authelia hot-reloads it)."""
-    if not _pg_ready():
-        return False
-    try:
-        conn = db.cp_connect()
-        try:
-            users = _load_users(conn)
-        finally:
-            conn.close()
-        _rendered = render_users_yaml(users)
-        _write_private(USERS_YAML, _rendered)
-        return True
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def ensure_authelia_config(domain: str) -> bool:
-    """Create config.yml exactly once (secrets generated at bootstrap)."""
-    if CONFIG_YAML.is_file() and CONFIG_YAML.stat().st_size > 0:
-        return True
-    try:
-        _write_private(
-            CONFIG_YAML,
-            render_config(secrets.token_hex(32), secrets.token_hex(32), domain),
-        )
-        return True
-    except Exception:  # noqa: BLE001
-        return False
 
 
 def write_gate(enabled: bool) -> None:
@@ -343,25 +376,12 @@ def reload_nginx() -> None:
         )
 
 
-def _authelia_health() -> str:
-    import urllib.error
-    import urllib.request
-
-    url = f"http://{AUTH_HOST}:{AUTH_PORT}{AUTH_PATH}/api/health"
-    try:
-        with urllib.request.urlopen(url, timeout=2):
-            return "healthy"
-    except (urllib.error.URLError, OSError, ValueError):
-        return "down"
-
-
 def auth_status() -> dict[str, Any]:
-    """Cheap edge-auth summary for /api/status (live probe + counts)."""
+    """Cheap edge-auth summary for /api/status."""
     gate_enabled = GATE_CONF.is_file() and bool(GATE_CONF.read_text(encoding="utf-8").strip())
     user_count, admin_count = account_counts()
     return {
         "state": "enabled" if gate_enabled else "disabled",
-        "service": _authelia_health(),
         "users": user_count,
         "admins": admin_count,
         "reset_pending": reset_marker_present(),
@@ -372,16 +392,21 @@ def create_admin(username: str, password: str) -> dict[str, Any]:
     """Create the first admin (or consume a lockout reset). Synchronous.
 
     Waits bounded for Postgres, then: upsert user, ensure default groups and
-    mappings, derive users.yaml/config.yml, flip the gate, reload nginx.
+    mappings, generate session secret, flip the gate, reload nginx.
     Raises ValueError with a user-facing message on failure.
     """
     username = username.strip()[:64]
     if not _USERNAME_RE.fullmatch(username):
         raise ValueError(
-            "admin username must be 1-64 characters of a-z, 0-9, '_', '.' or '-'"
+            "admin username must be 1-64 characters of a-z, 0-9, '_' '.' or '-'"
         )
     if len(password) < 8:
         raise ValueError("admin password must be at least 8 characters")
+
+    # OWUI trusted-header auth keys identity on email; the setup form has no
+    # email field, so derive a deterministic local-part fallback to guarantee a
+    # non-empty identity (and a stable one across re-logins / resets).
+    email = f"{username}@lemonseed.local"
 
     reset = reset_marker_present()
     password_hash = hash_password(password)
@@ -410,13 +435,14 @@ def create_admin(username: str, password: str) -> dict[str, Any]:
             cur.execute(
                 """
                 INSERT INTO users (username, display_name, email, password_hash, disabled)
-                VALUES (%s, %s, '', %s, FALSE)
+                VALUES (%s, %s, %s, %s, FALSE)
                 ON CONFLICT (username) DO UPDATE
                   SET display_name = EXCLUDED.display_name,
+                      email = EXCLUDED.email,
                       password_hash = EXCLUDED.password_hash,
                       disabled = FALSE
                 """,
-                (username, username, password_hash),
+                (username, username, email, password_hash),
             )
             for group in (ADMIN_GROUP, BASE_GROUP):
                 cur.execute(
@@ -437,12 +463,12 @@ def create_admin(username: str, password: str) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         raise ValueError(f"Could not create the admin account: {exc}") from exc
 
-    if not sync_users_yaml():
-        raise ValueError("Could not write the auth user store; submit setup again")
-    hostname = Path("/etc/hostname").read_text(encoding="utf-8").strip() if Path("/etc/hostname").is_file() else "lemonseed"
-    domain = f"{hostname}.local" if "." not in hostname else hostname
-    if not ensure_authelia_config(domain):
-        raise ValueError("Could not write the auth config; submit setup again")
+    # Generate the session signing secret (first-admin bootstrap).
+    try:
+        ensure_session_secret()
+    except OSError as exc:
+        raise ValueError(f"Could not initialize the session store: {exc}") from exc
+
     write_gate(True)
     reload_nginx()
     if reset:
@@ -473,16 +499,8 @@ def ensure_auth_gate_worker() -> None:
                     continue
                 write_gate(exists)
                 if exists:
-                    # Re-derive in case the /var files are ever missing; the
-                    # existing config (and its secret) is preserved.
-                    hostname = (
-                        Path("/etc/hostname").read_text(encoding="utf-8").strip()
-                        if Path("/etc/hostname").is_file()
-                        else "lemonseed"
-                    )
-                    domain = f"{hostname}.local" if "." not in hostname else hostname
-                    ensure_authelia_config(domain)
-                    sync_users_yaml()
+                    # Ensure the session secret exists (reboot; /var persists).
+                    ensure_session_secret()
                     reload_nginx()
                 _gate_synced = True
                 return

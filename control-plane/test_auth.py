@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for auth.py (mocked; no Postgres/Valkey/Authelia required)."""
+"""Unit tests for auth.py (mocked; no Postgres required)."""
 
 from __future__ import annotations
 
@@ -28,66 +28,33 @@ def _conn_with_cur():
     return conn, cur
 
 
-class AuthFileRenderTests(unittest.TestCase):
-    def test_render_users_yaml_empty(self) -> None:
-        self.assertEqual(auth.render_users_yaml([]), "users: {}\n")
+class SessionSecretTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.secret_file = Path(self._tmp.name) / "session-secret"
+        self._patch = mock.patch.object(auth, "SESSION_SECRET_FILE", self.secret_file)
+        self._patch.start()
 
-    def test_render_users_yaml_map_format(self) -> None:
-        yaml_text = auth.render_users_yaml(
-            [
-                {
-                    "username": "matt",
-                    "display_name": "Matt O\"Brien\\Jr",
-                    "email": "matt@example.com",
-                    "password_hash": "$2y$12$abcdefgh",
-                    "disabled": False,
-                    "groups": ["admin", "family"],
-                },
-                {
-                    "username": "jill",
-                    "display_name": "",
-                    "email": "",
-                    "password_hash": "$2y$12$ijklmnop",
-                    "disabled": True,
-                    "groups": ["family"],
-                },
-            ]
-        )
-        # 4.x format: a `users` map keyed by username (many:many groups).
-        self.assertTrue(yaml_text.startswith("users:\n"))
-        self.assertIn('  "matt":', yaml_text)
-        self.assertIn('    displayname: "Matt O\\"Brien\\\\Jr"', yaml_text)
-        self.assertIn('    email: "matt@example.com"', yaml_text)
-        self.assertIn('    password: "$2y$12$abcdefgh"', yaml_text)
-        self.assertIn("    disabled: false", yaml_text)
-        self.assertIn("    groups:", yaml_text)
-        self.assertIn('      - "admin"', yaml_text)
-        self.assertIn('      - "family"', yaml_text)
-        # displayname falls back to the username; empty email omitted.
-        self.assertIn('  "jill":', yaml_text)
-        self.assertIn('    displayname: "jill"', yaml_text)
-        jill_block = yaml_text.split('"jill":', 1)[1]
-        self.assertNotIn("email:", jill_block)
-        self.assertIn("    disabled: true", jill_block)
-        # No legacy 2.x list style.
-        self.assertNotIn("- username:", yaml_text)
+    def tearDown(self) -> None:
+        self._patch.stop()
+        self._tmp.cleanup()
 
-    def test_render_config_keys(self) -> None:
-        config = auth.render_config("session-secret-1", "storage-key-2", "test.local")
-        self.assertIn(f"address: 'tcp://{auth.AUTH_HOST}:{auth.AUTH_PORT}{auth.AUTH_PATH}'", config)
-        self.assertIn("    watch: true", config)
-        self.assertIn("  encryption_key: storage-key-2", config)
-        self.assertIn("  secret: session-secret-1", config)
-        self.assertIn(f"    database_index: {auth.VALKEY_SESSION_DB}", config)
-        self.assertIn("  default_policy: one_factor", config)
-        self.assertIn("    disable: true", config)
-        self.assertIn("  disable_startup_check: true", config)
-        self.assertIn("    domain: test.local", config)
-        self.assertIn("    authelia_url: https://test.local/auth/", config)
-        # Default redirect target so Authelia does not reject rd=%2F as unsafe.
-        self.assertIn("    default_redirection_url: https://test.local/", config)
-        # 4.x auth-request endpoint implementation (official nginx guide).
-        self.assertIn('        implementation: "AuthRequest"', config)
+    def test_ensure_generates_32_bytes_0600(self) -> None:
+        secret = auth.ensure_session_secret()
+        self.assertEqual(len(secret), 32)
+        self.assertTrue(self.secret_file.is_file())
+        self.assertEqual(self.secret_file.stat().st_mode & 0o777, 0o600)
+
+    def test_ensure_returns_existing(self) -> None:
+        first = auth.ensure_session_secret()
+        second = auth.ensure_session_secret()
+        self.assertEqual(first, second)
+
+    def test_rotate_changes_secret(self) -> None:
+        first = auth.ensure_session_secret()
+        auth.rotate_session_secret()
+        second = auth.ensure_session_secret()
+        self.assertNotEqual(first, second)
 
 
 class AuthGateSnippetTests(unittest.TestCase):
@@ -106,12 +73,20 @@ class AuthGateSnippetTests(unittest.TestCase):
             patch.stop()
         self._tmp.cleanup()
 
+    def test_role_maps_admin_group(self) -> None:
+        self.assertEqual(auth.role(["admin", "users"]), "admin")
+        self.assertEqual(auth.role(["users"]), "user")
+        self.assertEqual(auth.role([]), "user")
+        self.assertEqual(auth.role([" admin "]), "admin")
+
     def test_write_gate_on_and_off(self) -> None:
         auth.write_gate(True)
-        self.assertIn("auth_request /_lemonseed/auth-verify;", auth.GATE_CONF.read_text())
+        self.assertIn("auth_request /_lemonseed/session-verify;", auth.GATE_CONF.read_text())
         self.assertIn("error_page 401 = @auth_unauthorized;", auth.GATE_CONF.read_text())
-        self.assertIn("$upstream_http_remote_user", auth.GATE_CONF.read_text())
-        self.assertIn("$upstream_http_remote_groups", auth.GATE_CONF.read_text())
+        self.assertIn("$upstream_http_x_forwarded_user", auth.GATE_CONF.read_text())
+        self.assertIn("$upstream_http_x_forwarded_groups", auth.GATE_CONF.read_text())
+        self.assertIn("$upstream_http_x_forwarded_name", auth.GATE_CONF.read_text())
+        self.assertIn("$upstream_http_x_forwarded_role", auth.GATE_CONF.read_text())
         # Admin group check is enforced by the CP (X-Forwarded-Groups), not
         # nginx `if` (which runs in the rewrite phase, before auth_request).
         self.assertEqual(auth.ADMIN_CONF.read_text(), "")
@@ -169,47 +144,69 @@ class AuthAdminStateTests(unittest.TestCase):
             self.assertTrue(auth.admin_bootstrap_required())
 
 
-class AuthConfigFileTests(unittest.TestCase):
+class TokenTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
-        root = Path(self._tmp.name)
-        self._patches = [
-            mock.patch.object(auth, "AUTH_STATE_DIR", root),
-            mock.patch.object(auth, "USERS_YAML", root / "users.yaml"),
-            mock.patch.object(auth, "CONFIG_YAML", root / "config.yml"),
-        ]
-        for patch in self._patches:
-            patch.start()
+        self.secret_file = Path(self._tmp.name) / "session-secret"
+        self._patch = mock.patch.object(auth, "SESSION_SECRET_FILE", self.secret_file)
+        self._patch.start()
+        self.secret = b"0123456789abcdef0123456789abcdef"  # 32 bytes
+        self.secret_file.write_bytes(self.secret)
 
     def tearDown(self) -> None:
-        for patch in self._patches:
-            patch.stop()
+        self._patch.stop()
         self._tmp.cleanup()
 
-    def test_ensure_config_writes_once(self) -> None:
-        self.assertTrue(auth.ensure_authelia_config("test.local"))
-        first = auth.CONFIG_YAML.read_text()
-        self.assertIn("encryption_key:", first)
-        self.assertIn("secret:", first)
-        # A second call must not rewrite (the secret must survive).
-        self.assertTrue(auth.ensure_authelia_config("test.local"))
-        self.assertEqual(auth.CONFIG_YAML.read_text(), first)
+    def test_issue_then_verify_roundtrip(self) -> None:
+        token = auth.issue_token("matt", "matt@example.com", ["admin", "users"])
+        data = auth.verify_token(token)
+        self.assertEqual(data["u"], "matt")
+        self.assertEqual(data["e"], "matt@example.com")
+        self.assertEqual(data["g"], ["admin", "users"])
+        # Display name falls back to the username when not supplied.
+        self.assertEqual(data["n"], "matt")
+        self.assertGreater(data["exp"], data["iat"])
 
-    def test_ensure_config_empty_file_rewrites(self) -> None:
-        auth.CONFIG_YAML.write_text("")
-        self.assertTrue(auth.ensure_authelia_config("test.local"))
-        self.assertGreater(auth.CONFIG_YAML.stat().st_size, 0)
+    def test_display_name_claim(self) -> None:
+        token = auth.issue_token("matt", "", ["users"], "Matt Corddry")
+        self.assertEqual(auth.verify_token(token)["n"], "Matt Corddry")
+
+    def test_tampered_payload_rejected(self) -> None:
+        token = auth.issue_token("matt", "", ["users"])
+        payload_b64, sig_b64 = token.split(".", 1)
+        # Flip a character in the payload (username).
+        bad_payload = payload_b64[:-2] + ("A" if payload_b64[-2] != "A" else "B")
+        self.assertIsNone(auth.verify_token(bad_payload + "." + sig_b64))
+
+    def test_tampered_signature_rejected(self) -> None:
+        token = auth.issue_token("matt", "", ["users"])
+        payload_b64, sig_b64 = token.split(".", 1)
+        bad_sig = ("A" if sig_b64[0] != "A" else "B") + sig_b64[1:]
+        self.assertIsNone(auth.verify_token(payload_b64 + "." + bad_sig))
+
+    def test_wrong_secret_rejected(self) -> None:
+        token = auth.issue_token("matt", "", ["users"])
+        self.secret_file.write_bytes(b"fedcba9876543210fedcba9876543210")
+        self.assertIsNone(auth.verify_token(token))
+
+    def test_expired_token_rejected(self) -> None:
+        token = auth.issue_token("matt", "", ["users"])
+        with mock.patch.object(auth, "SESSION_ABSOLUTE_SECONDS", -10):
+            expired = auth.issue_token("matt", "", ["users"])
+        self.assertIsNone(auth.verify_token(expired))
+
+    def test_no_secret_returns_none(self) -> None:
+        self.secret_file.unlink()
+        self.assertIsNone(auth.verify_token("abc.def"))
+
+    def test_malformed_token_rejected(self) -> None:
+        for bad in ("", "noperiod", "!!!.!!!", "a.b.c"):
+            self.assertIsNone(auth.verify_token(bad))
 
 
-class AuthSyncTests(unittest.TestCase):
+class VerifyCredentialsTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        root = Path(self._tmp.name)
         self._patches = [
-            mock.patch.object(auth, "AUTH_STATE_DIR", root),
-            mock.patch.object(auth, "USERS_YAML", root / "users.yaml"),
-            mock.patch.object(auth, "CONFIG_YAML", root / "config.yml"),
-            mock.patch.object(auth, "RESET_MARKER_FILE", root / "reset-admin"),
             mock.patch.object(db, "postgres_admin_dsn", return_value="postgresql://u:p@127.0.0.1/postgres"),
             mock.patch.object(db, "pg_isready", return_value=True),
         ]
@@ -219,24 +216,79 @@ class AuthSyncTests(unittest.TestCase):
     def tearDown(self) -> None:
         for patch in self._patches:
             patch.stop()
-        self._tmp.cleanup()
 
-    def test_sync_users_yaml_not_ready(self) -> None:
+    def test_pg_down_returns_none(self) -> None:
         with mock.patch.object(db, "pg_isready", return_value=False):
-            self.assertFalse(auth.sync_users_yaml())
+            self.assertIsNone(auth.verify_credentials("matt", "password1"))
 
-    def test_sync_users_yaml_derives(self) -> None:
+    def test_valid_credentials(self) -> None:
         conn, cur = _conn_with_cur()
-        cur.fetchall.side_effect = [
-            [("matt", "Matt", "", "$2y$12$hash", False)],
-            [("matt", "admin"), ("matt", "users")],
-        ]
+        # First query (user) returns one row; second (groups) returns rows.
+        cur.fetchone.return_value = ("matt", "Matt", "matt@example.com", "$2b$12$hash", False)
+        cur.fetchall.return_value = [("admin",), ("users",)]
+        with mock.patch.object(db, "cp_connect", return_value=conn), \
+             mock.patch("bcrypt.checkpw", return_value=True):
+            user = auth.verify_credentials("matt", "password1")
+        self.assertEqual(user["username"], "matt")
+        self.assertEqual(user["groups"], ["admin", "users"])
+
+    def test_unknown_user_returns_none(self) -> None:
+        conn, cur = _conn_with_cur()
+        cur.fetchone.return_value = None
         with mock.patch.object(db, "cp_connect", return_value=conn):
-            self.assertTrue(auth.sync_users_yaml())
-        text = auth.USERS_YAML.read_text()
-        self.assertIn('  "matt":', text)
-        self.assertIn('      - "admin"', text)
-        self.assertIn('      - "users"', text)
+            self.assertIsNone(auth.verify_credentials("ghost", "password1"))
+
+    def test_disabled_user_returns_none(self) -> None:
+        conn, cur = _conn_with_cur()
+        cur.fetchone.return_value = ("matt", "Matt", "", "$2b$12$hash", True)
+        with mock.patch.object(db, "cp_connect", return_value=conn):
+            self.assertIsNone(auth.verify_credentials("matt", "password1"))
+
+    def test_wrong_password_returns_none(self) -> None:
+        conn, cur = _conn_with_cur()
+        cur.fetchone.return_value = ("matt", "Matt", "", "$2b$12$hash", False)
+        cur.fetchall.return_value = []
+        with mock.patch.object(db, "cp_connect", return_value=conn), \
+             mock.patch("bcrypt.checkpw", return_value=False):
+            self.assertIsNone(auth.verify_credentials("matt", "wrong"))
+
+    def test_db_error_returns_none(self) -> None:
+        with mock.patch.object(db, "cp_connect", side_effect=RuntimeError("down")):
+            self.assertIsNone(auth.verify_credentials("matt", "password1"))
+
+
+class RateLimitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Reset module-level rate-limit state between tests.
+        auth._rate_failures.clear()
+        auth._rate_lockouts.clear()
+
+    def tearDown(self) -> None:
+        auth._rate_failures.clear()
+        auth._rate_lockouts.clear()
+
+    def test_allows_below_threshold(self) -> None:
+        for _ in range(auth.RATE_LIMIT_MAX_FAILURES - 1):
+            auth.rate_limit_record_failure("1.2.3.4")
+        self.assertTrue(auth.rate_limit_check("1.2.3.4"))
+
+    def test_locks_out_at_threshold(self) -> None:
+        for _ in range(auth.RATE_LIMIT_MAX_FAILURES):
+            auth.rate_limit_record_failure("1.2.3.4")
+        self.assertFalse(auth.rate_limit_check("1.2.3.4"))
+
+    def test_reset_clears_lockout(self) -> None:
+        for _ in range(auth.RATE_LIMIT_MAX_FAILURES):
+            auth.rate_limit_record_failure("1.2.3.4")
+        self.assertFalse(auth.rate_limit_check("1.2.3.4"))
+        auth.rate_limit_reset("1.2.3.4")
+        self.assertTrue(auth.rate_limit_check("1.2.3.4"))
+
+    def test_ips_are_independent(self) -> None:
+        for _ in range(auth.RATE_LIMIT_MAX_FAILURES):
+            auth.rate_limit_record_failure("1.2.3.4")
+        self.assertFalse(auth.rate_limit_check("1.2.3.4"))
+        self.assertTrue(auth.rate_limit_check("5.6.7.8"))
 
 
 class AuthStatusTests(unittest.TestCase):
@@ -249,7 +301,6 @@ class AuthStatusTests(unittest.TestCase):
             mock.patch.object(auth, "GATE_CONF", self.gate),
             mock.patch.object(auth, "RESET_MARKER_FILE", self.marker),
             mock.patch.object(db, "postgres_admin_dsn", return_value=None),
-            mock.patch.object(auth, "_authelia_health", return_value="down"),
         ]
         for patch in self._patches:
             patch.start()
@@ -262,7 +313,7 @@ class AuthStatusTests(unittest.TestCase):
     def test_status_disabled_and_pg_down(self) -> None:
         status = auth.auth_status()
         self.assertEqual(status["state"], "disabled")
-        self.assertEqual(status["service"], "down")
+        self.assertNotIn("service", status)
         self.assertIsNone(status["users"])
         self.assertIsNone(status["admins"])
         self.assertFalse(status["reset_pending"])
@@ -286,15 +337,11 @@ class AuthCreateAdminTests(unittest.TestCase):
         self.admin_conf = root / "auth-admin.conf"
         self.marker = root / "reset-admin"
         self._patches = [
-            mock.patch.object(auth, "AUTH_STATE_DIR", root),
-            mock.patch.object(auth, "USERS_YAML", root / "users.yaml"),
-            mock.patch.object(auth, "CONFIG_YAML", root / "config.yml"),
+            mock.patch.object(auth, "SESSION_SECRET_FILE", root / "session-secret"),
             mock.patch.object(auth, "GATE_CONF", self.gate),
             mock.patch.object(auth, "ADMIN_CONF", self.admin_conf),
             mock.patch.object(auth, "RESET_MARKER_FILE", self.marker),
             mock.patch.object(auth, "hash_password", return_value="$2y$12$testhash"),
-            mock.patch.object(auth, "sync_users_yaml", return_value=True),
-            mock.patch.object(auth, "ensure_authelia_config", return_value=True),
             mock.patch.object(auth, "reload_nginx"),
             mock.patch.object(auth, "PG_WAIT_SECONDS", 0),
             mock.patch.object(db, "postgres_admin_dsn", return_value="postgresql://u:p@127.0.0.1/postgres"),
@@ -346,6 +393,9 @@ class AuthCreateAdminTests(unittest.TestCase):
         self.assertEqual(len(sqls), 5)
         self.assertFalse(any("DELETE FROM user_groups" in sql for sql in sqls))
         self.assertIn("INSERT INTO users", sqls[0])
+        # Deterministic local-part email fallback (OWUI keys identity on email).
+        user_params = cur.execute.call_args_list[0].args[1]
+        self.assertEqual(user_params[2], "admin@lemonseed.local")
         self.assertIn("INSERT INTO groups", sqls[1])
         self.assertIn("INSERT INTO groups", sqls[2])
         self.assertIn("INSERT INTO user_groups", sqls[3])
@@ -371,14 +421,10 @@ class AuthGateWorkerTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         root = Path(self._tmp.name)
         self._patches = [
-            mock.patch.object(auth, "AUTH_STATE_DIR", root),
-            mock.patch.object(auth, "USERS_YAML", root / "users.yaml"),
-            mock.patch.object(auth, "CONFIG_YAML", root / "config.yml"),
+            mock.patch.object(auth, "SESSION_SECRET_FILE", root / "session-secret"),
             mock.patch.object(auth, "GATE_CONF", root / "auth-gate.conf"),
             mock.patch.object(auth, "ADMIN_CONF", root / "auth-admin.conf"),
             mock.patch.object(auth, "RESET_MARKER_FILE", root / "reset-admin"),
-            mock.patch.object(auth, "sync_users_yaml", return_value=True),
-            mock.patch.object(auth, "ensure_authelia_config", return_value=True),
             mock.patch.object(auth, "reload_nginx"),
         ]
         for patch in self._patches:

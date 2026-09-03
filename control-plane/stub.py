@@ -520,6 +520,31 @@ input, select {
 .landing .status-line.bad { color: var(--bad); }
 .frame-wrap iframe.hidden { display: none; }
 .frame-fallback.hidden { display: none; }
+.login-page {
+  min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  padding: 1.5rem;
+}
+.login-card {
+  width: 100%; max-width: 24rem; padding: 2rem 1.75rem 2.25rem;
+  border: 1px solid var(--line); border-radius: 16px;
+  background: rgba(15, 28, 24, 0.72);
+  text-align: center;
+}
+.login-card .brand-logo {
+  display: block; width: 3.25rem; height: 3.25rem; margin: 0 auto 0.5rem;
+  border-radius: 50%; object-fit: cover;
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.1);
+}
+.login-card h1 { font-size: 1.75rem; margin: 0.25rem 0 0.2rem; }
+.login-card .lede { margin-bottom: 0.25rem; }
+.login-card .field { text-align: left; }
+.login-error { color: var(--bad); margin: 0.75rem 0 0; }
+.btn {
+  margin-top: 1.25rem; width: 100%; border: 0; border-radius: 999px;
+  padding: 0.85rem 1rem; font-size: 1rem; font-weight: 700; cursor: pointer;
+  background: var(--accent); color: var(--accent-ink);
+}
+.btn.primary { background: var(--accent); color: var(--accent-ink); }
 """
 
 
@@ -616,14 +641,11 @@ def page_setup(
 </form>
 {err_html}{'<p class="okmsg">Settings saved. Waiting for services…</p>' if done else ""}
 </section>"""
-    # Once auth is active the portal is gated; land on the Authelia sign-in so
+    # Once auth is active the portal is gated; land on the CP login page so
     # the browser establishes a session before the chat frame loads (M6.2).
-    # rd=/ is a relative target: Authelia validates it against the (https) cookie
-    # domain, then echoes it back unchanged, so the browser navigates to /
-    # over its own http scheme. An absolute http URL would be rejected as
-    # "unsafe" and Authelia would fall back to its https default_redirection_url.
+    # rd=/ is a same-origin relative target the login handler echoes back.
     base_url = f"http://{mdns_name(str(setup.get('name') or name))}.local"
-    redirect_url = f"{base_url}/auth/?rd=%2F" if auth_active else f"{base_url}/"
+    redirect_url = f"{base_url}/login?rd=%2F" if auth_active else f"{base_url}/"
     # Manual escape hatch: mDNS propagation or a slow unit must not trap the user.
     continue_html = (
         '<p class="lede" style="margin-top:0.85rem">If this page does not continue on its own, open '
@@ -708,6 +730,59 @@ if (timezoneSelect && !{json.dumps(bool(saved_timezone))}) {{
     return body.encode()
 
 
+def page_login(*, rd: str = "/", error: str = "") -> bytes:
+    """Branded login page (replaces Authelia's unbranded sign-in)."""
+    setup = load_setup()
+    name = escape(str(setup.get("name") or "Lemonseed"))
+    error_html = f'<p class="login-error">{escape(error)}</p>' if error else ""
+    rd_hidden = f'<input type="hidden" name="rd" value="{escape(rd)}"/>'
+    body = f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>{name} — Sign in</title>{brand_head_links()}<style>{STYLE}</style>
+</head><body>
+<main class="login-page">
+<div class="login-card">
+<img class="brand-logo" src="/_lemonseed/brand/lemon-64.png" width="48" height="48" alt=""/>
+<h1>{name}</h1>
+<p class="lede">Sign in to continue</p>
+{error_html}
+<form id="login-form" method="post" action="/login">
+{rd_hidden}
+<div class="field"><label for="username">Username</label><input id="username" name="username" type="text" autocomplete="username" required autofocus/></div>
+<div class="field"><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required/></div>
+<button type="submit" class="btn primary">Sign in</button>
+</form>
+</div>
+</main>
+<script>
+// Submit as JSON (the CP expects application/json).
+document.getElementById('login-form').addEventListener('submit', async (ev) => {{
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  const body = Object.fromEntries(fd.entries());
+  const res = await fetch('/login', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify(body),
+  }});
+  if (res.redirected || res.status === 302) {{
+    const loc = res.headers.get('Location') || '/';
+    location.href = loc;
+    return;
+  }}
+  if (res.status === 401) {{
+    const err = document.createElement('p');
+    err.className = 'login-error';
+    err.textContent = 'Invalid username or password.';
+    document.querySelector('.login-card').insertBefore(err, document.querySelector('form'));
+  }}
+}});
+</script>
+</body></html>"""
+    return body.encode()
+
+
 def page_shell(snap: dict[str, Any], *, view: str = "chat") -> bytes:
     """Post-setup app shell: persistent toolbar + keep-alive iframes."""
     setup = load_setup()
@@ -750,6 +825,7 @@ def page_shell(snap: dict[str, Any], *, view: str = "chat") -> bytes:
   </div>
 </div>
 <a href="/settings/" id="nav-settings" class="gear {gear_active}" title="Settings" data-view="settings">⚙</a>
+<button id="nav-logout" class="gear" title="Log out" aria-label="Log out">⎋</button>
 </header>
 <div class="frame-wrap">
 <div class="frame-fallback {landing_class}" id="chat-fallback">
@@ -884,6 +960,17 @@ document.getElementById('nav-chat').addEventListener('click', (ev) => {{
 document.getElementById('nav-settings').addEventListener('click', (ev) => {{
   ev.preventDefault();
   setView('settings', true);
+}});
+document.getElementById('nav-logout').addEventListener('click', async () => {{
+  // Clear the session cookie, then land on the login page.
+  try {{
+    const res = await fetch('/logout', {{method: 'POST'}});
+    if (res.redirected) {{
+      location.href = res.headers.get('Location') || '/login';
+      return;
+    }}
+  }} catch (_) {{}}
+  location.href = '/login';
 }});
 window.addEventListener('popstate', () => {{
   const path = location.pathname.replace(/\\/$/, '') || '/';
@@ -1150,7 +1237,7 @@ def complete_setup(
     run_best_effort(["timedatectl", "set-timezone", timezone])
     if admin_username and admin_password:
         # Synchronous first-admin bootstrap: waits bounded for Postgres, then
-        # derives the Authelia file backend and flips the nginx gate.
+        # stores the bcrypt hash, generates the session secret, and flips the gate.
         auth.create_admin(admin_username, admin_password)
     marker = SETUP_COMPLETE_FILE.with_suffix(".tmp")
     marker.write_text(payload["completed_at"] + "\n", encoding="utf-8")
@@ -1180,9 +1267,9 @@ class Handler(BaseHTTPRequestHandler):
     def _require_admin(self) -> bool:
         """Return True (and send 403) if the caller is not in the admin group.
 
-        nginx sets X-Forwarded-Groups from Authelia's Remote-Groups header
-        (via auth_request_set + proxy_set_header). When the auth gate is
-        disabled (pre-admin) the header is absent, which is fine: setup is
+        nginx sets X-Forwarded-Groups from the CP session-verify response
+        headers (via auth_request_set + proxy_set_header). When the auth gate
+        is disabled (pre-admin) the header is absent, which is fine: setup is
         not yet complete and /settings/ redirects to /setup anyway.
         """
         groups = self.headers.get("X-Forwarded-Groups", "")
@@ -1191,6 +1278,108 @@ class Handler(BaseHTTPRequestHandler):
             self._send(403, b"forbidden\n", "text/plain; charset=utf-8")
             return False
         return True
+
+    def _parse_cookie(self, name: str) -> Optional[str]:
+        """Extract a cookie value from the request headers."""
+        raw = self.headers.get("Cookie", "")
+        for part in raw.split(";"):
+            part = part.strip()
+            if part.startswith(name + "="):
+                return part[len(name) + 1 :]
+        return None
+
+    def _handle_session_verify(self) -> None:
+        """nginx auth_request target: verify the session cookie.
+
+        Returns 200 + X-Forwarded-* headers on success, 401 on failure.
+        """
+        token = self._parse_cookie(auth.SESSION_COOKIE)
+        if not token:
+            self.send_response(401)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        data = auth.verify_token(token)
+        if data is None:
+            self.send_response(401)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("X-Forwarded-User", data.get("u", ""))
+        self.send_header("X-Forwarded-Email", data.get("e", ""))
+        self.send_header("X-Forwarded-Groups", ",".join(data.get("g", [])))
+        self.send_header("X-Forwarded-Name", data.get("n", "") or data.get("u", ""))
+        self.send_header("X-Forwarded-Role", auth.role(data.get("g", [])))
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _handle_login_get(self, query: str) -> None:
+        """GET /login — branded login page."""
+        if setup_complete() and not auth.admin_bootstrap_required():
+            # Auth is active: show the login form.
+            rd = ""
+            if query:
+                params = parse_qs(query)
+                rd = params.get("rd", [""])[0]
+            body = page_login(rd=rd)
+            self._send(200, body, "text/html; charset=utf-8")
+            return
+        # Pre-setup or admin reset: redirect to /setup.
+        self.send_response(302)
+        self.send_header("Location", "/setup")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _handle_login_post(self, raw: bytes) -> None:
+        """POST /login — verify credentials, issue session token."""
+        try:
+            data = json.loads(raw.decode() or "{}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send(400, b"bad request\n", "text/plain; charset=utf-8")
+            return
+        username = str(data.get("username", "")).strip()
+        password = str(data.get("password", ""))
+        rd = str(data.get("rd", "/"))
+
+        # Rate limiting by source IP.
+        ip = self.client_address[0] if self.client_address else "unknown"
+        if not auth.rate_limit_check(ip):
+            self._send(401, b"invalid username or password\n", "text/plain; charset=utf-8")
+            return
+
+        user = auth.verify_credentials(username, password)
+        if user is None:
+            auth.rate_limit_record_failure(ip)
+            self._send(401, b"invalid username or password\n", "text/plain; charset=utf-8")
+            return
+
+        auth.rate_limit_reset(ip)
+        token = auth.issue_token(
+            user["username"],
+            user.get("email", ""),
+            user.get("groups", []),
+            user.get("display_name", ""),
+        )
+
+        # Sanitize the redirect target: must be a same-origin relative path.
+        if not rd.startswith("/") or rd.startswith("//"):
+            rd = "/"
+
+        self.send_response(302)
+        self.send_header("Location", rd)
+        cookie = f"{auth.SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax"
+        self.send_header("Set-Cookie", cookie)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _handle_logout(self) -> None:
+        """POST /logout — clear the session cookie."""
+        self.send_response(302)
+        self.send_header("Location", "/login")
+        self.send_header("Set-Cookie", f"{auth.SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
@@ -1312,6 +1501,12 @@ class Handler(BaseHTTPRequestHandler):
             modules.ensure_module_worker()
             self._send(200, page_shell(snap, view="settings"), "text/html; charset=utf-8")
             return
+        if path == "/login":
+            self._handle_login_get(urlparse(self.path).query)
+            return
+        if path == "/_lemonseed/session-verify":
+            self._handle_session_verify()
+            return
         if path in ("/", "/index.html", "/setup"):
             if redirect_off_factory_mdns(self, path if path != "/index.html" else "/"):
                 return
@@ -1321,10 +1516,11 @@ class Handler(BaseHTTPRequestHandler):
             snap["data"] = data_services.data_snapshot()
             snap["modules"] = modules.modules_snapshot()
             setup = load_setup()
-            review_required = (
-                not setup_complete()
-                or setup.get("confirmed_version") != appliance_version()
-            )
+            # The review form (name + timezone + admin creds) is a first-boot
+            # concern. On an A/B update the version changes, so a version
+            # mismatch must NOT re-prompt an already-configured appliance —
+            # only a genuinely incomplete setup does.
+            review_required = not setup_complete()
             admin_reset = auth.reset_marker_present()
             if setup_complete() and not review_required and not admin_reset:
                 chat_ready.ensure_chat_worker()
@@ -1349,6 +1545,12 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
+        if path == "/login":
+            self._handle_login_post(raw)
+            return
+        if path == "/logout":
+            self._handle_logout()
+            return
         if path != "/setup":
             self._json(404, {"error": "not found"})
             return

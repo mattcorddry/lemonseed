@@ -12,7 +12,6 @@
     ./modules/lemond.nix
     ./modules/data-services.nix
     ./modules/control-plane.nix
-    ./modules/authelia.nix
     ./modules/gateway.nix
     ./modules/console.nix
     ./modules/metadata.nix
@@ -80,7 +79,6 @@
   virtualisation.docker.enableOnBoot = true;
 
   lemonseed.dataServices.enable = true;
-  lemonseed.authelia.enable = true;
   networking.useDHCP = true;
   networking.firewall.enable = true;
 

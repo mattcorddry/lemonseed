@@ -268,6 +268,13 @@ _POLICY_ENV_KEYS = (
     "ENABLE_WEB_SEARCH",
     "ENABLE_IMAGE_GENERATION",
     "ENABLE_CHANNELS",
+    # OWUI auth (M6.2): trusted-header env is read at import time, so a healthy
+    # container running without it must be blue/green-recreated to pick it up.
+    "WEBUI_AUTH",
+    "WEBUI_AUTH_TRUSTED_EMAIL_HEADER",
+    "WEBUI_AUTH_TRUSTED_NAME_HEADER",
+    "WEBUI_AUTH_TRUSTED_GROUPS_HEADER",
+    "WEBUI_AUTH_TRUSTED_ROLE_HEADER",
 )
 
 
@@ -300,10 +307,22 @@ def enrich_open_webui_secrets() -> dict[str, str]:
     # M6.3a policy: autocomplete off, automations on, workspace off, notes/memory
     # on; web search / image gen / community off until sidecars land; channels
     # deferred until we seed a shared “everyone” channel.
+    #
+    # OWUI auth (M6.2): WEBUI_AUTH on with trusted-header auth. The nginx edge
+    # gate (auth_request) is the real login; it forwards the signed-in user's
+    # identity via X-Forwarded-Email/-Name/-Groups/-Role (set only from the CP
+    # session-verify response, so client-supplied values are dropped). OWUI's
+    # trusted-header provider keys identity on EMAIL, auto-creates one account
+    # per user, and syncs groups + role — no OWUI password login, no https
+    # requirement, and the user is never called “User”.
     payload = {
         **existing,
         "DATABASE_URL": database_url,
-        "WEBUI_AUTH": "False",
+        "WEBUI_AUTH": "True",
+        "WEBUI_AUTH_TRUSTED_EMAIL_HEADER": "X-Forwarded-Email",
+        "WEBUI_AUTH_TRUSTED_NAME_HEADER": "X-Forwarded-Name",
+        "WEBUI_AUTH_TRUSTED_GROUPS_HEADER": "X-Forwarded-Groups",
+        "WEBUI_AUTH_TRUSTED_ROLE_HEADER": "X-Forwarded-Role",
         "ENABLE_PERSISTENT_CONFIG": "False",
         "ENABLE_OLLAMA_API": "False",
         "OLLAMA_BASE_URL": "",

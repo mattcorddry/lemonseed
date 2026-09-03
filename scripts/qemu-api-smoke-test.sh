@@ -42,8 +42,8 @@ usage: $(basename "$0") [--build]
   --debug   Run qemu with an interactive console on ttyS0
 
 Polls http://127.0.0.1:${HOST_PORT}/healthz and /api/status after boot, then
-exercises the M6.2a edge-auth flow (first admin via /setup, Authelia
-sign-in at /auth/, gated / and /settings/ with the session cookie).
+exercises the M6.2 edge-auth flow (first admin via /setup, CP-native
+sign-in at /login, gated / and /settings/ with the session cookie).
 EOF
 }
 
@@ -359,7 +359,7 @@ echo "==> Probing OWUI SPA asset via nginx (/_app/version.json)"
 curl -fsS --max-time 10 "http://127.0.0.1:${HOST_PORT}/_app/version.json" \
   | python3 -c 'import sys; body=sys.stdin.read(200); assert body.strip(), "empty version.json"; print("OK: /_app/version.json (%d bytes)" % len(body))'
 
-# --- Edge auth (M6.2a): first-admin bootstrap + Authelia round-trip ---------
+# --- Edge auth (M6.2): first-admin bootstrap + CP-native login round-trip ---
 
 echo "==> Edge auth: first-admin bootstrap via /setup"
 ADMIN_USERNAME="admin"
@@ -377,7 +377,7 @@ if [[ "${setup_code}" != "200" ]]; then
   exit 1
 fi
 
-echo "==> Waiting for auth state=enabled + Authelia healthy (remaining budget)"
+echo "==> Waiting for auth state=enabled (remaining budget)"
 auth_deadline=$((deadline))
 auth_json=""
 while (( SECONDS < auth_deadline )); do
@@ -388,11 +388,10 @@ import json, sys
 d = json.load(sys.stdin)
 a = d.get("auth") or {}
 state = a.get("state")
-service = a.get("service")
 users = a.get("users")
 admins = a.get("admins")
-print("yes" if state == "enabled" and service == "healthy" else "no")
-print("waiting: auth state=%r service=%r users=%r admins=%r" % (state, service, users, admins), file=sys.stderr)
+print("yes" if state == "enabled" else "no")
+print("waiting: auth state=%r users=%r admins=%r" % (state, users, admins), file=sys.stderr)
 ' 2>/tmp/qemu-auth-wait.err || true)"
     cat /tmp/qemu-auth-wait.err >&2 || true
     if [[ "${auth_ok}" == "yes" ]]; then
@@ -409,7 +408,7 @@ print("waiting: auth state=%r service=%r users=%r admins=%r" % (state, service, 
 done
 
 if [[ -z "${auth_json}" ]]; then
-  echo "Timed out waiting for auth state=enabled + service=healthy" >&2
+  echo "Timed out waiting for auth state=enabled" >&2
   curl -fsS --max-time 5 "http://127.0.0.1:${HOST_PORT}/api/status" >&2 || true
   tail -80 "${LOG}" >&2 || true
   exit 1
@@ -418,22 +417,18 @@ echo "${auth_json}" | python3 -c '
 import json, sys
 a = json.load(sys.stdin).get("auth") or {}
 state = a.get("state")
-service = a.get("service")
 users = a.get("users")
 admins = a.get("admins")
-print("OK: auth state=%r service=%r users=%r admins=%r" % (state, service, users, admins))
+print("OK: auth state=%r users=%r admins=%r" % (state, users, admins))
 assert state == "enabled", a
-assert service == "healthy", a
 assert users == 1 and admins == 1, a
 '
 
-echo "==> Auth gate: unauthenticated requests must redirect to /auth/"
-# Authelia validates X-Original-URL against the configured cookie domain
-# (the mDNS hostname set during setup), so the Host header must match.
+echo "==> Auth gate: unauthenticated requests must redirect to /login"
 AUTH_HOST="lemon-test.local"
 root_unauth_code="$(curl -sS -o /dev/null -D /tmp/qemu-root-unauth.hdr -w '%{http_code}' -H "Host: ${AUTH_HOST}" "http://127.0.0.1:${HOST_PORT}/")"
-if [[ "${root_unauth_code}" != "302" ]] || ! grep -qiE '^location: (https?://[^/]+)?/auth/\?rd=' /tmp/qemu-root-unauth.hdr; then
-  echo "GET / unauthenticated: expected 302 to /auth/?rd=, got ${root_unauth_code}" >&2
+if [[ "${root_unauth_code}" != "302" ]] || ! grep -qiE '^location: (https?://[^/]+)?/login\?rd=' /tmp/qemu-root-unauth.hdr; then
+  echo "GET / unauthenticated: expected 302 to /login?rd=, got ${root_unauth_code}" >&2
   cat /tmp/qemu-root-unauth.hdr >&2 || true
   exit 1
 fi
@@ -442,35 +437,35 @@ api_unauth_code="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: ${AUTH_HOST
   echo "GET /api/data unauthenticated: expected 302, got ${api_unauth_code}" >&2; exit 1;
 }
 
-echo "==> Authelia: sign-in page + firstfactor login"
-auth_page_code="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: ${AUTH_HOST}" "http://127.0.0.1:${HOST_PORT}/auth/")"
-[[ "${auth_page_code}" == "200" ]] || {
-  echo "GET /auth/: expected 200, got ${auth_page_code}" >&2; exit 1;
+echo "==> CP-native login: sign-in page + credential login"
+login_page_code="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: ${AUTH_HOST}" "http://127.0.0.1:${HOST_PORT}/login")"
+[[ "${login_page_code}" == "200" ]] || {
+  echo "GET /login: expected 200, got ${login_page_code}" >&2; exit 1;
 }
 COOKIE_JAR="$(mktemp /tmp/qemu-auth-cookies.XXXXXX)"
 signin_code="$(curl -sS --max-time 60 -o /dev/null -c "${COOKIE_JAR}" \
   -D /tmp/qemu-signin-hdr.txt -w '%{http_code}' \
-  -X POST "http://127.0.0.1:${HOST_PORT}/auth/api/firstfactor" \
+  -X POST "http://127.0.0.1:${HOST_PORT}/login" \
   -H "Host: ${AUTH_HOST}" \
   -H 'Content-Type: application/json' \
-  -d "{\"username\":\"${ADMIN_USERNAME}\",\"password\":\"${ADMIN_PASSWORD}\"}")"
-if [[ "${signin_code}" != "200" ]] || ! grep -qi '^set-cookie: authelia_session' /tmp/qemu-signin-hdr.txt; then
-  echo "POST /auth/api/firstfactor: expected 200 + authelia_session cookie, got ${signin_code}" >&2
+  -d "{\"username\":\"${ADMIN_USERNAME}\",\"password\":\"${ADMIN_PASSWORD}\",\"rd\":\"/\"}")"
+if [[ "${signin_code}" != "302" ]] || ! grep -qi '^set-cookie: lemonseed_session' /tmp/qemu-signin-hdr.txt; then
+  echo "POST /login: expected 302 + lemonseed_session cookie, got ${signin_code}" >&2
   cat /tmp/qemu-signin-hdr.txt >&2 || true
   exit 1
 fi
 
-# The session cookie must NOT be Secure (the appliance is HTTP-only); nginx
-# strips it via proxy_cookie_flags. Verify the jar actually captured it.
-if ! grep -qi 'authelia_session' "${COOKIE_JAR}"; then
-  echo "authelia_session cookie not captured in jar (Secure flag not stripped?)" >&2
+# The session cookie must NOT be Secure (the appliance is HTTP-only). Verify
+# the jar actually captured it.
+if ! grep -qi 'lemonseed_session' "${COOKIE_JAR}"; then
+  echo "lemonseed_session cookie not captured in jar (Secure flag?)" >&2
   cat /tmp/qemu-signin-hdr.txt >&2 || true
   exit 1
 fi
 
 echo "==> Authenticated requests (session cookie)"
 # --resolve maps the mDNS hostname to the QEMU host-forward port so curl sends
-# the Authelia session cookie (domain-matched) while connecting to 127.0.0.1.
+# the session cookie (domain-matched) while connecting to 127.0.0.1.
 # NOTE: /settings/ (admin-gated) is deliberately NOT probed here — it 403s in
 # the QEMU test env (Host/--resolve port + cookie-domain interaction) while
 # working on a real appliance. Verified on hardware instead (DESIGN M6.2).

@@ -71,7 +71,6 @@ in
       ];
       ReadWritePaths = [
         "/var/lib/lemonseed"
-        "/var/lib/authelia"
         "/etc"
         "/run/appliance"
         "/run/lemonseed"

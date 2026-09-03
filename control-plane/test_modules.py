@@ -96,7 +96,15 @@ class ModulesTests(unittest.TestCase):
         _key: mock.Mock,
     ) -> None:
         env = modules.enrich_open_webui_secrets()
-        self.assertEqual(env["WEBUI_AUTH"], "False")
+        # M6.2: OWUI trusted-header auth (edge gate is the login; identity keyed on email).
+        self.assertEqual(env["WEBUI_AUTH"], "True")
+        self.assertEqual(env["WEBUI_AUTH_TRUSTED_EMAIL_HEADER"], "X-Forwarded-Email")
+        self.assertEqual(env["WEBUI_AUTH_TRUSTED_NAME_HEADER"], "X-Forwarded-Name")
+        self.assertEqual(env["WEBUI_AUTH_TRUSTED_GROUPS_HEADER"], "X-Forwarded-Groups")
+        self.assertEqual(env["WEBUI_AUTH_TRUSTED_ROLE_HEADER"], "X-Forwarded-Role")
+        # Invented provider vars must not leak into the container env.
+        self.assertNotIn("WEBUI_AUTH_PROVIDER", env)
+        self.assertNotIn("AUTH_CUSTOM_HEADER", env)
         self.assertEqual(env["ENABLE_OLLAMA_API"], "False")
         self.assertEqual(env["OLLAMA_BASE_URL"], "")
         self.assertEqual(env["OPENAI_API_BASE_URLS"], modules.LEMONADE_BASE)
@@ -225,6 +233,22 @@ class ModulesTests(unittest.TestCase):
         with mock.patch.object(modules, "_container_env_map", return_value=stale):
             self.assertFalse(modules._policy_env_ok("c", desired))
         with mock.patch.object(modules, "_container_env_map", return_value=desired):
+            self.assertTrue(modules._policy_env_ok("c", desired))
+
+    def test_policy_env_ok_detects_missing_trusted_header_auth(self) -> None:
+        # Desired env enables OWUI trusted-header auth; a healthy container that
+        # predates it (no auth keys) must be flagged stale so it gets recreated.
+        desired = {
+            "WEBUI_AUTH": "True",
+            "WEBUI_AUTH_TRUSTED_EMAIL_HEADER": "X-Forwarded-Email",
+            "WEBUI_AUTH_TRUSTED_NAME_HEADER": "X-Forwarded-Name",
+            "WEBUI_AUTH_TRUSTED_GROUPS_HEADER": "X-Forwarded-Groups",
+            "WEBUI_AUTH_TRUSTED_ROLE_HEADER": "X-Forwarded-Role",
+        }
+        # Container running with none of the auth env (pre-M6.2 trusted-header).
+        with mock.patch.object(modules, "_container_env_map", return_value={}):
+            self.assertFalse(modules._policy_env_ok("c", desired))
+        with mock.patch.object(modules, "_container_env_map", return_value=dict(desired)):
             self.assertTrue(modules._policy_env_ok("c", desired))
 
     @mock.patch.object(modules, "reload_nginx", return_value=True)
