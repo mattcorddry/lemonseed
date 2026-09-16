@@ -69,10 +69,12 @@ Lemonseed is a **local, multi-user home AI hub** — not a cloud client and not 
 | **M4 — USB installer** | **Nearly done** — install + portal + first-boot setup; polish remaining |
 | **M4.1 — Preserve known user-data on reinstall** | **Done** — namespaced storage identity; preserve checkbox; layout-compatible reinstall |
 | **M5 — Hardware-aware local chat** | **Done** — `lemond` + NVIDIA/CUDA; inventory + catalog planner + CP pull/load/pin + portal “Local chat ready”; unit tests + QEMU API smoke |
-| **M6 — Open WebUI household UX** | **In progress** — M6.1 + M6.3a done; next **M6.2** edge auth (Authelia, file backend + Valkey sessions); SearXNG/ComfyUI after auth |
-| **M6+ (later)** | Conduit/mobile polish, AMD/UMA profiles, heterogeneous GPU planner, encryption, offline install, Secure Boot/TPM |
+| **M6 — Open WebUI household UX** | **In progress** — M6.1 + M6.2 + M6.3a + M6.4 done; M6.3 (TOTP) next; SearXNG/ComfyUI after |
+| **M6+ (later)** | Conduit/mobile polish, AMD GPU driver optimization (ROCm/HRX), AMD NPU (XDNA), heterogeneous GPU planner, encryption, offline install, Secure Boot/TPM |
 
-**Immediate next step:** **M6.2a** — edge auth via **Authelia (file backend)** behind nginx at `/auth/`, first-admin bootstrap via `/setup` (the USB installer only supplies the lockout reset marker), Valkey session store. Multi-user / shared-LAN features (SearXNG, channels/calendar, ComfyUI) follow once the edge is authenticated.
+**M6.4 status (2026-09):** AMD Vulkan GPU support is **implemented** (code + unit tests green). QEMU smoke test pending (CPU path only; no AMD GPU in QEMU). Real-hardware validation pending on RX 6800 (gfx1030) and Ryzen AI 385 (gfx1151 iGPU + XDNA NPU).
+
+**Immediate next step:** **M6.3** — TOTP MFA via `pyotp`, required for `admin` group. Then SearXNG/ComfyUI modules.
 
 ### M6 — Open WebUI as primary UX (decided)
 
@@ -220,6 +222,7 @@ Failed health-check → old container keeps serving; appliance stays up.
 | **M6.2 (migration)** | Remove Authelia. Add CP login/logout/session-verify endpoints + branded login page. Update nginx gate to point to CP. Remove https workarounds. Keep all M6.2a account/group/bootstrap/lockout logic. |
 | **M6.2b** | `/api/auth` users & groups management + portal Users & Groups section. (Unchanged from prior plan.) |
 | **M6.3** | TOTP MFA via `pyotp`. Required for `admin` group. Device remembered per session. |
+| **M6.4** | AMD GPU Vulkan support. Mesa RADV ICD + `vulkaninfo` detection + `select_backend` runtime dispatch. Single production image covers NVIDIA (CUDA) and AMD (Vulkan). |
 
 **Testing (revised):**
 - **Unit** (`make test`): token sign/verify/expire, login POST (valid/invalid/rate-limited), session-verify endpoint, admin group check, bootstrap gate, reset-marker idempotency, `/api/auth` handlers. Subprocess/psycopg2 mocked.
@@ -304,6 +307,7 @@ Default appliance image: **no** community plugins until reviewed; optional “en
 - **Live API health:** CP status fields (`/api/data`, `/api/status`, subsystem snapshots) should report **current health** via cheap live checks (e.g. `pg_isready` / `SELECT 1`, Valkey PING, HTTP ready), not a one-shot or cached reflection of “daemon started once.” If Postgres stops accepting connections after boot, the API should flip to unhealthy.
 - **Module catalog specs:** Define a Lemonseed **module configuration file** (one file per module under a catalog directory in-tree). Each spec encapsulates execution params (docker-compose fragment / pinned image), UX (logo, name, description, help), and dependencies (Postgres, Valkey, future object store). Catalog entries are what users see and what the CP downloads/sets up. The catalog itself needs a **test/release cycle**: pull candidate images → integration test → advance the version pin only when validated.
 - **Module image pins (strategy):** Every Docker module tracks the **newest upstream stable** tag we have validated. Keep an explicit pin in code (Open WebUI: `ghcr.io/open-webui/open-webui:v0.11.0` via `OWUI_IMAGE_DEFAULT` in `control-plane/modules.py`) so field appliances never float on `:latest` / `:main`. The build/rebase pipeline should regularly bump pins to current stable, run unit + QEMU smoke (and hardware when the module is user-facing), then land the pin — not leave modules on stale releases for “safety.” Lab overrides use `LEMONSEED_OWUI_IMAGE` only.
+- **Registry reachability preflight:** `network-online.target` can be reached while DNS is still broken (or the WAN link is down); a `docker pull` then fails with an opaque `no such host` and the supervisor would hammer the registry every 10s. Before pulling, `modules._pull_image()` checks the registry host (DNS + TCP 443, cached 60s) and, when unreachable, surfaces a user-actionable message ("Cannot reach the container registry — check this appliance's internet connection. Retrying automatically.") on the Getting Ready / settings pages. A single diagnostic `docker pull` probe per 60s keeps the journal informative without hammering the registry; the box self-heals when connectivity returns.
 - **Backup / restore:** Transactionally clean, space/time-efficient backup including Postgres dump, Valkey dump, and per-module **durable** volumes declared in the module spec. Targets: USB (preflight free-space check; optional encryption) and local SMB/NAS shares.
 - **Installer stream-to-disk:** partition first, stream squashfs to `root-a`, avoid multi-GB RAM staging on the live ISO.
 - **Internationalization &amp; accessibility:** Support for multiple languages and dialects, number units, and for assistive technology (e.g. image ALT tags, screen reader support).
@@ -325,6 +329,67 @@ Default appliance image: **no** community plugins until reviewed; optional “en
 - [ ] Identity `X-Forwarded-*` sourced only from Authelia (client-supplied overridden); `/settings/` admin-gated
 - [ ] M6.2b: `/api/auth` users & groups management + portal Users & Groups section
 - [ ] QEMU auth phase green (redirect → sign-in → authenticated 200s; status endpoints stay open)
+
+### M6.4 — AMD GPU Vulkan support (design)
+
+**Decision (2026-09):** M6.4 adds **AMD GPU support via the Vulkan backend** so `lemond` + `llama-server` can use AMD GPUs (dGPU and Strix iGPU) on user hardware. The scope is **Vulkan only** — ROCm and the new HRX backend (Lemonade 11.9) are deferred to the backlog as "AMD GPU driver optimization (ROCm/HRX)". Long-term the system should auto-detect and enable any combination of NVIDIA GPU, AMD dGPU, AMD iGPU, AMD NPU, or CPU.
+
+**Why Vulkan:**
+- **Broad coverage:** Mesa RADV (the AMD Vulkan ICD) supports RDNA1/2/3/4 dGPUs and Strix iGPUs with a single driver. No per-GPU driver selection needed.
+- **Lightweight:** No ROCm closure (which is multi-GB and lags kernel updates). The Vulkan ICD is already in `pkgs.mesa` (default for `hardware.graphics.enable`).
+- **Simple driver model:** The kernel `amdgpu` module ships in the base kernel. Userspace is just the Mesa Vulkan ICD + loader. No display server required.
+- **Runtime dispatch:** The control plane selects the backend at runtime from detected GPU vendor (`select_backend`), so a single production image works on both NVIDIA and AMD hardware.
+
+**What is NOT in M6.4 (backlog):**
+- **ROCm/HIP backend:** `llama-cpp` with `cudaSupport`-equivalent for AMD (`hipSupport`). Requires the multi-GB ROCm closure and kernel module alignment. Deferred until Vulkan proves out on real hardware.
+- **HRX backend (Lemonade 11.9):** AMD's new `llamacpp-hrx` backend is experimental, initially targeting gfx1100 (RDNA3) and gfx1151 (Strix Halo) only. Not in our pinned Lemonade 11.5.2 nor nixpkgs 26.05. The RX 6800 (gfx1030/RDNA2) is NOT covered by HRX's initial targets. Re-evaluate when HRX stabilizes and broadens GPU coverage.
+- **AMD NPU (XDNA):** The `amdxdna`/XRT/FastFlowLM stack is not in nixpkgs 26.05 (only in the nix-amd-ai flake). Out of scope for M6.4.
+- **Heterogeneous GPU scheduling:** Mixed AMD+NVIDIA boxes assign workloads to devices; no memory pooling. Post-M5 backlog.
+- **CPU RAM reserve re-evaluation:** The APU split reserves a fixed 16GB for the CPU. Re-evaluate once multiple Docker modules run (image generation, etc.) so container memory is reserved without adding swap.
+- **Serial console strategy:** Move the kernel console to `/dev/ttyS0` only (RS232 becomes the debug port), keep gettys on KVM for now, and later disable VGA gettys — the final product's VGA should show only a Lemonseed ASCII splash (URL, system/network status, instructions).
+- **Installer log hardening:** `/var/lib/lemonseed/installer.log` is currently written by `install.py` only; extend to capture all install-invoked shell scripts (repart, release, amdgpu-kernel-params) via a shared `LEMONSEED_INSTALL_LOG` env convention, and ship the log to the appliance's journal at first boot.
+
+#### Implementation
+
+**Nix modules:**
+- `nixos/modules/amd-gpu.nix` (new): `hardware.amd-gpu.enable` option. Sets `hardware.graphics.enable = true` (defaults to Mesa/RADV Vulkan ICD), adds `pkgs.vulkan-tools` (vulkaninfo) to systemPackages. Kernel `amdgpu` ships in base kernel (no module needed). No display server.
+- `nixos/modules/lemond.nix`: Added `"vulkan"` to `llamacppBackend` enum (now `["cuda" "vulkan" "cpu" "auto"]`). `enableVulkan = cfg.llamacppBackend == "vulkan" || cfg.llamacppBackend == "auto"`. `llamaCppVulkan = pkgs.llama-cpp.override { vulkanSupport = true; }`. Added `vulkan_bin` to defaults JSON + jq re-apply + `environment.etc` symlink. Added `char-kfd` to `DeviceAllow`. `enableCuda` changed to `== "cuda" || == "auto"` (so a `vulkan`-only box doesn't pull the CUDA closure).
+- `nixos/configuration.nix`: Both `lemonseed.nvidia.enable` and `hardware.amd-gpu.enable` default to `true` so the single production image works on NVIDIA and AMD. QEMU profile overrides both to `false` + `llamacppBackend = "cpu"`.
+- `nixos/modules/amd-gpu.nix`: `lemonseed-amdgpu-kernel-params` oneshot service (runs `after` `lemonseed-ab-lock-in` so a param-triggered reboot lands on the now-default slot). Exports `LEMONSEED_APPLY_REBOOT=1` so the script reboots when the params changed; `SuccessExitStatus = [ "0" "1" ]` (reboot returns non-zero from the service's view).
+
+**Strix Halo iGPU shared memory (AMD APUs only, PCI 1002:1586):**
+- `scripts/amdgpu-kernel-params.sh`: reads *physical* RAM from DMI via `lshw -class memory -json | jq` (NOT `/proc/meminfo` — that reports CPU-addressable memory, already reduced by the GPU split). Allocates `physical_total − 16GB` to the GPU (min 4GB; systems < 32GB keep the default split). Writes a **GRUB stub** to the ESP: `/grub/kernel-params` containing `set kernel_params='ttm.pages_limit=… ttm.page_pool_size=…'` — GRUB has no command substitution and `export` is not a GRUB command, so `boot/grub.cfg` does `source /grub/kernel-params` and appends `${kernel_params}` to every menuentry's `linux` line.
+- **Installer path:** `seed_esp()` runs the same script (lspci fallback for iGPU detection — no Vulkan ICD in the installer) *before* first boot, so a fresh install gets the correct split on boot #1 with **zero extra reboots**.
+- **Update path:** the service runs after lock-in; if the ESP value differs from the running `/proc/cmdline` it writes the stub, drops `/var/lib/lemonseed/reboot-pending.json` (so the portal shows "Rebooting to apply GPU memory settings…" and keeps polling), and reboots once. The updater also refreshes the ESP `grub.cfg` on every update (new images ship the template at `/usr/share/lemonseed/grub.cfg`; older images had `/etc/lemonseed/grub.cfg` — the updater falls back across both) so stale ESPs self-heal.
+- **Manual override:** `LEMONSEED_AMDGPU_SHARED_MEM_GB` env var or `/etc/lemonseed/amdgpu-shared-mem-override` (GB) pins the split instead of auto-calculating.
+- **Installer logging:** the install pipeline logs to syslog (journal) and appends to `/var/lib/lemonseed/installer.log`; `_run()` mirrors every subprocess's output (repart, grub-install, amdgpu-kernel-params, …) into the log with the command line prefixed. At the end of the install the log is copied to the target's user-data at `/var/lemonseed/lemonseed/installer.log` so it survives the first boot.
+
+**Control plane:**
+- `hardware.py`: New `_amd_gpus_llama_cli()` parses `llama-cli --list-devices` output (reports real GTT/VRAM size, e.g. `56210 MiB` on a Strix Halo iGPU), with `_amd_gpus_vulkaninfo()` as fallback when the Vulkan llama-cpp binary is absent. `collect_hardware()` merges AMD GPUs with NVIDIA GPUs (dedup by vendor+name).
+- `catalog.py`: New `select_backend(hardware)` — returns `"cuda"` for NVIDIA, `"vulkan"` for AMD, `"cpu"` otherwise. `plan_model` is now vendor-aware: gates on the *selected* backend's state (not hard-coded CUDA). VRAM fit is skipped when `vram == 0` (AMD Vulkan) and delegated to lemond.
+- `catalog/models.json`: Model `backend` field changed from `llamacpp:cuda` to `llamacpp` (vendor-agnostic).
+- `chat_ready.py`: `lemonade load` uses `select_backend(hardware)` instead of hard-coded `--llamacpp cuda`. `chat_snapshot()` reports `state="rebooting"` while the reboot-pending marker exists (portal keeps polling until the box is back); CP clears the stale marker at startup.
+
+#### Testing
+
+| Tier | Target | Command |
+|------|--------|---------|
+| **A — unit** | `select_backend` (nvidia→cuda, amd→vulkan, no-gpu→cpu), `plan_model` AMD/NVIDIA/no-GPU cases, `vulkaninfo` parsing, `collect_hardware` merge | `make test` (no root, no GPU) |
+| **C — QEMU HTTP** | CPU-profile appliance boot (no GPU in QEMU); verifies the image builds and boots with the Vulkan closure present but unused | `make test-qemu` (needs `make build-qemu`) |
+| **D — GPU lab** | Real AMD hardware validation: `vulkaninfo` lists the GPU, `lemond` loads a model on the Vulkan backend, chat completes | Manual on RX 6800 (gfx1030) / Ryzen AI 385 (gfx1151) |
+
+**VRAM reporting:** AMD Vulkan GPUs report real memory via `llama-cli --list-devices` (shipped as `/etc/lemonseed/lemond-backends/llamacpp-vulkan-cli` from the Vulkan llama-cpp closure). On APU iGPUs this is the GTT allocation (shared system RAM), not dedicated VRAM. The planner uses this for model-fit validation. `vulkaninfo` fallback (no memory size) is used only when the llama-cli binary is absent.
+
+#### Acceptance checklist
+- [x] `make test` green (96 control-plane tests including 11 new AMD/Vulkan tests)
+- [x] `vulkaninfo` detects AMD GPUs (dGPU + Strix iGPU) with `vendor: "amd"`
+- [x] `select_backend` returns `"vulkan"` for AMD, `"cuda"` for NVIDIA, `"cpu"` otherwise
+- [x] `plan_model` is vendor-aware (gates on selected backend, not hard-coded CUDA)
+- [x] `chat_ready` uses `select_backend` for `lemonade load`
+- [x] Single production image includes both CUDA and Vulkan closures (`llamacppBackend = "auto"`)
+- [ ] QEMU smoke test green (CPU path; no AMD GPU in QEMU)
+- [ ] Real-hardware validation: RX 6800 (gfx1030) — `vulkaninfo` + lemond load + chat
+- [ ] Real-hardware validation: Ryzen AI 385 (gfx1151 iGPU) — `vulkaninfo` + lemond load + chat
 
 ### M3 verification
 
@@ -461,7 +526,7 @@ Canonical report (e.g. `/api/hardware`), persisted under `/run/appliance/hardwar
 
 **NVIDIA path (M5):** host NVIDIA open kernel modules in the SquashFS base; `lemond` runs on the host (systemd) with CUDA/Vulkan backends wired from Nix packages — **not** via NVIDIA Container Toolkit for inference.
 
-**AMD / Ryzen AI Max (post-M5):** treat usable accelerator memory as an **UMA / system-RAM budget**, not discrete VRAM. Inventory-only until a dedicated profile exists. Reuse patterns from [nix-amd-ai](https://github.com/noamsto/nix-amd-ai) (ROCm/Vulkan/NPU wiring) when that profile lands.
+**AMD / Ryzen AI Max (M6.4):** Vulkan backend via Mesa RADV ICD. `llama-cli --list-devices` detects AMD GPUs and reports real GTT/VRAM size; `vulkaninfo` is the fallback. See **M6.4** section for details. ROCm/HRX optimization is backlog. NPU (XDNA) is out of scope for M6.4.
 
 **Heterogeneous GPUs (post-M5):** physical devices stay separate. Planner assigns **workloads to devices**; mixed AMD+NVIDIA is **not** pooled memory for one model.
 
@@ -872,7 +937,7 @@ Resolved for early milestones where noted; remaining items do not block M5 start
 | Data services | Shared PostgreSQL (+ pgvector), Valkey; CP-provisioned credentials |
 | Inference runtime | **`lemond` embedded in SquashFS** (headless); Docker is not the Lemonade path |
 | Module updates | Blue/green: start new → health-check → nginx cutover → stop old |
-| GPU | Drivers in base; NVIDIA first (M5); AMD/UMA later; no VRAM pooling |
+| GPU | Drivers in base; NVIDIA CUDA (M5) + AMD Vulkan (M6.4); single image covers both; no VRAM pooling |
 | Inference UX | Open WebUI primary (M6); catalog-selected LLM via `lemond` |
 | Models | Stored under `/var/lib/lemonseed/`; versioned catalog fit |
 | Lemonade packaging | From-source Nix; wire Nix backends; patterns from nix-amd-ai |
@@ -888,6 +953,7 @@ Resolved for early milestones where noted; remaining items do not block M5 start
 | Edge auth (M6.2) | **CP-native login** (signed session tokens, branded login page). Replaces Authelia (https workarounds were fragile). Stateless HMAC-SHA256 tokens in cookie; no session store to GC. nginx `auth_request` at `/_lemonseed/session-verify` → CP. Login at `/login`, logout at `/logout`. TOTP (M6.3) via `pyotp`, required for `admin` group. |
 | CP authority | **CP + Postgres is the source of truth** (accounts = standard **users + groups**, many:many, Linux-style; elevation = `admin` group, no singular owner); config files / env / secrets are derived and regenerated (see §3) |
 | Admin bootstrap | **Single `/setup` path** (synchronous; name + timezone + admin creds) — first admin only while the `admin` group is empty; no installer interstitial, no Authelia/`mkpasswd` in the installer; lockout = preserve-reinstall + “Reset admin credentials” marker (physical access) clears the `admin` group so `/setup` reopens |
+| AMD GPU (M6.4) | **Vulkan backend** via Mesa RADV ICD (single driver for dGPU + Strix iGPU). `vulkaninfo` detection + `select_backend` runtime dispatch. Single production image covers NVIDIA (CUDA) + AMD (Vulkan). ROCm/HRX deferred to backlog (experimental, gfx1100/gfx1151 only). NPU (XDNA) out of scope. |
 
 ---
 

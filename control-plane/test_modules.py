@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 import tempfile
 import unittest
@@ -22,12 +23,18 @@ class ModulesTests(unittest.TestCase):
         modules._state = None
         modules._health_fail_count = 0
         modules._worker = None
+        modules._pull_fail_at = 0.0
+        modules._net_check_at = 0.0
+        modules._net_ok = False
         if modules._lock.locked():
             modules._lock.release()
 
     def tearDown(self) -> None:
         modules._worker = None
         modules._health_fail_count = 0
+        modules._pull_fail_at = 0.0
+        modules._net_check_at = 0.0
+        modules._net_ok = False
         if modules._lock.locked():
             modules._lock.release()
 
@@ -47,6 +54,60 @@ class ModulesTests(unittest.TestCase):
         self.assertNotIn(":main", image)
         # Default runtime pin matches the documented default unless overridden.
         self.assertEqual(modules.OWUI_IMAGE, modules.OWUI_IMAGE_DEFAULT)
+
+    def test_network_reachable_caches_outcome(self) -> None:
+        with (
+            mock.patch.object(modules.socket, "gethostbyname", return_value="203.0.113.9"),
+            mock.patch.object(modules.socket, "create_connection") as m_conn,
+        ):
+            self.assertTrue(modules._network_reachable())
+            self.assertTrue(modules._network_reachable())  # cached, no 2nd probe
+            m_conn.assert_called_once()
+
+    def test_network_reachable_unreachable_on_dns_failure(self) -> None:
+        with mock.patch.object(
+            modules.socket, "gethostbyname", side_effect=socket.gaierror("no such host")
+        ):
+            self.assertFalse(modules._network_reachable())
+
+    def test_pull_skips_docker_when_registry_unreachable(self) -> None:
+        probe = mock.Mock(returncode=1, stdout="", stderr="Error: no such host")
+        with (
+            mock.patch.object(modules, "_image_present", return_value=False),
+            mock.patch.object(modules, "_network_reachable", return_value=False),
+            mock.patch.object(modules, "_docker", return_value=probe) as m_docker,
+        ):
+            ok, detail = modules._pull_image()
+        self.assertFalse(ok)
+        self.assertIn("container registry", detail)
+        self.assertIn("internet connection", detail)
+        # Exactly one diagnostic probe (journal), not a pull attempt per tick.
+        m_docker.assert_called_once()
+
+    def test_pull_probes_docker_once_per_cooldown(self) -> None:
+        with (
+            mock.patch.object(modules, "_image_present", return_value=False),
+            mock.patch.object(modules, "_network_reachable", return_value=False),
+            mock.patch.object(modules, "_docker") as m_docker,
+        ):
+            modules._pull_image()
+            modules._pull_image()  # within cooldown: no 2nd probe
+            m_docker.assert_called_once()
+            modules._pull_fail_at = 0.0  # force cooldown expiry
+            modules._pull_image()
+            self.assertEqual(m_docker.call_count, 2)
+
+    def test_pull_pulls_when_network_reachable(self) -> None:
+        result = mock.Mock(returncode=0, stdout="", stderr="")
+        with (
+            mock.patch.object(modules, "_image_present", return_value=False),
+            mock.patch.object(modules, "_network_reachable", return_value=True),
+            mock.patch.object(modules, "_docker", return_value=result) as m_docker,
+        ):
+            ok, detail = modules._pull_image()
+        self.assertTrue(ok)
+        self.assertEqual(detail, "pulled")
+        m_docker.assert_called_once()
 
     def test_http_ready_requires_version_json(self) -> None:
         class _Resp:

@@ -8,6 +8,7 @@
     ./modules/artifacts.nix
     ./modules/storage.nix
     ./modules/nvidia.nix
+    ./modules/amd-gpu.nix
     ./modules/fhs-compat.nix
     ./modules/lemond.nix
     ./modules/data-services.nix
@@ -79,6 +80,14 @@
   virtualisation.docker.enableOnBoot = true;
 
   lemonseed.dataServices.enable = true;
+
+  # GPU driver stacks: both enabled by default so the single production image
+  # works on NVIDIA (CUDA) and AMD (Vulkan) hardware. The control plane
+  # selects the active backend at runtime from detected GPU vendor.
+  # Override in a profile (e.g. QEMU) to disable and shrink the image.
+  lemonseed.nvidia.enable = true;
+  hardware.amd-gpu.enable = true;
+
   networking.useDHCP = true;
   networking.firewall.enable = true;
 

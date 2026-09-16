@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -127,6 +128,122 @@ def _nvidia_gpus_smi() -> list[dict[str, Any]]:
     return gpus
 
 
+def _amd_gpus_llama_cli() -> list[dict[str, Any]]:
+    """Enumerate Vulkan GPU devices via `llama-cli --list-devices`.
+
+    Unlike vulkaninfo, this reports the real device memory size (GTT on AMD
+    APUs, VRAM on dGPUs). Uses the Vulkan llama-cpp binary shipped with the
+    lemond backends. Returns [] when the binary is absent or finds no device.
+    """
+    cli = Path("/etc/lemonseed/lemond-backends/llamacpp-vulkan-cli")
+    if not cli.exists():
+        return []
+    try:
+        out = subprocess.check_output(
+            [str(cli), "--list-devices"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return []
+    gpus: list[dict[str, Any]] = []
+    for line in out.splitlines():
+        # Format: "Vulkan0: AMD Radeon 8060S Graphics (RADV STRIX_HALO) (56210 MiB, 50007 MiB free)"
+        s = line.strip()
+        if not s.startswith("Vulkan"):
+            continue
+        # Extract name (between first ": " and last " (") and total MiB (first parenthesized number).
+        if ": " not in s or " (" not in s:
+            continue
+        rest = s.partition(": ")[2]
+        name = rest.rsplit(" (", 1)[0]
+        # Find the first parenthesized group containing "MiB".
+        m = re.search(r"\((\d+)\s+MiB", rest)
+        if not m:
+            continue
+        total_mib = float(m.group(1))
+        gpus.append(
+            {
+                "index": len(gpus),
+                "name": name,
+                "vram_gb": round(total_mib / 1024.0, 2),
+                "driver_version": "",
+                "vendor": "amd",
+                "available": True,
+                "device_type": "",
+            }
+        )
+    return gpus
+
+
+def _amd_gpus_vulkaninfo() -> list[dict[str, Any]]:
+    """Enumerate AMD (and other) Vulkan GPU devices via `vulkaninfo`.
+
+    Used when lemond's system-info has no AMD field (Lemonade 11.5 reports
+    NVIDIA-only). Returns [] when the tool is absent or finds no GPU device.
+    VRAM is not exposed by vulkaninfo, so it is reported as 0; the planner
+    treats that as "present but size unknown" (see plan_model).
+
+    Filters out CPU-type devices (e.g. llvmpipe software renderer) — only
+    INTEGRATED_GPU and DISCRETE_GPU are real GPUs.
+    """
+    try:
+        out = subprocess.check_output(
+            ["vulkaninfo", "--summary"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return []
+    gpus: list[dict[str, Any]] = []
+    current: Optional[dict[str, Any]] = None
+    for line in out.splitlines():
+        s = line.strip()
+        # vulkaninfo --summary uses "GPU0:", "GPU1:", … as device headers.
+        # Each header starts a new device; properties follow as "key = value".
+        if s.startswith("GPU") and s.endswith(":"):
+            if current is not None:
+                _maybe_append_gpu(gpus, current)
+            current = {
+                "index": len(gpus),
+                "name": "",
+                "vram_gb": 0,
+                "driver_version": "",
+                "vendor": "amd",
+                "available": True,
+                "device_type": "",
+            }
+            continue
+        if current is None or "=" not in s:
+            continue
+        key, _, value = s.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key == "deviceName":
+            current["name"] = value
+        elif key == "deviceType":
+            current["device_type"] = value
+    # Finalize the last device.
+    if current is not None:
+        _maybe_append_gpu(gpus, current)
+    # Re-index after filtering (indices may have gaps).
+    for i, gpu in enumerate(gpus):
+        gpu["index"] = i
+    return gpus
+
+
+def _maybe_append_gpu(gpus: list[dict[str, Any]], gpu: dict[str, Any]) -> None:
+    """Append a vulkaninfo device only if it is a real GPU (not CPU/llvmpipe)."""
+    dtype = gpu.get("device_type", "")
+    # PHYSICAL_DEVICE_TYPE_CPU is the software renderer (llvmpipe) — not a GPU.
+    # PHYSICAL_DEVICE_TYPE_VIRTUAL can be a real GPU in some configurations.
+    if dtype == "PHYSICAL_DEVICE_TYPE_CPU":
+        return
+    gpus.append(gpu)
+
+
 def _gpus_from_system_info(info: dict[str, Any]) -> list[dict[str, Any]]:
     devices = info.get("devices") or {}
     nvidia = devices.get("nvidia_gpu") or []
@@ -134,6 +251,10 @@ def _gpus_from_system_info(info: dict[str, Any]) -> list[dict[str, Any]]:
     if isinstance(nvidia, list):
         for gpu in nvidia:
             if not isinstance(gpu, dict):
+                continue
+            # Skip unavailable GPUs (e.g. lemond reports a placeholder entry
+            # with available=false when no NVIDIA GPU is present).
+            if not gpu.get("available", True):
                 continue
             out.append(
                 {
@@ -144,7 +265,7 @@ def _gpus_from_system_info(info: dict[str, Any]) -> list[dict[str, Any]]:
                     "family": str(gpu.get("family") or ""),
                     "compute_capability": str(gpu.get("compute_capability") or ""),
                     "vendor": "nvidia",
-                    "available": bool(gpu.get("available", True)),
+                    "available": True,
                 }
             )
     return out
@@ -170,6 +291,14 @@ def collect_hardware() -> dict[str, Any]:
     info = system_info if healthy else {}
 
     gpus = _gpus_from_system_info(info) or _nvidia_gpus_smi()
+    # lemond 11.5's system-info reports NVIDIA only; add AMD Vulkan devices so
+    # an AMD box is not mistaken for "no GPU". Prefer llama-cli (reports real
+    # GTT/VRAM) over vulkaninfo (no memory size). De-dupe by (vendor, name).
+    seen = {(g.get("vendor"), g.get("name")) for g in gpus}
+    for gpu in _amd_gpus_llama_cli() or _amd_gpus_vulkaninfo():
+        if (gpu.get("vendor"), gpu.get("name")) not in seen:
+            gpus.append(gpu)
+            seen.add((gpu.get("vendor"), gpu.get("name")))
     cpu = _cpu_info()
     # Prefer lemond CPU fields when present.
     dev_cpu = (info.get("devices") or {}).get("cpu") or {}

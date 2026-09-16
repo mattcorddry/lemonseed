@@ -33,6 +33,8 @@ from lemonseed_artifacts import (
 DOWNLOAD_DIR = Path(os.environ.get("LEMONSEED_DOWNLOAD_DIR", "/var/lib/lemonseed/download"))
 ESP_MOUNT = Path("/run/lemonseed-esp")
 AB_HELPER = os.environ.get("LEMONSEED_AB", "lemonseed-ab")
+GRUB_CFG = Path(os.environ.get("LEMONSEED_GRUB_CFG", "/etc/lemonseed/grub.cfg"))
+GRUB_CFG_FALLBACK = Path("/usr/share/lemonseed/grub.cfg")
 
 
 class UpdateError(Exception):
@@ -209,6 +211,16 @@ def write_inactive_slot(
         atomic_copy(files["vmlinuz"], efi_dir / f"vmlinuz-{target_slot}")
         atomic_copy(files["initrd.img"], efi_dir / f"initrd-{target_slot}.img")
         log(f"updated ESP kernels for slot {target_slot}")
+        # Refresh grub.cfg so new kernel-param logic (e.g. extra_params for
+        # APU GPU memory) is picked up on the next boot. Newer images ship
+        # the template at /usr/share/lemonseed/grub.cfg; older images
+        # (pre-M6.4) only had /etc/lemonseed/grub.cfg.
+        grub_src = GRUB_CFG if GRUB_CFG.is_file() else GRUB_CFG_FALLBACK
+        if grub_src.is_file():
+            grub_dir = esp / "grub"
+            grub_dir.mkdir(parents=True, exist_ok=True)
+            atomic_copy(grub_src, grub_dir / "grub.cfg")
+            log(f"updated ESP grub.cfg (from {grub_src})")
         run([AB_HELPER, "set-once", target_slot, "--esp", str(esp)])
     finally:
         umount_esp()

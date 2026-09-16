@@ -317,10 +317,32 @@ in
       # not yet running, 502/503/504 from the dead upstream are rewritten to
       # the CP shell (which shows a "Getting Ready" interstitial and
       # auto-loads OWUI once it is healthy).
+      #
+      # The CP shell itself is also the "rebooting" interstitial: when the
+      # amdgpu-kernel-params service reboots the box, the browser's in-flight
+      # requests die mid-flight. The shell's 5s poll keeps retrying, but the
+      # browser only re-displays the page if it actually received a response
+      # after the box came back. To guarantee the user sees the "Rebooting…"
+      # page (rather than ERR_CONNECTION_REFUSED), we also serve the CP shell
+      # on 502/503/504 from the CP upstream — the shell's JS then shows the
+      # rebooting state (chat.state == "rebooting") and keeps polling until
+      # the box is back and the model is ready.
       extraConfig = ''
         ${authVarDecls}
         location @auth_unauthorized {
           return 302 /login?rd=$request_uri;
+        }
+        location @cp_interstitial {
+          # Named location: proxy_pass may not carry a URI part. Forward the
+          # original request URI — the CP routes /, /login, /settings/, and
+          # /api/* natively, so the interstitial shows the right page.
+          proxy_pass http://127.0.0.1:8080;
+          proxy_http_version 1.1;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          ${identityHeaders}
         }
         location @owui_loading {
           proxy_pass http://127.0.0.1:8080;
@@ -351,11 +373,11 @@ in
       # form); logout is gated (only a signed-in user can log out).
       locations."= /login" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = cpProxy;
+        extraConfig = "${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
       };
       locations."= /logout" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${authGate}\n${cpProxy}";
+        extraConfig = "${authGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
       };
       # Internal auth_request target (never LAN-facing). The CP verifies the
       # signed session cookie and returns 200 + X-Forwarded-* headers (read via
@@ -379,7 +401,7 @@ in
       # First-boot setup + health probes stay open (pre-admin trust window).
       locations."= /setup" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = cpProxy;
+        extraConfig = "${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
       };
       locations."= /healthz" = {
         proxyPass = "http://127.0.0.1:8080";
@@ -392,7 +414,7 @@ in
       locations."/settings/" = {
         proxyPass = "http://127.0.0.1:8080";
         # Gated + admin group required (M6.2).
-        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
       };
       locations."= /settings" = {
         return = "302 /settings/";
@@ -407,27 +429,27 @@ in
       };
       locations."= /api/status" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = cpProxy;
+        extraConfig = "${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
       };
       locations."= /api/hardware" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${authGate}\n${cpProxy}";
+        extraConfig = "${authGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
       };
       locations."= /api/plan" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${authGate}\n${cpProxy}";
+        extraConfig = "${authGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
       };
       locations."= /api/data" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${authGate}\n${cpProxy}";
+        extraConfig = "${authGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
       };
       locations."= /api/modules" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${authGate}\n${cpProxy}";
+        extraConfig = "${authGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
       };
       locations."= /api/chat" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${authGate}\n${cpProxy}";
+        extraConfig = "${authGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
       };
 
       # Brand icons (shell / setup / favicon) — must not fall through to OWUI.
@@ -487,15 +509,18 @@ in
   };
 
   systemd.services.nginx = {
+    # Do NOT depend on appliance-control-plane: nginx must open :80 as soon as
+    # the network is up, even while the CP (and lemond/docker) are still
+    # starting. A dead CP upstream is handled by error_page 502 → the CP shell
+    # interstitial, so the browser always gets a response instead of
+    # ERR_CONNECTION_REFUSED during the boot window.
     after = [
       "network-online.target"
-      "appliance-control-plane.service"
       "lemonseed-owui-upstream-seed.service"
       "lemonseed-auth-gate-seed.service"
     ];
     wants = [
       "network-online.target"
-      "appliance-control-plane.service"
       "lemonseed-owui-upstream-seed.service"
       "lemonseed-auth-gate-seed.service"
     ];

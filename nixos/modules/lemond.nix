@@ -27,10 +27,20 @@ let
 
   cpuBackendPath = "/etc/lemonseed/lemond-backends/llamacpp-cpu";
   cudaBackendPath = "/etc/lemonseed/lemond-backends/llamacpp-cuda";
+  vulkanBackendPath = "/etc/lemonseed/lemond-backends/llamacpp-vulkan";
+  # The Vulkan closure also provides llama-cli, which the control plane uses
+  # for accurate GPU memory reporting (llama-cli --list-devices reports the
+  # real GTT/VRAM size; vulkaninfo does not).
+  vulkanLlamaCliPath = "/etc/lemonseed/lemond-backends/llamacpp-vulkan-cli";
 
-  # Skip the CUDA llama-cpp closure on CPU-only profiles (QEMU smoke).
-  enableCuda = cfg.llamacppBackend != "cpu";
+  # Which llama-cpp closures to ship in the image. "auto" (the production
+  # default) ships both CUDA and Vulkan so the control plane can select the
+  # backend at runtime based on detected GPU vendor. Single-backend variants
+  # keep the image lean for constrained profiles (QEMU = cpu only).
+  enableCuda = cfg.llamacppBackend == "cuda" || cfg.llamacppBackend == "auto";
+  enableVulkan = cfg.llamacppBackend == "vulkan" || cfg.llamacppBackend == "auto";
   llamaCppCuda = pkgs.llama-cpp.override { cudaSupport = true; };
+  llamaCppVulkan = pkgs.llama-cpp.override { vulkanSupport = true; };
 
   sourceApiKey = ''
     if [ "''${EUID:-$(id -u)}" -eq 0 ] && [ -r ${envFile} ]; then
@@ -41,6 +51,11 @@ let
     fi
   '';
 
+  # lemond's config.json backend field: "auto" lets lemond accept any
+  # --llamacpp flag the control plane passes at load time. Single-backend
+  # profiles (QEMU cpu) pin the backend so a misconfigured load fails fast.
+  lemondBackend = if cfg.llamacppBackend == "auto" then "auto" else cfg.llamacppBackend;
+
   defaults = (pkgs.formats.json { }).generate "lemonseed-lemond-defaults.json" {
     host = "127.0.0.1";
     port = 13305;
@@ -49,11 +64,12 @@ let
     models_dir = modelsDir;
     max_loaded_models = 1;
     llamacpp = {
-      backend = cfg.llamacppBackend;
+      backend = lemondBackend;
       prefer_system = false;
       cpu_bin = cpuBackendPath;
     }
-    // lib.optionalAttrs enableCuda { cuda_bin = cudaBackendPath; };
+    // lib.optionalAttrs enableCuda { cuda_bin = cudaBackendPath; }
+    // lib.optionalAttrs enableVulkan { vulkan_bin = vulkanBackendPath; };
   };
 
   # systemd loads EnvironmentFile= *before* ExecStartPre, so a missing file
@@ -101,11 +117,13 @@ let
         mv ${configJson}.tmp ${configJson}
       fi
       jq \
-        --arg backend ${lib.escapeShellArg cfg.llamacppBackend} \
+        --arg backend ${lib.escapeShellArg lemondBackend} \
         --arg cpu ${lib.escapeShellArg cpuBackendPath} \
         --arg cuda ${lib.escapeShellArg cudaBackendPath} \
+        --arg vulkan ${lib.escapeShellArg vulkanBackendPath} \
         --arg models ${lib.escapeShellArg modelsDir} \
         --argjson enableCuda ${if enableCuda then "true" else "false"} \
+        --argjson enableVulkan ${if enableVulkan then "true" else "false"} \
         '
           .host = "127.0.0.1"
           | .port = 13305
@@ -115,8 +133,8 @@ let
           | .llamacpp.backend = $backend
           | .llamacpp.prefer_system = false
           | .llamacpp.cpu_bin = $cpu
-          | if $enableCuda then .llamacpp.cuda_bin = $cuda else .
-          end
+          | if $enableCuda then .llamacpp.cuda_bin = $cuda else . end
+          | if $enableVulkan then .llamacpp.vulkan_bin = $vulkan else . end
         ' ${configJson} > ${configJson}.tmp
       chown lemonseed-lemond:lemonseed-lemond ${configJson}.tmp
       chmod 0640 ${configJson}.tmp
@@ -161,13 +179,19 @@ in
     llamacppBackend = lib.mkOption {
       type = lib.types.enum [
         "cuda"
+        "vulkan"
         "cpu"
         "auto"
       ];
-      default = "cuda";
+      default = "auto";
       description = ''
-        Default llama.cpp backend for lemond. Production appliances use CUDA;
-        the QEMU smoke profile forces "cpu".
+        Which llama.cpp backend(s) to ship in the image and use for lemond.
+
+        - "auto" (production default): ships both CUDA and Vulkan; the control
+          plane selects the backend at runtime from detected GPU vendor.
+        - "cuda": ships only the CUDA build (NVIDIA-only, smaller image).
+        - "vulkan": ships only the Vulkan build (AMD-only, smaller image).
+        - "cpu": ships only the CPU build (QEMU smoke profile).
       '';
     };
   };
@@ -217,6 +241,12 @@ in
       // lib.optionalAttrs enableCuda {
         "lemonseed/lemond-backends/llamacpp-cuda".source =
           "${llamaCppCuda}/bin/llama-server";
+      }
+      // lib.optionalAttrs enableVulkan {
+        "lemonseed/lemond-backends/llamacpp-vulkan".source =
+          "${llamaCppVulkan}/bin/llama-server";
+        "lemonseed/lemond-backends/llamacpp-vulkan-cli".source =
+          "${llamaCppVulkan}/bin/llama-cli";
       };
 
     systemd.services.lemond = {
@@ -227,11 +257,11 @@ in
         "systemd-tmpfiles-setup.service"
         "network-online.target"
       ]
-      ++ lib.optionals config.hardware.nvidia.nvidiaPersistenced [
+      ++ lib.optionals (config.lemonseed.nvidia.enable && config.hardware.nvidia.nvidiaPersistenced) [
         "nvidia-persistenced.service"
       ];
       wants = [ "network-online.target" ]
-        ++ lib.optionals config.hardware.nvidia.nvidiaPersistenced [
+        ++ lib.optionals (config.lemonseed.nvidia.enable && config.hardware.nvidia.nvidiaPersistenced) [
           "nvidia-persistenced.service"
         ];
       # Keep probes on PATH; lemond may still reset PATH to /usr/bin:/bin.
@@ -269,7 +299,9 @@ in
         PrivateTmp = false;
         ProtectSystem = "strict";
         ProtectHome = true;
-        # CUDA needs writable executable mappings; keep GPU device nodes visible.
+        # CUDA/Vulkan need writable executable mappings; keep GPU device nodes
+        # visible (NVIDIA /dev/nvidia* and AMD /dev/dri/* + /dev/kfd for later
+        # ROCm/HRX backends).
         MemoryDenyWriteExecute = false;
         PrivateDevices = false;
         DevicePolicy = "closed";
@@ -279,6 +311,7 @@ in
           "char-nvidia-frontend"
           "char-nvidia-uvm"
           "char-drm"
+          "char-kfd"
         ];
         ReadWritePaths = [
           "/var/lib/lemonseed"

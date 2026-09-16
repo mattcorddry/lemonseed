@@ -853,6 +853,14 @@ function landingCopy(chat, owui) {{
   const modelReady = chatState === 'ready';
   const uiReady = ui === 'ready' && httpReady;
 
+  if (chatState === 'rebooting') {{
+    return {{
+      title: 'Rebooting',
+      workflow: 'Applying GPU memory settings',
+      task: 'The appliance is rebooting — this page will reconnect automatically…',
+      cls: 'wait',
+    }};
+  }}
   if (chatState === 'error' || ui === 'error') {{
     const err = chat.error || owui.error || chat.reason || owui.reason || 'Something went wrong. Open Settings for diagnostics.';
     return {{
@@ -1259,7 +1267,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("X-Lemonseed-Role", "control-plane")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # Client went away mid-response (reboot, tab close, nginx abort).
+            # socketserver would otherwise dump a full traceback per occurrence.
+            self.log_message("client disconnected during response (%s)", self.path)
 
     def _json(self, code: int, obj: Any) -> None:
         self._send(code, (json.dumps(obj) + "\n").encode(), "application/json")
@@ -1597,6 +1610,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    # A reboot-pending marker from the previous boot is stale by definition
+    # (we are up); clear it so the portal doesn't show "Rebooting…" forever.
+    chat_ready.clear_reboot_pending()
     chat_ready.ensure_chat_worker()
     data_services.ensure_provision_worker()
     modules.ensure_module_worker()

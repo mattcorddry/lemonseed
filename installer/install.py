@@ -19,6 +19,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import syslog
+
 from disks import list_candidate_disks
 from preflight import require_host_ready
 
@@ -27,12 +29,37 @@ ProgressFn = Callable[..., None]
 IMAGE_BASE_DEFAULT = "https://lemonseed.ai/releases/stable/"
 USER_AGENT = "lemonseed-installer/0.1"
 DOWNLOAD_DIR = Path(os.environ.get("LEMONSEED_DOWNLOAD_DIR", "/var/lib/lemonseed/download"))
+INSTALL_LOG = Path("/var/lib/lemonseed/installer.log")
+
+
+def _log(level: int, msg: str) -> None:
+    """Log to syslog (journal) AND append to a persistent file.
+
+    The installer's journal otherwise only shows HTTP access logs — the
+    install thread runs in-process and its output went nowhere persistent.
+    The file survives on the live rootfs and is copied to the target's
+    user-data at the end of the install (see run_install), so the install
+    can be inspected post-reboot.
+    """
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    line = f"{stamp} {msg}"
+    try:
+        syslog.syslog(level, line)
+    except OSError:
+        pass
+    try:
+        INSTALL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with INSTALL_LOG.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 ESP_MOUNT = Path("/run/lemonseed-install-esp")
 LEMONSEED_ROOT = Path(os.environ.get("LEMONSEED_ROOT", "/etc/lemonseed"))
 REPART_SCRIPT = LEMONSEED_ROOT / "disk-repart.sh"
 RELEASE_SCRIPT = LEMONSEED_ROOT / "disk-release.sh"
 GRUB_CFG = LEMONSEED_ROOT / "grub.cfg"
 AB_HELPER = LEMONSEED_ROOT / "lemonseed-ab.sh"
+AMDGPU_KERNEL_PARAMS = LEMONSEED_ROOT / "amdgpu-kernel-params.sh"
 
 
 class InstallError(Exception):
@@ -45,7 +72,13 @@ def _progress(cb: ProgressFn | None, **kwargs: Any) -> None:
 
 
 def _run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    """Run a command, capturing output and mirroring it to the install log.
+
+    Subprocess output (repart, grub-install, amdgpu-kernel-params, …) is
+    what we need to diagnose install failures; without this it was only
+    visible in the web progress message (last line) or lost entirely.
+    """
+    result = subprocess.run(
         cmd,
         check=True,
         text=True,
@@ -53,6 +86,9 @@ def _run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         stderr=kwargs.pop("stderr", subprocess.STDOUT),
         **kwargs,
     )
+    for line in (result.stdout or "").splitlines():
+        _log(syslog.LOG_INFO, f"$ {' '.join(cmd)}: {line}")
+    return result
 
 
 def _cmdline_val(key: str) -> str | None:
@@ -433,6 +469,30 @@ def seed_esp(
         if AB_HELPER.is_file():
             _run(["bash", str(AB_HELPER), "init", "--esp", str(ESP_MOUNT)])
 
+        # APU iGPU shared memory: write the ttm GRUB stub to the target
+        # ESP so the first appliance boot already has the correct GPU/CPU
+        # split (no post-install reboot). The script detects the ESP is
+        # already mounted (mountpoint check) and skips its own mount. Uses
+        # lspci for iGPU detection (no Vulkan ICD in the installer). Failure
+        # is non-fatal — the appliance's lemonseed-amdgpu-kernel-params
+        # service will retry on first boot.
+        if AMDGPU_KERNEL_PARAMS.is_file():
+            try:
+                result = _run(["bash", str(AMDGPU_KERNEL_PARAMS)])
+                last = (result.stdout.strip().splitlines() or ["ok"])[-1]
+                _progress(progress, phase="esp", message=last, progress=87)
+            except subprocess.CalledProcessError as exc:
+                detail = ""
+                if exc.stdout and exc.stdout.strip():
+                    detail = exc.stdout.strip().splitlines()[-1]
+                _progress(
+                    progress,
+                    phase="esp",
+                    message=f"GPU memory setup deferred to first boot: {detail}" if detail
+                    else "GPU memory setup deferred to first boot",
+                    progress=87,
+                )
+
         if reset_admin_credentials:
             # Physical-access-only lockout recovery: the first-boot
             # lemonseed-auth-reset-seed unit relocates this to user-data, and
@@ -541,6 +601,31 @@ def run_install(
     subprocess.run(["sync"], check=False)
     time.sleep(1)
     subprocess.run(["sync"], check=False)
+    # Preserve the install log on the target's user-data (mounted by
+    # partition_disk for preserve, or freshly mounted here) so it can be
+    # inspected after the first appliance boot.
+    try:
+        if INSTALL_LOG.is_file():
+            ud_part = parts_on_disk(disk_path).get("user-data")
+            if ud_part and Path(ud_part).exists():
+                user_data = Path("/run/lemonseed-install-user-data")
+                user_data.mkdir(parents=True, exist_ok=True)
+                mounted_ud = os.path.ismount(str(user_data))
+                if not mounted_ud:
+                    subprocess.run(
+                        ["mount", ud_part, str(user_data)], check=True, capture_output=True
+                    )
+                    mounted_ud = True
+                try:
+                    dst = user_data / "lemonseed" / "installer.log"
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(INSTALL_LOG, dst)
+                    _log(syslog.LOG_INFO, f"install log copied to {dst}")
+                finally:
+                    if mounted_ud:
+                        subprocess.run(["umount", str(user_data)], check=False)
+    except Exception as exc:  # noqa: BLE001 — best-effort, never fail the install
+        _log(syslog.LOG_WARNING, f"could not copy install log to user-data: {exc}")
     _progress(
         progress,
         phase="await_usb",

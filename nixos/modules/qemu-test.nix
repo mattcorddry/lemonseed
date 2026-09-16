@@ -26,10 +26,11 @@ in
   # Second virtio disk is the LVM PV candidate (whole-disk for QEMU).
   boot.kernelParams = [ "appliance.storage=/dev/vdb" ];
 
-  # No GPU in the smoke VM — keep the image small and skip NVIDIA modules.
-  services.xserver.videoDrivers = lib.mkForce [ ];
+  # No GPU in the smoke VM — keep the image small and skip GPU driver stacks.
+  lemonseed.nvidia.enable = lib.mkForce false;
+  hardware.amd-gpu.enable = lib.mkForce false;
 
-  # CUDA llama-server is useless without a GPU; keep lemond on CPU for QEMU.
+  # CPU-only llama-server for QEMU (no CUDA/Vulkan closures in the image).
   lemonseed.lemond.llamacppBackend = "cpu";
 
   # Allow serial login for interactive debugging in QEMU.

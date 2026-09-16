@@ -39,7 +39,7 @@ import stub  # noqa: E402
 def _cuda_hw(vram: float = 6.0, ram: float = 7.65) -> dict:
     return {
         "ram_gb": ram,
-        "gpus": [{"index": 0, "name": "GTX 1660 SUPER", "vram_gb": vram}],
+        "gpus": [{"index": 0, "name": "GTX 1660 SUPER", "vendor": "nvidia", "vram_gb": vram}],
         "lemond": {
             "healthy": True,
             "system_info": {
@@ -66,7 +66,7 @@ class CatalogTests(unittest.TestCase):
     def test_not_ready_without_gpu(self) -> None:
         plan = catalog.plan_model({"ram_gb": 16, "gpus": [], "lemond": {}})
         self.assertEqual(plan["state"], "not-ready")
-        self.assertIn("No NVIDIA GPU", plan["reason"])
+        self.assertIn("No GPU", plan["reason"])
 
     def test_not_ready_when_ram_below_floor(self) -> None:
         plan = catalog.plan_model(_cuda_hw(ram=4.0))
@@ -298,6 +298,28 @@ class ChatReadyTests(unittest.TestCase):
             self.assertEqual(result["state"], "preparing")
         finally:
             chat_ready._prepare_lock.release()
+
+    def test_chat_snapshot_shows_rebooting_when_marker_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pending = Path(tmp) / "reboot-pending.json"
+            chat_ready.write_chat_ready({"state": "ready", "progress": 100, "model_id": "m"})
+            with mock.patch.object(chat_ready, "REBOOT_PENDING_FILE", pending):
+                pending.write_text("{}\n", encoding="utf-8")
+                snap = chat_ready.chat_snapshot()
+                self.assertEqual(snap["state"], "rebooting")
+                self.assertEqual(snap["workflow"], "Rebooting")
+                self.assertIn("rebooting", snap["task"].lower())
+                chat_ready.clear_reboot_pending()
+                self.assertFalse(pending.exists())
+
+    def test_chat_snapshot_ignores_missing_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pending = Path(tmp) / "reboot-pending.json"
+            chat_ready.write_chat_ready({"state": "ready", "progress": 100, "model_id": "m"})
+            with mock.patch.object(chat_ready, "REBOOT_PENDING_FILE", pending):
+                chat_ready.clear_reboot_pending()
+                snap = chat_ready.chat_snapshot()
+                self.assertNotEqual(snap["state"], "rebooting")
 
     @mock.patch.object(chat_ready, "prepare_local_chat")
     def test_ensure_chat_worker_returns_immediately(self, prepare: mock.Mock) -> None:

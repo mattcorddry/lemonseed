@@ -37,4 +37,14 @@
       '';
     };
   };
+
+  # Keep avahi-daemon running as a normal service. The default NixOS
+  # configuration is socket-activated: the service has `requires = [ "avahi-daemon.socket" ]`
+  # and `Type = "dbus"`, so the daemon exits when the socket goes idle. The
+  # installer has no D-Bus client (unlike the appliance's lemonseed-avahi-alias),
+  # so the daemon would be HUP'd and mDNS discovery would stop working.
+  # Drop the `requires` so the service starts standalone from multi-user.target.
+  # (Do NOT disable the socket unit: NixOS `enable = false` masks it, and a
+  # masked required unit makes the service fail to start.)
+  systemd.services.avahi-daemon.requires = [ ];
 }

@@ -13,11 +13,14 @@ from typing import Any, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from catalog import plan_model
+from catalog import plan_model, select_backend
 from hardware import collect_hardware, largest_gpu_index, lemonade_api_key, persist_hardware
 
 CHAT_READY_FILE = Path("/var/lib/lemonseed/chat-ready.json")
 SETUP_COMPLETE_FILE = Path("/etc/appliance-setup-complete")
+# Written by the amdgpu-kernel-params service just before it reboots to
+# apply the GPU memory split; deleted by CP at startup (stale after boot).
+REBOOT_PENDING_FILE = Path("/var/lib/lemonseed/reboot-pending.json")
 
 # Spawn lock is only for starting the worker thread — never hold it across pull/load.
 _spawn_lock = threading.Lock()
@@ -70,6 +73,20 @@ def write_chat_ready(payload: dict[str, Any]) -> None:
 def chat_snapshot() -> dict[str, Any]:
     """Portal/API view of chat readiness; reconcile file state with lemond load."""
     state = read_chat_ready()
+    if _reboot_pending():
+        # The box is about to reboot (GPU memory split). Show that instead of
+        # chat progress — the portal keeps polling until the box is back.
+        state = {
+            "state": "rebooting",
+            "progress": 0,
+            "message": "Rebooting to apply GPU memory settings…",
+            "workflow": "Rebooting",
+            "task": "Rebooting to apply GPU memory settings…",
+            "model_id": None,
+            "display_name": None,
+            "reason": None,
+            "error": None,
+        }
     model_id = state.get("model_id")
     if (
         state.get("state") == "ready"
@@ -104,6 +121,28 @@ def _workflow_for_state(state: str) -> str:
     if state in ("not-ready", "error"):
         return "Local chat unavailable"
     return "Downloading an initial LLM"
+
+
+def _reboot_pending() -> bool:
+    """True while the kernel-params service has queued a reboot (it writes
+    this marker right before `systemctl reboot`). The CP deletes it at
+    startup, so a stale marker never survives an actual reboot."""
+    try:
+        return REBOOT_PENDING_FILE.is_file()
+    except OSError:
+        return False
+
+
+def _clear_reboot_pending() -> None:
+    try:
+        REBOOT_PENDING_FILE.unlink()
+    except OSError:
+        pass
+
+
+def clear_reboot_pending() -> None:
+    """Drop a stale reboot marker (CP startup, tests)."""
+    _clear_reboot_pending()
 
 
 def _run_lemonade(args: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
@@ -341,8 +380,9 @@ def prepare_local_chat(*, force: bool = False) -> dict[str, Any]:
                     href=href,
                 )
             )
+            load_backend = select_backend(hardware)
             load = _run_lemonade(
-                ["load", model_id, "--llamacpp", "cuda", "--pinned"],
+                ["load", model_id, "--llamacpp", load_backend, "--pinned"],
                 timeout=600,
             )
             if load.returncode != 0:

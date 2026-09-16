@@ -6,11 +6,13 @@ import json
 import os
 import secrets
 import signal
+import socket
 import subprocess
 import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
+from urllib.error import URLError
 from urllib.request import urlopen
 
 from db import SECRETS_MODULES, _module_credentials, _write_module_secret
@@ -421,13 +423,67 @@ def _image_present() -> bool:
     return _docker(["image", "inspect", OWUI_IMAGE], timeout=30).returncode == 0
 
 
+# Registry reachability preflight. network-online.target can be reached while
+# DNS is still broken (or the WAN link is down), in which case every docker
+# pull fails with an opaque "no such host" and the supervisor hammers the
+# registry on every 10s tick. Check once, cache the failure, and re-check on
+# a slow cadence so the box self-heals when connectivity returns.
+_REGISTRY_HOST = OWUI_IMAGE.split("/")[0] if "/" in OWUI_IMAGE else "registry-1.docker.io"
+_PULL_FAIL_COOLDOWN_SEC = 60
+_pull_fail_at = 0.0
+_net_check_at = 0.0
+_net_ok = False
+
+
+def _network_reachable() -> bool:
+    """Best-effort check that we can reach the image registry (DNS + TCP 443).
+
+    Cached for _PULL_FAIL_COOLDOWN_SEC: True stays until a re-check fails,
+    False is retried after the cooldown. Any exception counts as unreachable.
+    """
+    global _net_check_at, _net_ok
+    now = time.monotonic()
+    if _net_ok and now - _net_check_at < _PULL_FAIL_COOLDOWN_SEC:
+        return True
+    if not _net_ok and now - _net_check_at < _PULL_FAIL_COOLDOWN_SEC:
+        return False
+    try:
+        host = socket.gethostbyname(_REGISTRY_HOST)
+        with socket.create_connection((host, 443), timeout=5):
+            pass
+        _net_ok = True
+    except (OSError, URLError, socket.gaierror):
+        _net_ok = False
+    _net_check_at = now
+    return _net_ok
+
+
 def _pull_image() -> tuple[bool, str]:
+    global _pull_fail_at
     if _image_present():
         return True, "present"
     # QEMU smoke preloads OWUI via virtio-fs. Prefer waiting over a doomed DNS pull.
     wait_s = int(os.environ.get("LEMONSEED_OWUI_WAIT_LOCAL_SECONDS", "0") or "0")
     if wait_s > 0:
         return False, "waiting for local image preload"
+    if not _network_reachable():
+        now = time.monotonic()
+        if now - _pull_fail_at >= _PULL_FAIL_COOLDOWN_SEC:
+            _pull_fail_at = now
+            # One diagnostic probe so the journal shows the underlying error.
+            probe = _docker(["pull", OWUI_IMAGE], timeout=30)
+            if probe.returncode != 0:
+                detail = (probe.stderr or probe.stdout or "").strip().splitlines()
+                print(
+                    f"owui pull: registry unreachable; docker probe: "
+                    f"{(detail[-1] if detail else 'no output')[:300]}",
+                    flush=True,
+                )
+        return (
+            False,
+            "Cannot reach the container registry — check this appliance's internet connection. "
+            "Retrying automatically.",
+        )
     result = _docker(["pull", OWUI_IMAGE], timeout=600)
     if result.returncode != 0:
         return False, (result.stderr or result.stdout or "docker pull failed").strip()

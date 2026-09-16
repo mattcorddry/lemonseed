@@ -4,12 +4,17 @@
 
 let
   cpSrc = ../../control-plane;
+  bootSrc = ../../boot;
   cpRoot = pkgs.runCommand "lemonseed-control-plane-src" { } ''
     mkdir -p "$out/catalog" "$out/static/brand"
     cp ${cpSrc}/stub.py ${cpSrc}/hardware.py ${cpSrc}/catalog.py ${cpSrc}/chat_ready.py \
        ${cpSrc}/db.py ${cpSrc}/data_services.py ${cpSrc}/modules.py ${cpSrc}/auth.py "$out/"
     cp ${cpSrc}/catalog/models.json "$out/catalog/"
     cp -r ${cpSrc}/static/brand/. "$out/static/brand/"
+    # GRUB template for the A/B updater to refresh on the ESP (the installed
+    # system keeps no other copy of boot/grub.cfg in SquashFS).
+    mkdir -p "$out/lemonseed"
+    cp ${bootSrc}/grub.cfg "$out/lemonseed/grub.cfg"
   '';
 
   pythonEnv = pkgs.python3.withPackages (ps: [ ps.psycopg2 ps.bcrypt ]);
@@ -29,12 +34,16 @@ let
       pkgs.pciutils
       lemonadePackage
     ]
-    ++ lib.optionals (builtins.elem "nvidia" config.services.xserver.videoDrivers) [
+    ++ lib.optionals config.lemonseed.nvidia.enable [
       config.hardware.nvidia.package.bin
-    ];
+    ]
+    # vulkaninfo for AMD GPU detection in /api/hardware (see hardware.py).
+    ++ lib.optionals config.hardware.amd-gpu.enable [ pkgs.vulkan-tools ];
     text = ''
       export PYTHONPATH=${cpRoot}
       export LEMONSEED_CATALOG=${cpRoot}/catalog/models.json
+      # Updater source for ESP grub.cfg refresh (see lemonseed_update.py).
+      export LEMONSEED_GRUB_CFG=${cpRoot}/lemonseed/grub.cfg
       exec ${pythonEnv}/bin/python3 ${cpRoot}/stub.py
     '';
   };
@@ -61,8 +70,8 @@ in
       ExecStart = "${controlPlane}/bin/appliance-control-plane";
       Restart = "on-failure";
       RestartSec = "2s";
-      StandardOutput = "journal+console";
-      StandardError = "journal+console";
+      StandardOutput = "journal";
+      StandardError = "journal";
       Environment = [
         "APPLIANCE_CP_HOST=127.0.0.1"
         "APPLIANCE_CP_PORT=8080"

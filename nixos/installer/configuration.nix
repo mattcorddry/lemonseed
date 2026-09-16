@@ -62,6 +62,7 @@
     avahi
     pciutils
     usbutils
+    lshw
   ];
 
   # Do not auto-activate leftover appliance VGs on the target disk.
@@ -78,6 +79,7 @@
   environment.etc."lemonseed/partitions.yaml".source = ../../partitions.yaml;
   environment.etc."lemonseed/grub.cfg".source = ../../boot/grub.cfg;
   environment.etc."lemonseed/lemonseed-ab.sh".source = ../../scripts/lemonseed-ab.sh;
+  environment.etc."lemonseed/amdgpu-kernel-params.sh".source = ../../scripts/amdgpu-kernel-params.sh;
 
   # Keep the live image lean: no docker / appliance stack.
   nix.enable = false;

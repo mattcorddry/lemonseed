@@ -38,25 +38,51 @@ def _llamacpp_backend_state(hardware: dict[str, Any], backend: str) -> Optional[
     return None
 
 
+def _detected_vendors(hardware: dict[str, Any]) -> set[str]:
+    vendors = set()
+    for gpu in hardware.get("gpus") or []:
+        if isinstance(gpu, dict) and gpu.get("vendor"):
+            vendors.add(str(gpu["vendor"]))
+    return vendors
+
+
+def select_backend(hardware: dict[str, Any]) -> str:
+    """Pick the llamacpp backend to load with, from detected hardware.
+
+    NVIDIA prefers CUDA; AMD prefers Vulkan (M6.4). The returned name is the
+    lemond backend id (``cuda`` / ``vulkan`` / ``cpu``) used both for the
+    planner gate and the ``lemonade load --llamacpp`` argument.
+    """
+    vendors = _detected_vendors(hardware)
+    if "nvidia" in vendors:
+        return "cuda"
+    if "amd" in vendors:
+        return "vulkan"
+    return "cpu"
+
+
 def plan_model(hardware: dict[str, Any]) -> dict[str, Any]:
     """Pick the highest-ranked catalog entry that fits the largest single GPU."""
     catalog = load_catalog()
     models = catalog.get("models") or []
     vram = max_gpu_vram_gb(hardware)
     ram = float(hardware.get("ram_gb") or 0)
-    cuda_state = _llamacpp_backend_state(hardware, "cuda")
+    backend = select_backend(hardware)
+    backend_state = _llamacpp_backend_state(hardware, backend)
 
-    if vram <= 0:
+    # No GPU with usable VRAM. An AMD Vulkan device may report vram_gb=0
+    # (vulkaninfo does not expose VRAM), so only fail when no GPU at all.
+    if vram <= 0 and not _detected_vendors(hardware):
         return {
             "state": "not-ready",
-            "reason": "No NVIDIA GPU with usable VRAM was detected.",
+            "reason": "No GPU with usable VRAM was detected.",
             "selection": None,
             "catalog_version": catalog.get("catalog_version"),
         }
-    if cuda_state in ("installable", "unsupported"):
+    if backend_state in ("installable", "unsupported"):
         return {
             "state": "not-ready",
-            "reason": f"llamacpp:cuda backend is '{cuda_state}', expected installed.",
+            "reason": f"llamacpp:{backend} backend is '{backend_state}', expected installed.",
             "selection": None,
             "catalog_version": catalog.get("catalog_version"),
             "max_vram_gb": vram,
@@ -67,10 +93,16 @@ def plan_model(hardware: dict[str, Any]) -> dict[str, Any]:
         key=lambda m: int(m.get("rank") or 0),
         reverse=True,
     )
+    # When VRAM is unknown (vram == 0, e.g. an AMD Vulkan device that
+    # vulkaninfo does not report VRAM for), skip the VRAM fit check and let
+    # lemond decide at load time. We still rank by rank so the largest
+    # reasonable model is tried first.
+    vram_known = vram > 0
     for model in ranked:
         need_v = float(model.get("min_vram_gb") or 0)
         need_r = float(model.get("min_ram_gb") or 0)
-        if vram + 1e-6 >= need_v and ram + 1e-6 >= need_r:
+        fits_vram = (vram + 1e-6 >= need_v) if vram_known else True
+        if fits_vram and ram + 1e-6 >= need_r:
             return {
                 "state": "selected",
                 "reason": (
