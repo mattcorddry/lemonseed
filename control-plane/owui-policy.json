@@ -1,0 +1,335 @@
+{
+  "version": 1,
+  "owui": {
+    "min_version": "0.11.0"
+  },
+  "settings": {
+    "entries": {
+      "ollama.enable": {
+        "value": false,
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "No Ollama on the appliance; the egress surface stays closed."
+      },
+      "direct.enable": {
+        "value": false,
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "Chat must not be pointed at arbitrary direct model endpoints."
+      },
+      "openai.enable": {
+        "value": true,
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "Lemonade (lemond) is the OpenAI-compatible upstream for chat."
+      },
+      "openai.api_base_urls": {
+        "value": { "derived": "lemond_base", "wrap": "list" },
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "Chat traffic goes to Lemonade and nowhere else (whole list is ours)."
+      },
+      "openai.api_keys": {
+        "value": { "secret": "OPENAI_API_KEY", "wrap": "list" },
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "The Lemonade API key for the managed connection (masked in the portal)."
+      },
+      "openai.api_configs": {
+        "value": { "derived": "lemond_api_configs" },
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "Exactly one model connection: Lemonade, with no per-connection valves."
+      },
+      "web.search.enable": {
+        "value": false,
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "No web-search sidecar yet; internet egress stays off."
+      },
+      "image_generation.enable": {
+        "value": false,
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "No image-generation sidecar yet."
+      },
+      "images.edit.enable": {
+        "value": false,
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "Image editing depends on the disabled image-generation pipeline."
+      },
+      "ui.enable_community_sharing": {
+        "value": false,
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "Household content stays home; no community gallery."
+      },
+      "ui.enable_signup": {
+        "value": false,
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "Household accounts are created in Lemonseed, not in Open WebUI."
+      },
+      "auth.enable_api_keys": {
+        "value": true,
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "The control plane holds a machine key and members can mint their own."
+      },
+      "auth.api_key.endpoint_restrictions": {
+        "value": true,
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "The control-plane key stays scoped to the contract in this manifest."
+      },
+      "auth.api_key.allowed_endpoints": {
+        "value": { "derived": "api_paths_allow" },
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "Key blast radius equals this manifest's api path set."
+      },
+      "user.permissions": {
+        "value": {
+          "workspace": {
+            "models": false,
+            "knowledge": false,
+            "prompts": false,
+            "tools": false,
+            "skills": false,
+            "models_import": false,
+            "models_export": false,
+            "prompts_import": false,
+            "prompts_export": false,
+            "tools_import": false,
+            "tools_export": false,
+            "skills_import": false,
+            "skills_export": false
+          },
+          "sharing": {
+            "models": false,
+            "public_models": false,
+            "knowledge": false,
+            "public_knowledge": false,
+            "prompts": false,
+            "public_prompts": false,
+            "tools": false,
+            "public_tools": false,
+            "skills": false,
+            "public_skills": false,
+            "notes": false,
+            "public_notes": false,
+            "folders": false,
+            "public_chats": false,
+            "open_chats": false,
+            "public_calendars": false
+          },
+          "access_grants": {
+            "allow_users": true,
+            "allow_groups": true
+          },
+          "chat": {
+            "controls": true,
+            "valves": true,
+            "system_prompt": true,
+            "params": true,
+            "file_upload": true,
+            "web_upload": true,
+            "delete": true,
+            "delete_message": true,
+            "continue_response": true,
+            "regenerate_response": true,
+            "rate_response": true,
+            "edit": true,
+            "share": true,
+            "export": true,
+            "import": true,
+            "stt": true,
+            "tts": true,
+            "call": true,
+            "multiple_models": true,
+            "temporary": true,
+            "temporary_enforced": false
+          },
+          "features": {
+            "api_keys": true,
+            "notes": true,
+            "folders": true,
+            "channels": false,
+            "direct_tool_servers": false,
+            "web_search": true,
+            "image_generation": true,
+            "code_interpreter": true,
+            "memories": true,
+            "automations": true,
+            "calendar": true,
+            "webhooks": false
+          },
+          "settings": {
+            "interface": true
+          }
+        },
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "Default member permissions: personal OpenAI-compatible endpoint on, workspace/model admin off."
+      },
+      "automations.enable": {
+        "value": true,
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "Automations are an on-appliance feature (M6.3a policy)."
+      },
+      "notes.enable": {
+        "value": true,
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "Notes stay on for members (M6.3a policy)."
+      },
+      "memories.enable": {
+        "value": true,
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "Cross-chat memories stay on (M6.3a policy)."
+      },
+      "memories.system_context.enable": {
+        "value": true,
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "Memories feed the system context (M6.3a policy)."
+      },
+      "channels.enable": {
+        "value": false,
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "Deferred until Lemonseed seeds a shared household channel."
+      },
+      "task.autocomplete.enable": {
+        "value": false,
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "Autocomplete burns model cycles for little gain on appliance hardware."
+      },
+      "ui.default_models": {
+        "value": [],
+        "mode": "initial_setup",
+        "reason": "First-boot default only; per-user model choices belong to users."
+      },
+      "models.default_metadata": {
+        "value": {
+          "capabilities": {
+            "builtin_tools": false,
+            "web_search": false,
+            "image_generation": false,
+            "code_interpreter": false
+          },
+          "builtinTools": {
+            "knowledge": false,
+            "files": false,
+            "web_search": false,
+            "image_generation": false,
+            "code_interpreter": false,
+            "channels": false,
+            "tasks": false,
+            "automations": false
+          }
+        },
+        "mode": "initial_setup",
+        "reason": "Seed only: builtin tools stay off until curated on-appliance sources land."
+      },
+      "models.default_params": {
+        "value": {
+          "system": "You are Lemonseed, a helpful AI running on this household appliance. Be clear, practical, and privacy-conscious. When the user's name is known, address them as {{ USER_NAME }}. Today's date is {{ CURRENT_DATE }}.",
+          "function_calling": "legacy"
+        },
+        "mode": "initial_setup",
+        "reason": "Seed the Lemonseed identity prompt once; per-model parameter edits belong to users."
+      }
+    }
+  },
+  "entities": {
+    "models": {
+      "mode": "selective_management",
+      "own_by": "id",
+      "own_ids": ["lemonseed-ai", "lemonseed-ai-filtered"],
+      "reserved_name_regex": "^Lemonseed.*$",
+      "definitions": {},
+      "reason": "Lemonseed owns ids lemonseed-ai* and the Lemonseed name space; other models are never touched. Definitions arrive with Phase 5 (LiteLLM)."
+    },
+    "users": {
+      "mode": "full_management",
+      "source": "cp.users",
+      "scope": ["membership", "is_admin"],
+      "never_touch": ["%SERVICE_ACCOUNT_ID%"],
+      "reason": "Household accounts live in Lemonseed: membership and admin flag mirror the CP list (trusted headers at sign-in, plus this loop at boot). The loop creates, promotes and demotes, but never deletes accounts."
+    }
+  },
+  "guards": [
+    {
+      "path": "POST /api/v1/auths/add",
+      "mode": "advertise",
+      "hint": "Household accounts are created in Lemonseed.",
+      "reason": "Household accounts are created in Lemonseed. Advisory until M6.2b gives Lemonseed its own account management; enforcing this before then would leave no way to create a user."
+    },
+    {
+      "path": "DELETE /api/v1/users/.*",
+      "mode": "advertise",
+      "hint": "Household accounts are removed in Lemonseed.",
+      "reason": "Household accounts are removed in Lemonseed. Advisory until M6.2b replaces it with user-list mirroring, which is the safe version of this rule."
+    },
+    {
+      "path": "POST /api/v1/configs/connections",
+      "mode": "enforce",
+      "hint": "Lemonseed manages model connections on this appliance.",
+      "reason": "Writes direct.enable (direct model endpoints), which Lemonseed keeps off; re-asserted at boot."
+    },
+    {
+      "path": "POST /openai/config/update",
+      "mode": "enforce",
+      "hint": "Lemonseed manages the OpenAI connection set on this appliance.",
+      "reason": "Open WebUI's connection editor rewrites the whole OpenAI connection set, including Lemonseed's managed Lemonade entry; Lemonseed re-asserts its own at boot."
+    },
+    {
+      "path": "POST /ollama/config/update",
+      "mode": "enforce",
+      "hint": "There is no Ollama on this appliance.",
+      "reason": "There is no Ollama on the appliance; ollama.enable stays off and is re-asserted at boot."
+    },
+    {
+      "path": "POST /api/v1/users/%CP_OWUI_ID%/update",
+      "mode": "enforce",
+      "hint": "The Lemonseed Control Plane account is not editable here.",
+      "reason": "The Lemonseed Control Plane account is not editable from Open WebUI."
+    },
+    {
+      "path": "DELETE /api/v1/users/%CP_OWUI_ID%",
+      "mode": "enforce",
+      "hint": "The Lemonseed Control Plane account is not removable here.",
+      "reason": "The Lemonseed Control Plane account is not removable from Open WebUI."
+    }
+  ],
+  "api": {
+    "app.version": "GET /api/config",
+    "config.export": "GET /api/v1/configs/export",
+    "config.import": "POST /api/v1/configs/import",
+    "config.namespace": "GET /api/v1/configs/namespace/{namespace}",
+    "models.export": "GET /api/v1/models/export",
+    "models.list": "GET /api/v1/models/list",
+    "models.create": "POST /api/v1/models/create",
+    "models.update": "POST /api/v1/models/model/update",
+    "models.delete": "POST /api/v1/models/model/delete",
+    "models.sync": "POST /api/v1/models/sync",
+    "users.all": "GET /api/v1/users/all",
+    "users.update": "POST /api/v1/users/{user_id}/update",
+    "users.delete": "DELETE /api/v1/users/{user_id}",
+    "users.create": "POST /api/v1/auths/add",
+    "apikey.create": "POST /api/v1/auths/api_key",
+    "apikey.revoke": "DELETE /api/v1/auths/api_key",
+    "apikey.get": "GET /api/v1/auths/api_key",
+    "groups.list": "GET /api/v1/groups/",
+    "groups.create": "POST /api/v1/groups/create",
+    "groups.update": "POST /api/v1/groups/id/{group_id}/update",
+    "groups.users_add": "POST /api/v1/groups/id/{group_id}/users/add",
+    "groups.users_remove": "POST /api/v1/groups/id/{group_id}/users/remove",
+    "groups.delete": "DELETE /api/v1/groups/id/{group_id}/delete"
+  }
+}

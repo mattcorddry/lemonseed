@@ -16,16 +16,29 @@
     }:
     let
       system = "x86_64-linux";
+      pkgs = nixpkgs.legacyPackages.${system};
       lemonadePackage = nix-amd-ai.packages.${system}.lemonade.override {
         withWebApp = false;
         withDesktopApp = false;
+      };
+
+      # Unofficial Python SDK for the lemond HTTP API (not in nixpkgs). The
+      # control plane uses it to talk to lemond over HTTP instead of wrapping
+      # the `lemonade` CLI — see DESIGN.md "lemond API over CLI".
+      lemonadePythonSdk = pkgs.callPackage ./pkgs/lemonade-python-sdk.nix {
+        buildPythonPackage = pkgs.python3Packages.buildPythonPackage;
+        requests = pkgs.python3Packages.requests;
+        setuptools = pkgs.python3Packages.setuptools;
       };
 
       mkAppliance =
         extraModules:
         nixpkgs.lib.nixosSystem {
           inherit system;
-          specialArgs = { inherit lemonadePackage; };
+          # nix-amd-ai is passed so lemond.nix can consume its llama.cpp
+          # builds (must track the same llama.cpp lemonadePackage is built
+          # against — see DESIGN.md "llama.cpp provenance").
+          specialArgs = { inherit lemonadePackage nix-amd-ai lemonadePythonSdk; };
           modules = [ ./nixos/configuration.nix ] ++ extraModules;
         };
     in

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import calendar
+import hashlib
 import os
 import secrets
 import signal
@@ -15,6 +17,10 @@ from typing import Any, Optional
 from urllib.error import URLError
 from urllib.request import urlopen
 
+import owui_client
+import owui_policy
+import auth
+import db
 from db import SECRETS_MODULES, _module_credentials, _write_module_secret
 from hardware import lemonade_api_key
 
@@ -38,39 +44,28 @@ LEMONADE_BASE = "http://host.docker.internal/_lemonseed/lemond/v1"
 # OWUI is a root SPA — iframe must load path /, not /chat/.
 OWUI_EMBED_PATH = "/?embed=1"
 
-# M6.3a: appliance identity for all models (OWUI merges into chat params).
-LEMONSEED_SYSTEM_PROMPT = (
-    "You are Lemonseed, a helpful AI running on this household appliance. "
-    "Be clear, practical, and privacy-conscious. When the user's name is known, "
-    "address them as {{ USER_NAME }}. Today's date is {{ CURRENT_DATE }}."
-)
+# M6.3b: OWUI identity wire contract. These trusted-header names are the
+# CP↔OWUI protocol: nginx forwards the same set for household users after the
+# auth_request gate, and the CP signs in directly to the slot port (localhost
+# only) with its own set — so only the CP can mint identities outside portal.
+OWUI_TRUSTED_EMAIL_HEADER = "X-Forwarded-Email"
+OWUI_TRUSTED_NAME_HEADER = "X-Forwarded-Name"
+OWUI_TRUSTED_GROUPS_HEADER = "X-Forwarded-Groups"
+OWUI_TRUSTED_ROLE_HEADER = "X-Forwarded-Role"
 
-# OWUI v0.11 defaults to native tool calling and injects Knowledge/Files tools.
-# With no seeded KBs, small models call query_knowledge_bases / query_knowledge_files
-# and then apologize that nothing was found. Prefer legacy completion (older OWUI
-# behavior) until we ship curated on-appliance sources (DESIGN backlog).
-DEFAULT_MODEL_PARAMS = {
-    "system": LEMONSEED_SYSTEM_PROMPT,
-    "function_calling": "legacy",
-}
-DEFAULT_MODEL_METADATA = {
-    "capabilities": {
-        "builtin_tools": False,
-        "web_search": False,
-        "image_generation": False,
-        "code_interpreter": False,
-    },
-    "builtinTools": {
-        "knowledge": False,
-        "files": False,
-        "web_search": False,
-        "image_generation": False,
-        "code_interpreter": False,
-        "channels": False,
-        "tasks": False,
-        "automations": False,
-    },
-}
+# CP service identity in OWUI (DESIGN.md M6.3b). Signing in first at
+# first-healthy makes it OWUI's primary admin — the first-created user, which
+# OWUI refuses to let anyone else modify or delete. It cannot be hidden from
+# the admin user list, so the deterrent is the explicit display name. Shares the
+# portal's synthetic email domain so the admin user list reads uniformly.
+OWUI_SERVICE_EMAIL = auth.owui_email("lemonseed-cp")
+OWUI_SERVICE_NAME = "Lemonseed Control Plane"
+OWUI_SERVICE_ROLE = "admin"
+
+# M6.3a: appliance identity for all models (OWUI merges into chat params).
+# M6.3a/M6.3b: the Lemonseed identity prompt, model params, and model
+# metadata now live in owui-policy.json (initial_setup seeds) — reconciled
+# through the admin API, not env.
 
 
 
@@ -223,6 +218,99 @@ def _container_running(name: str) -> bool:
     return result.returncode == 0 and result.stdout.strip().lower() == "true"
 
 
+def _docker_duration(seconds: float) -> str:
+    """Whole-unit duration the way `docker ps` says it ("59 minutes", "2 hours")."""
+    total = max(0, int(seconds))
+    if total < 60:
+        value, unit = total, "second"
+    elif total < 3600:
+        value, unit = total // 60, "minute"
+    elif total < 86400:
+        value, unit = total // 3600, "hour"
+    else:
+        value, unit = total // 86400, "day"
+    return f"{value} {unit}" + ("" if value == 1 else "s")
+
+
+def _docker_epoch(text: str) -> Optional[float]:
+    """Unix time from docker's RFC 3339 stamp; None for the zero value / junk.
+
+    Only whole seconds are needed, so the fraction is dropped rather than
+    parsed (docker emits nanosecond precision, which `datetime.fromisoformat`
+    only accepts from 3.11 onwards). Docker prints UTC, so the fields are read
+    as UTC (`calendar.timegm`), not local time.
+    """
+    text = (text or "").strip()
+    if len(text) < 19 or text.startswith("0001-01-01"):
+        return None
+    try:
+        return float(calendar.timegm(time.strptime(text[:19], "%Y-%m-%dT%H:%M:%S")))
+    except ValueError:
+        return None
+
+
+def format_container_status(
+    fields: list[str], now: float
+) -> Optional[tuple[str, str]]:
+    """Join docker inspect fields into the phrase `docker ps` would print.
+
+    `fields` is [status, started_at, finished_at, exit_code, health, image].
+    Returns (status, image) with status like "Up 59 minutes (healthy)" or
+    "Exited (1) 3 minutes ago", or None when the status field is unusable.
+    """
+
+    def _text(index: int) -> str:
+        return fields[index].strip() if len(fields) > index else ""
+
+    status = _text(0).lower()
+    if not status or status == "<no value>":
+        return None
+    health = _text(4)
+    if status == "running":
+        started = _docker_epoch(_text(1))
+        elapsed = 0.0 if started is None else max(0.0, now - started)
+        phrase = f"Up {_docker_duration(elapsed)}"
+        if health:
+            phrase += f" ({health})"
+        return (phrase, _text(5))
+    if status in ("paused", "restarting", "created"):
+        return (status.capitalize(), _text(5))
+    # exited / dead: docker reports the exit code and how long ago it stopped.
+    finished = _docker_epoch(_text(2))
+    code = _text(3)
+    phrase = status.capitalize()
+    if code.isdigit():
+        phrase += f" ({code})"
+    if finished is not None:
+        phrase += f" {_docker_duration(now - finished)} ago"
+    return (phrase, _text(5))
+
+
+def owui_container_status(name: Optional[str] = None) -> Optional[tuple[str, str]]:
+    """(docker status, image ref) for the active Open WebUI container.
+
+    The portal shows docker's own wording ("Up 59 minutes (healthy)") because
+    it is what an admin sees in `docker ps`. Returns None when docker cannot
+    answer, so the caller falls back to the control plane's lifecycle word
+    instead of inventing an uptime.
+    """
+    container = name or _container_name(_active_port_from_upstream())
+    result = _docker(
+        [
+            "inspect",
+            "-f",
+            "{{.State.Status}}|{{.State.StartedAt}}|{{.State.FinishedAt}}"
+            "|{{.State.ExitCode}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}"
+            "|{{.Config.Image}}",
+            container,
+        ],
+        timeout=15,
+    )
+    if result.returncode != 0:
+        return None
+    return format_container_status((result.stdout or "").strip().split("|"), time.time())
+
+
 def _container_env_contains(name: str, needle: str) -> bool:
     result = _docker(
         ["inspect", "-f", "{{json .Config.Env}}", name],
@@ -254,62 +342,82 @@ def _container_env_map(name: str) -> dict[str, str]:
     return out
 
 
-# Keys that must match the secrets file or we blue/green recreate OWUI.
-# lemonseed-update refreshes SquashFS/CP; without this check a healthy container
-# keeps stale Docker Env forever (DEFAULT_MODEL_PARAMS etc.).
-_POLICY_ENV_KEYS = (
-    "ENABLE_OLLAMA_API",
-    "OPENAI_API_BASE_URL",
-    "OPENAI_API_BASE_URLS",
-    "ENABLE_PERSISTENT_CONFIG",
-    "ENABLE_VERSION_UPDATE_CHECK",
-    "OFFLINE_MODE",
-    "WEBUI_NAME",
-    "DEFAULT_MODEL_PARAMS",
-    "DEFAULT_MODEL_METADATA",
-    "ENABLE_WEB_SEARCH",
-    "ENABLE_IMAGE_GENERATION",
-    "ENABLE_CHANNELS",
-    # OWUI auth (M6.2): trusted-header env is read at import time, so a healthy
-    # container running without it must be blue/green-recreated to pick it up.
+# Keys OWUI reads from env at import; must match the secrets file or we
+# blue/green recreate OWUI. Since the M6.3b policy engine landed, everything
+# else the container used to receive via env is reconciled through the admin
+# API (owui-policy.json), so the env floor is the bootstrap set only.
+#
+# Staleness detection uses a CP-owned generation marker (below), NOT absence
+# checks on retired keys: the OWUI image bakes OLLAMA_BASE_URL, WEBUI_SECRET_KEY,
+# OPENAI_API_KEY and OPENAI_API_BASE_URL into its Config.Env, and docker
+# merges --env-file over image ENV — `docker inspect` can therefore never
+# report those keys absent, retired or not (QEMU proved this: infinite
+# blue/green recreate storm). A marker only our CP writes distinguishes
+# containers across any floor change; bump _ENV_GEN_VALUE whenever the floor
+# or its semantics change.
+_BOOTSTRAP_ENV_KEYS = (
+    "DATABASE_URL",
+    "WEBUI_SECRET_KEY",
     "WEBUI_AUTH",
     "WEBUI_AUTH_TRUSTED_EMAIL_HEADER",
     "WEBUI_AUTH_TRUSTED_NAME_HEADER",
     "WEBUI_AUTH_TRUSTED_GROUPS_HEADER",
     "WEBUI_AUTH_TRUSTED_ROLE_HEADER",
+    "OFFLINE_MODE",
+    "WEBUI_NAME",
+    "ENABLE_VERSION_UPDATE_CHECK",
 )
 
+_ENV_GEN_KEY = "LEMONSEED_OWUI_ENV_GEN"
+_ENV_GEN_VALUE = "2"
 
-def _policy_env_ok(name: str, desired: dict[str, str]) -> bool:
-    """True when the running container Env matches Lemonseed policy knobs."""
+# The docker --env-file key set: bootstrap keys + the env-generation marker.
+# (The module credential store intentionally holds more: OPENAI_API_KEY and
+# DB_PASSWORD are storage-only and never reach the container.)
+_CONTAINER_ENV_KEYS = _BOOTSTRAP_ENV_KEYS + (_ENV_GEN_KEY,)
+
+
+def _bootstrap_env_drift(name: str, desired: dict[str, str]) -> Optional[str]:
+    """First human-readable reason the container env is stale, or None.
+
+    ``desired`` is always ``_container_env_subset(...)`` — the bootstrap keys
+    plus our generation marker. A pre-shrink container lacks the marker and
+    is flagged for recreate; image-baked keys are simply not in ``desired``
+    and are ignored.
+    """
     current = _container_env_map(name)
     if not current:
-        return False
-    for key in _POLICY_ENV_KEYS:
-        if key not in desired:
-            continue
+        return "no env map (docker inspect empty?)"
+    for key in desired:
         if current.get(key) != desired[key]:
-            return False
-    return True
+            return (f"{key} differs: container={current.get(key)!r} "
+                    f"want={desired[key]!r}")
+    return None
+
+
+def _bootstrap_env_ok(name: str, desired: dict[str, str]) -> bool:
+    """True when the running container Env matches the bootstrap policy set."""
+    return _bootstrap_env_drift(name, desired) is None
 
 
 def enrich_open_webui_secrets() -> dict[str, str]:
-    """Merge Lemonade + OWUI knobs into the module secret file."""
+    """Merge Lemonade + OWUI knobs into the module secret file.
+
+    M6.3b Phase 3: the payload is the **bootstrap set only** — env is read at
+    OWUI import time for database/identity wiring; every other knob is
+    reconciled into the DB config table through the admin API from
+    owui-policy.json. OPENAI_API_KEY stays *as secret storage* (lemond and
+    the policy's ``openai.api_keys`` entry read it from here) but is no
+    longer an OWUI env entry.
+    """
     existing = _module_credentials(MODULE_ID)
     database_url = existing.get("DATABASE_URL", "")
     if not database_url:
         return {}
 
-    api_key = lemonade_api_key()
     secret_key = existing.get("WEBUI_SECRET_KEY") or secrets.token_urlsafe(32)
     # OWUI is on the lemon network; use the Postgres service DNS name.
     database_url = _module_database_url(database_url)
-    # OpenAI-compatible Lemonade only. ENABLE_OLLAMA_API is a ConfigVar — pair
-    # with ENABLE_PERSISTENT_CONFIG=False so env wins over DB defaults.
-    # M6.3a policy: autocomplete off, automations on, workspace off, notes/memory
-    # on; web search / image gen / community off until sidecars land; channels
-    # deferred until we seed a shared “everyone” channel.
-    #
     # OWUI auth (M6.2): WEBUI_AUTH on with trusted-header auth. The nginx edge
     # gate (auth_request) is the real login; it forwards the signed-in user's
     # identity via X-Forwarded-Email/-Name/-Groups/-Role (set only from the CP
@@ -320,52 +428,436 @@ def enrich_open_webui_secrets() -> dict[str, str]:
     payload = {
         **existing,
         "DATABASE_URL": database_url,
-        "WEBUI_AUTH": "True",
-        "WEBUI_AUTH_TRUSTED_EMAIL_HEADER": "X-Forwarded-Email",
-        "WEBUI_AUTH_TRUSTED_NAME_HEADER": "X-Forwarded-Name",
-        "WEBUI_AUTH_TRUSTED_GROUPS_HEADER": "X-Forwarded-Groups",
-        "WEBUI_AUTH_TRUSTED_ROLE_HEADER": "X-Forwarded-Role",
-        "ENABLE_PERSISTENT_CONFIG": "False",
-        "ENABLE_OLLAMA_API": "False",
-        "OLLAMA_BASE_URL": "",
-        "OLLAMA_BASE_URLS": "",
-        "ENABLE_OPENAI_API": "True",
-        "OPENAI_API_BASE_URL": LEMONADE_BASE,
-        "OPENAI_API_BASE_URLS": LEMONADE_BASE,
-        "OPENAI_API_KEY": api_key or existing.get("OPENAI_API_KEY", ""),
-        "OPENAI_API_KEYS": api_key or existing.get("OPENAI_API_KEY", ""),
         "WEBUI_SECRET_KEY": secret_key,
+        "WEBUI_AUTH": "True",
+        "WEBUI_AUTH_TRUSTED_EMAIL_HEADER": OWUI_TRUSTED_EMAIL_HEADER,
+        "WEBUI_AUTH_TRUSTED_NAME_HEADER": OWUI_TRUSTED_NAME_HEADER,
+        "WEBUI_AUTH_TRUSTED_GROUPS_HEADER": OWUI_TRUSTED_GROUPS_HEADER,
+        "WEBUI_AUTH_TRUSTED_ROLE_HEADER": OWUI_TRUSTED_ROLE_HEADER,
         "WEBUI_NAME": "Lemonseed",
         "OFFLINE_MODE": "True",
         "ENABLE_VERSION_UPDATE_CHECK": "False",
-        "ENABLE_AUTOCOMPLETE_GENERATION": "False",
-        "ENABLE_AUTOMATIONS": "True",
-        "USER_PERMISSIONS_FEATURES_AUTOMATIONS": "True",
-        "ENABLE_NOTES": "True",
-        "USER_PERMISSIONS_FEATURES_NOTES": "True",
-        "ENABLE_MEMORIES": "True",
-        "ENABLE_MEMORY_SYSTEM_CONTEXT": "True",
-        "USER_PERMISSIONS_FEATURES_MEMORIES": "True",
-        "ENABLE_CHANNELS": "False",
-        "USER_PERMISSIONS_FEATURES_CHANNELS": "False",
-        "ENABLE_WEB_SEARCH": "False",
-        "ENABLE_IMAGE_GENERATION": "False",
-        "ENABLE_IMAGE_EDIT": "False",
-        "ENABLE_COMMUNITY_SHARING": "False",
-        "USER_PERMISSIONS_WORKSPACE_MODELS_ACCESS": "False",
-        "USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_ACCESS": "False",
-        "USER_PERMISSIONS_WORKSPACE_PROMPTS_ACCESS": "False",
-        "USER_PERMISSIONS_WORKSPACE_TOOLS_ACCESS": "False",
-        "USER_PERMISSIONS_WORKSPACE_SKILLS_ACCESS": "False",
-        "DEFAULT_MODEL_METADATA": json.dumps(DEFAULT_MODEL_METADATA),
-        "DEFAULT_MODEL_PARAMS": json.dumps(DEFAULT_MODEL_PARAMS),
+        # Secret *storage* only (policy resolver + lemond consumers read it
+        # here); _write_container_env keeps it out of the OWUI environment.
+        "OPENAI_API_KEY": lemonade_api_key() or existing.get("OPENAI_API_KEY", ""),
     }
     _write_module_secret(MODULE_ID, payload)
+    _write_container_env(payload)
     return payload
 
 
+def _container_env_subset(payload: dict[str, str]) -> dict[str, str]:
+    out = {k: v for k, v in payload.items() if k in _BOOTSTRAP_ENV_KEYS}
+    out[_ENV_GEN_KEY] = _ENV_GEN_VALUE
+    return out
+
+
+def _write_container_env(payload: dict[str, str]) -> None:
+    """Write the docker --env-file: bootstrap keys + env-generation marker.
+
+    The module credential store (open-webui.env) intentionally holds more
+    (OPENAI_API_KEY, DB_PASSWORD); OWUI's container env must not.
+    """
+    SECRETS_MODULES.mkdir(parents=True, exist_ok=True)
+    path = _env_file_path()
+    tmp = path.with_name(path.name + ".tmp")
+    lines = [f"{k}={v}" for k, v in _container_env_subset(payload).items()]
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o640)
+    tmp.replace(path)
+
+
 def _env_file_path() -> Path:
-    return SECRETS_MODULES / f"{MODULE_ID}.env"
+    # Derived docker env-file, separate from the module credential store
+    # (open-webui.env): only the bootstrap subset reaches the container.
+    return SECRETS_MODULES / f"{MODULE_ID}.container.env"
+
+
+# M6.3b: CP service identity in OWUI. In-memory because provisioning is
+# idempotent in the DB — a CP restart just re-signs-in once on next boot.
+_service_identity_ready = False
+_service_account_id: Optional[str] = None
+
+
+def ensure_owui_service_identity(port: int) -> bool:
+    """Provision the CP's service account inside Open WebUI (M6.3b).
+
+    Signs in as OWUI_SERVICE_EMAIL via trusted headers against the slot port
+    (localhost only), which auto-provisions the account when missing and
+    re-asserts its admin role on every sign-in. Must happen before the first
+    household sign-in: OWUI's first-created user is the primary admin and is
+    immune to modify/delete, so whoever signs in first owns that seat.
+
+    Idempotent — a no-op once provisioned; until then the supervisor retries
+    each tick. Never raises: a not-yet-provisioned identity must not fail an
+    otherwise-healthy module.
+    """
+    global _service_identity_ready, _service_account_id
+    if _service_identity_ready:
+        return True
+    try:
+        client = owui_client.OwuiClient(
+            f"http://127.0.0.1:{port}",
+            email_header=OWUI_TRUSTED_EMAIL_HEADER,
+            name_header=OWUI_TRUSTED_NAME_HEADER,
+            groups_header=OWUI_TRUSTED_GROUPS_HEADER,
+            role_header=OWUI_TRUSTED_ROLE_HEADER,
+        )
+        result = client.sign_in_trusted(
+            OWUI_SERVICE_EMAIL, name=OWUI_SERVICE_NAME, role=OWUI_SERVICE_ROLE
+        )
+    except Exception as exc:  # noqa: BLE001 — service boundary; heals on next tick
+        print(f"owui service identity: {exc}", flush=True)
+        return False
+    payload = result.get("data")
+    data: dict[str, Any] = payload if isinstance(payload, dict) else {}
+    # The sign-in response can carry a pre-update role (OWUI syncs the trusted
+    # role after authenticating); requiring admin here means the next tick
+    # re-signs-in and sees the synced value.
+    if result.get("ok") and data.get("role") == OWUI_SERVICE_ROLE and data.get("id"):
+        _service_identity_ready = True
+        _service_account_id = str(data["id"])
+        print(f"owui service identity: provisioned (id={_service_account_id})", flush=True)
+        # The %CP_OWUI_ID% guards could not render until this moment, so do not
+        # wait up to a supervisor tick to install them.
+        sync_owui_guards()
+        return True
+    detail = str(result.get("error") or f"unexpected role {data.get('role')!r}")[:200]
+    print(f"owui service identity: not provisioned: {detail}", flush=True)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# M6.3b Phase 3: policy reconcile wiring. The engine (owui_policy) owns all
+# semantics; this section is glue: deps wiring, trigger bookkeeping, and the
+# supervisor hooks. Reconcile failures never touch the module state machine —
+# they surface via the owui_policy snapshot field (iframe gate, decision D1).
+# ---------------------------------------------------------------------------
+
+POLICY_AUDIT_INTERVAL_SEC = int(
+    os.environ.get("LEMONSEED_OWUI_POLICY_AUDIT_SECONDS", "300") or "300"
+)
+# (port, container) whose write-reconcile completed; audit cadence anchor.
+_policy_slot_done: Optional[tuple[int, str]] = None
+_policy_audit_at = 0.0
+
+
+def _owui_cp_key_path() -> Path:
+    # Separate file (not the module env file): OWUI_CP_API_KEY must never
+    # become OWUI container environment — the container env floor stays
+    # bootstrap-keys-only (§8 smoke asserts it).
+    return SECRETS_MODULES / f"{MODULE_ID}.cp-key"
+
+
+def _load_owui_cp_key() -> Optional[str]:
+    try:
+        key = _owui_cp_key_path().read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return key or None
+
+
+def _persist_owui_cp_key(key: str) -> bool:
+    try:
+        path = _owui_cp_key_path()
+        path.write_text(key + "\n", encoding="utf-8")
+        os.chmod(path, 0o600)
+        return True
+    except OSError as exc:  # noqa: BLE001 — mint still works this run in-memory
+        print(f"owui cp key persist: {exc}", flush=True)
+        return False
+
+
+def _policy_context() -> owui_policy.ResolverContext:
+    placeholders: dict[str, str] = {}
+    if _service_account_id:
+        placeholders = {
+            "CP_OWUI_ID": _service_account_id,
+            "SERVICE_ACCOUNT_ID": _service_account_id,
+        }
+    return owui_policy.ResolverContext(
+        secrets=_module_credentials(MODULE_ID),
+        lemond_base=LEMONADE_BASE,
+        placeholders=placeholders,
+        cp_users=auth.owui_identities(),
+    )
+
+
+def _policy_deps(port: int) -> owui_policy.ReconcileDeps:
+    return owui_policy.ReconcileDeps(
+        build_client=lambda api_map, api_key, on_remint: owui_client.OwuiClient(
+            f"http://127.0.0.1:{port}",
+            email_header=OWUI_TRUSTED_EMAIL_HEADER,
+            name_header=OWUI_TRUSTED_NAME_HEADER,
+            groups_header=OWUI_TRUSTED_GROUPS_HEADER,
+            role_header=OWUI_TRUSTED_ROLE_HEADER,
+            api_map=api_map,
+            api_key=api_key,
+            on_remint=on_remint,
+        ),
+        service_identity={
+            "email": OWUI_SERVICE_EMAIL,
+            "name": OWUI_SERVICE_NAME,
+            "role": OWUI_SERVICE_ROLE,
+        },
+        load_api_key=_load_owui_cp_key,
+        persist_api_key=_persist_owui_cp_key,
+        refresh_context=_policy_context,
+    )
+
+
+def _policy_pending_triggers() -> frozenset[str]:
+    """Cadence set for a slot's write-reconcile (§5.3 firing rules)."""
+    triggers = {"at_boot"}
+    state = owui_policy.load_state()
+    try:
+        manifest = owui_policy.load_manifest()
+    except owui_policy.ManifestError:
+        manifest = None
+    # Unreadable manifest or absent/changed hash: also re-assert on_upgrade —
+    # idempotent writes, the fail-safe reading of "undeterminable" (§5.5).
+    if manifest is None or not state or state.get("policy_hash") != manifest.policy_hash:
+        triggers.add("on_upgrade")
+    return frozenset(triggers)
+
+
+def _policy_maybe_write(port: int, container: str) -> None:
+    """Run the pending write-reconcile for a healthy identified slot.
+
+    Called from the ensure_open_webui ready paths only (identity gate).
+    Retries each tick until ok; reconcile itself never raises.
+    """
+    global _policy_slot_done, _policy_audit_at
+    if not _service_identity_ready or _policy_slot_done == (port, container):
+        return
+    triggers = _policy_pending_triggers()
+    result = owui_policy.reconcile(port, triggers, _policy_deps(port))
+    if result.get("skipped"):
+        return
+    if result.get("ok"):
+        _policy_slot_done = (port, container)
+        _policy_audit_at = time.monotonic()
+        # Rare (boot / slot change / CP restart) — journal lines here are the
+        # audit trail for "when did the CP last write OWUI intent".
+        print(f"owui policy: {'+'.join(sorted(triggers))} reconcile ok; "
+              f"audit armed for {container}:{port}", flush=True)
+    else:
+        print(f"owui policy: reconcile not ok: {result.get('last_error')}", flush=True)
+
+
+def _policy_maybe_audit(port: int, container: str) -> None:
+    """Slow periodic audit-only reconcile (observe + drift report, D3)."""
+    global _policy_audit_at
+    if _policy_slot_done != (port, container):
+        return
+    now = time.monotonic()
+    if now - _policy_audit_at < POLICY_AUDIT_INTERVAL_SEC:
+        return
+    _policy_audit_at = now
+    result = owui_policy.reconcile(port, frozenset(), _policy_deps(port))
+    drift = result.get("drift") or {}
+    print(f"owui policy: audit tick ok={result.get('ok')} "
+          f"pending={drift.get('pending', 0)} "
+          f"error={result.get('last_error') or '-'}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# M6.3b Phase 4B: guard rendering + edge enforcement.
+#
+# The manifest *declares* ownership; this section makes that true by rendering
+# /run/lemonseed/owui-guards.conf, which nginx includes in `locations."/"`.
+# The whole file is re-rendered from the manifest every sync (never edited
+# incrementally), so a guard that stops being enforced cannot survive as a stale
+# rule — that is the no-stale-rules guarantee (DESIGN 4B §3.2.1).
+#
+# Two hashes are tracked on purpose: what is on disk, and what nginx is known
+# to be serving. A reload can fail after a successful write; with one hash the
+# CP would believe its own claim forever.
+# ---------------------------------------------------------------------------
+
+GUARDS_CONF = Path("/run/lemonseed/owui-guards.conf")
+
+# sha256 of the guard text the live nginx is known to serve. Advanced only on a
+# successful reload, so the next tick retries a failed one.
+_guards_nginx_sha: Optional[str] = None
+# Last render failure we logged, so a persistently broken manifest logs once
+# instead of once per tick.
+_guards_error_logged: Optional[str] = None
+
+
+def _guards_placeholders() -> dict[str, str]:
+    """Guard placeholder map (empty until the service account id is known).
+
+    Deliberately its own accessor: `_policy_context()` is *not* reusable here
+    because it reads module secrets from the DB, and guards must render even
+    while the data plane is unavailable.
+    """
+    if not _service_account_id:
+        return {}
+    return {
+        "CP_OWUI_ID": _service_account_id,
+        "SERVICE_ACCOUNT_ID": _service_account_id,
+    }
+
+
+def render_owui_guards() -> dict[str, Any]:
+    """Render the guard include from the manifest. Never raises.
+
+    Returns ``{ok, error, render, declared, declared_sha}`` where ``declared``
+    is the enforce-mode guard count in the manifest and ``declared_sha`` the
+    hash of the text that render produced.
+    """
+    try:
+        manifest = owui_policy.load_manifest()
+        render = owui_policy.render_guards(manifest, _guards_placeholders())
+    except owui_policy.PolicyError as exc:
+        return {
+            "ok": False,
+            "error": str(exc)[:300],
+            "render": None,
+            "declared": 0,
+            "declared_sha": None,
+        }
+    return {
+        "ok": True,
+        "error": None,
+        "render": render,
+        "declared": sum(1 for g in manifest.guards if g.mode == "enforce"),
+        "declared_sha": render.sha256,
+    }
+
+
+def _guards_file_sha() -> Optional[str]:
+    try:
+        data = GUARDS_CONF.read_bytes()
+    except OSError:
+        return None
+    return hashlib.sha256(data).hexdigest()
+
+
+def _write_guards_conf(text: str) -> bool:
+    """Atomic replace, same pattern as ``auth._write_conf`` (a reload landing
+    mid-write would leave nginx with truncated config)."""
+    try:
+        GUARDS_CONF.parent.mkdir(parents=True, exist_ok=True)
+        tmp = GUARDS_CONF.with_name(GUARDS_CONF.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.chmod(tmp, 0o644)
+        tmp.replace(GUARDS_CONF)
+        return True
+    except OSError as exc:  # noqa: BLE001 — keep the previous file, retry tick
+        print(f"owui guards: write failed: {exc}", flush=True)
+        return False
+
+
+def sync_owui_guards() -> dict[str, Any]:
+    """Make the rendered include and the live nginx match the manifest.
+
+    Cheap enough for every supervisor tick: one small JSON parse plus a hash
+    compare. The expensive parts (file replace + nginx reload) only run when
+    the rendered hash actually changed, so a quiet appliance does zero I/O.
+    """
+    global _guards_nginx_sha, _guards_error_logged
+
+    result = render_owui_guards()
+    if not result["ok"]:
+        # Fail-open for the UI, fail-closed for intent: keep the previous file
+        # (never a partial render) and report it. The reconcile loop is
+        # unaffected because it talks to the slot port, not through nginx.
+        if result["error"] != _guards_error_logged:
+            print(f"owui guards: render failed: {result['error']}", flush=True)
+            _guards_error_logged = result["error"]
+        return owui_guard_state(result)
+    _guards_error_logged = None
+
+    render = result["render"]
+    on_disk = _guards_file_sha()
+    if on_disk != render.sha256:
+        if not _write_guards_conf(render.text):
+            return owui_guard_state(result)
+        print(
+            f"owui guards: rendered {len(render.enforced)} enforced "
+            f"({len(render.pending)} pending) sha={render.sha256[:12]}",
+            flush=True,
+        )
+    if on_disk != render.sha256 or _guards_nginx_sha != render.sha256:
+        if reload_nginx():
+            _guards_nginx_sha = render.sha256
+        else:
+            # Leave _guards_nginx_sha alone: the next tick re-attempts the
+            # reload instead of trusting a config nginx never accepted.
+            print("owui guards: nginx reload failed; will retry next tick", flush=True)
+    return owui_guard_state(result)
+
+
+def owui_guard_state(result: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Guard truth for /api/modules and the portal (T4-B: *enforced* means
+    actually served, not merely declared).
+
+    ``rendered`` lists enforced keys only when declared == on-disk == nginx; a
+    mismatch reports an empty list plus ``pending_reason`` so the portal can
+    never paint intent as reality.
+    """
+    if result is None:
+        result = render_owui_guards()
+    render = result.get("render")
+    rendered_sha = _guards_file_sha()
+    declared_sha = result.get("declared_sha")
+    in_sync = bool(result.get("ok")) and rendered_sha == declared_sha == _guards_nginx_sha
+    enforced = list(render.enforced) if (in_sync and render) else []
+    return {
+        "declared": result.get("declared", 0),
+        "declared_sha": declared_sha,
+        "rendered_sha": rendered_sha,
+        "nginx_sha": _guards_nginx_sha,
+        "in_sync": in_sync,
+        "rendered": enforced,
+        "pending": list(render.pending) if render else [],
+        "enforced_count": len(enforced),
+        "pending_reason": result.get("error") or (
+            render.errors[0] if render and render.errors else None
+        ),
+    }
+
+
+def owui_config_export() -> dict[str, Any]:
+    """Live Open WebUI config map for the admin portal (M6.3b Phase 4A).
+
+    Signs in as the CP service identity over trusted headers (the only identity
+    allowed on the slot ports) and reads ``configs/export`` from the active
+    slot. Never raises and returns ``{ok, data, error}``: the portal renders
+    manifest intent when Open WebUI is mid-restart, so an unavailable export is
+    a state to display, not an error to propagate.
+
+    Values come back raw because ``configs/export`` is unredacted; masking is
+    the view's job (``owui_portal``), so nothing here should cache or echo the
+    payload into a log line.
+    """
+    port = _active_port_from_upstream()
+    if not port or not _service_identity_ready:
+        return {"ok": False, "data": None, "error": "open webui is not ready"}
+    try:
+        client = owui_client.OwuiClient(
+            f"http://127.0.0.1:{port}",
+            email_header=OWUI_TRUSTED_EMAIL_HEADER,
+            name_header=OWUI_TRUSTED_NAME_HEADER,
+            groups_header=OWUI_TRUSTED_GROUPS_HEADER,
+            role_header=OWUI_TRUSTED_ROLE_HEADER,
+        )
+        signed = client.sign_in_trusted(
+            OWUI_SERVICE_EMAIL, name=OWUI_SERVICE_NAME, role=OWUI_SERVICE_ROLE
+        )
+        if not signed.get("ok"):
+            return {"ok": False, "data": None,
+                    "error": f"service sign-in failed: {signed.get('error')}"[:200]}
+        result = client.config_export()
+    except Exception as exc:  # noqa: BLE001 — HTTP boundary; the portal degrades
+        return {"ok": False, "data": None, "error": str(exc)[:200]}
+    data = result.get("data")
+    if not result.get("ok") or not isinstance(data, dict):
+        return {"ok": False, "data": None,
+                "error": str(result.get("error") or "export was not a config map")[:200]}
+    return {"ok": True, "data": data, "error": None}
 
 
 def _stop_container(name: str) -> None:
@@ -380,6 +872,280 @@ def ensure_lemon_network() -> tuple[bool, str]:
     if create.returncode != 0:
         return False, (create.stderr or create.stdout or "network create failed").strip()
     return True, "created"
+
+
+# ---------------------------------------------------------------------------
+# M6.3b Phase 4B: admin-triggered intent actions.
+#
+# Two operations an admin can ask for from the portal: re-apply Lemonseed's
+# intent now (T4-E), and rebuild from scratch by dropping Open WebUI's settings
+# table (T4-C/T4-D). Both are manual-only, both are admin-gated twice (nginx
+# `adminGate` + CP `_require_admin`), and neither ever raises into the HTTP
+# handler.
+# ---------------------------------------------------------------------------
+
+# A manual run must be able to do everything the boot run does, or the button is
+# a lie. "manual" exists so a future rule can opt out of boot-time writes.
+MANUAL_RECONCILE_TRIGGERS = frozenset({"at_boot", "manual"})
+# A reset wipes every row, so it is a first-install: fire every cadence.
+RESET_RECONCILE_TRIGGERS = frozenset({"at_boot", "on_upgrade", "manual"})
+# Typed confirmation for the destructive path. Not a secret — a speed bump that
+# makes an accidental click impossible. Compared case-insensitively and kept to
+# one short word: bare-metal review found the long uppercase phrase read as a
+# transcription test rather than a confirmation.
+OWUI_RESET_CONFIRM = "reset"
+
+_reconcile_request_lock = threading.Lock()
+# Progress/last-result of the admin reset: {state, error, at}. The handler
+# returns 202 immediately; the portal reads this from /api/modules (T4-D).
+_owui_reset: dict[str, Any] = {"state": "idle", "error": None, "at": None}
+_owui_reset_lock = threading.Lock()
+
+
+def _iso_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _slot_client(port: int) -> owui_client.OwuiClient:
+    """CP-service-identity transport against a slot port (localhost only)."""
+    return owui_client.OwuiClient(
+        f"http://127.0.0.1:{port}",
+        email_header=OWUI_TRUSTED_EMAIL_HEADER,
+        name_header=OWUI_TRUSTED_NAME_HEADER,
+        groups_header=OWUI_TRUSTED_GROUPS_HEADER,
+        role_header=OWUI_TRUSTED_ROLE_HEADER,
+    )
+
+
+def request_policy_reconcile(
+    triggers: Optional[frozenset[str]] = None,
+) -> dict[str, Any]:
+    """Run a write reconcile now, on behalf of an admin (T4-E).
+
+    This is the seam M6.2b will also use, so it is public rather than a one-off
+    for the portal button. Refusals are values, not exceptions: ``not ready``
+    (nothing to write to yet) and ``in flight`` (non-blocking lock, the same
+    pattern as the CP's other background work).
+    """
+    global _policy_slot_done, _policy_audit_at
+    if not _service_identity_ready:
+        return {"ok": False, "reason": "not ready"}
+    port = _active_port_from_upstream()
+    if not port or not http_ready(port, timeout=3.0):
+        return {"ok": False, "reason": "not ready"}
+    if not _reconcile_request_lock.acquire(blocking=False):
+        return {"ok": False, "reason": "in flight"}
+    try:
+        # Clear the slot marker: _policy_maybe_write skips a slot it already
+        # wrote, and an admin asking again means they want a real run.
+        _policy_slot_done = None
+        result = owui_policy.reconcile(
+            port,
+            frozenset(triggers or MANUAL_RECONCILE_TRIGGERS),
+            _policy_deps(port),
+        )
+    except Exception as exc:  # noqa: BLE001 — HTTP boundary
+        return {"ok": False, "reason": str(exc)[:200]}
+    finally:
+        _reconcile_request_lock.release()
+
+    if result.get("skipped"):
+        return {"ok": False, "reason": "in flight"}
+    if result.get("ok"):
+        _policy_slot_done = (port, _container_name(port))
+        _policy_audit_at = time.monotonic()
+        # This run may have minted the service-account id (first boot), which is
+        # what unblocks the %CP_OWUI_ID% guards.
+        sync_owui_guards()
+    drift = result.get("drift") or {}
+    # Counts only, never entries: the portal's ownership tree is where values
+    # belong (masked, behind the same gating), and an action response is one
+    # more surface a value could leak from.
+    return {
+        "ok": bool(result.get("ok")),
+        "reason": None,
+        "policy_hash": result.get("policy_hash"),
+        "drift": {k: v for k, v in drift.items() if isinstance(v, int)},
+        "last_error": result.get("last_error"),
+    }
+
+
+def owui_reset_state() -> dict[str, Any]:
+    """Reset progress for /api/modules (T4-D: 202 + poll, never a held socket)."""
+    with _owui_reset_lock:
+        return dict(_owui_reset)
+
+
+def _set_owui_reset(state: str, error: Optional[str] = None) -> None:
+    with _owui_reset_lock:
+        _owui_reset.update({"state": state, "error": error, "at": _iso_now()})
+
+
+def reset_owui_config(confirm: str) -> dict[str, Any]:
+    """Admin-only rebuild of Open WebUI's settings from the manifest (T4-C).
+
+    Drops OWUI's ``config`` table and lets a fresh reconcile re-apply every
+    Lemonseed-owned setting, so "the settings are a mess" has an answer that
+    does not require reflashing. Nothing destructive happens without the exact
+    typed confirmation, and it is never automatic (P4-B).
+
+    Returns ``{accepted, reason}`` immediately; the window runs on a daemon
+    thread and reports through ``owui_reset_state()``.
+    """
+    if not isinstance(confirm, str) or confirm.strip().lower() != OWUI_RESET_CONFIRM:
+        return {"accepted": False, "reason": "confirmation text did not match"}
+    if not _service_identity_ready:
+        return {"accepted": False, "reason": "not ready"}
+    active = _active_port_from_upstream()
+    if not active or not http_ready(active, timeout=3.0):
+        return {"accepted": False, "reason": "not ready"}
+    if not _lock.acquire(blocking=False):
+        # A blue/green or a heal owns the slots right now; do not race it.
+        return {"accepted": False, "reason": "a change is already in progress"}
+    # _lock is held for the whole window (released by the worker) so the
+    # supervisor's heal cannot interleave; ensure_open_webui answers "busy".
+    _set_owui_reset("stopping")
+    try:
+        threading.Thread(
+            target=_reset_owui_config_window, name="lemonseed-owui-reset", daemon=True
+        ).start()
+    except OSError as exc:  # noqa: BLE001 — thread never started: unlock here
+        _lock.release()
+        _set_owui_reset("error", str(exc)[:200])
+        return {"accepted": False, "reason": str(exc)[:200]}
+    return {"accepted": True, "reason": None}
+
+
+def _wait_slot_ready(port: int) -> bool:
+    """Wait for stable SPA-asset readiness (the same bar as a normal cutover)."""
+    budget = int(os.environ.get("LEMONSEED_OWUI_READY_SECONDS", "240") or "240")
+    deadline = time.monotonic() + max(30, budget)
+    while time.monotonic() < deadline:
+        if http_ready_stable(port, attempts=3, delay=2.0):
+            return True
+        time.sleep(2)
+    return False
+
+
+def _drop_owui_cp_key() -> bool:
+    """Forget the minted ``sk-`` key.
+
+    Required by a reset, not tidiness: the key is only valid while
+    ``auth.enable_api_keys`` is true, and that row lives in the table we just
+    dropped. With the stale file in place the client 401s and its repair path
+    (re-mint) fails too until the settings are re-applied — so the reset's own
+    reconcile would abort. Without it the client runs on its JWT and mints a
+    fresh key once the settings land.
+    """
+    try:
+        _owui_cp_key_path().unlink(missing_ok=True)
+        return True
+    except OSError as exc:  # noqa: BLE001 — best-effort; the reconcile reports 401s
+        print(f"owui cp key drop: {exc}", flush=True)
+        return False
+
+
+def _restore_last_known_good(port: int) -> bool:
+    """The LKG ladder, wired for the one case it exists for (D1/T4-C): a reset
+    that got as far as wiping config but could not rebuild it."""
+    try:
+        client = _slot_client(port)
+        signed = client.sign_in_trusted(
+            OWUI_SERVICE_EMAIL, name=OWUI_SERVICE_NAME, role=OWUI_SERVICE_ROLE
+        )
+        if not signed.get("ok"):
+            print(f"owui reset: LKG restore skipped (sign-in failed): "
+                  f"{str(signed.get('error'))[:200]}", flush=True)
+            return False
+        outcome = owui_policy.restore_lkg(client)
+    except Exception as exc:  # noqa: BLE001 — the ladder must not add a failure
+        print(f"owui reset: LKG restore failed: {str(exc)[:200]}", flush=True)
+        return False
+    if outcome.get("ok"):
+        print(f"owui reset: restored last-known-good config "
+              f"({outcome.get('restored_keys')} keys)", flush=True)
+        return True
+    print(f"owui reset: LKG restore skipped: {outcome.get('reason')}", flush=True)
+    return False
+
+
+def _reset_owui_config_window() -> None:
+    """The reset window (§6.2), on its own daemon thread.
+
+    Order matters and unit tests assert it: both slots down *before* the
+    truncate (they share one database, so blue/green buys nothing here), then
+    one slot rebuilt and reconciled before anything is allowed to serve it.
+    """
+    global _service_identity_ready, _service_account_id, _policy_slot_done, _state
+
+    candidate = _other_port(_active_port_from_upstream())
+    try:
+        # Interstitial instead of 502s for document requests while we are down.
+        OWUI_READY_FLAG.unlink(missing_ok=True)
+        for port in SLOT_PORTS:
+            _stop_container(_container_name(port))
+
+        _set_owui_reset("clearing")
+        cut = db.truncate_owui_config()
+        if cut.get("state") != "ready":
+            raise RuntimeError(f"could not clear the settings table: {cut.get('error')}")
+        _drop_owui_cp_key()
+        # The identity we remembered was minted against state we just deleted;
+        # force a fresh sign-in against the rebuilt slot.
+        _service_identity_ready = False
+        _service_account_id = None
+        _policy_slot_done = None
+
+        _set_owui_reset("starting")
+        ok, detail = _run_container(candidate, _env_file_path())
+        if not ok:
+            raise RuntimeError(f"could not start the rebuilt chat interface: {detail}")
+        if not _wait_slot_ready(candidate):
+            raise RuntimeError("the rebuilt chat interface did not become ready")
+
+        _set_owui_reset("reconciling")
+        if not ensure_owui_service_identity(candidate):
+            raise RuntimeError("the Lemonseed service account could not be restored")
+        rebuild = owui_policy.reconcile(
+            candidate, RESET_RECONCILE_TRIGGERS, _policy_deps(candidate)
+        )
+        if not rebuild.get("ok"):
+            # Never cut over to an unreconciled slot: a user must not meet the
+            # blank-slate OWUI we just created (decision D1).
+            _restore_last_known_good(candidate)
+            rebuild = owui_policy.reconcile(
+                candidate, RESET_RECONCILE_TRIGGERS, _policy_deps(candidate)
+            )
+            if not rebuild.get("ok"):
+                raise RuntimeError(
+                    "settings could not be re-applied after the reset: "
+                    f"{rebuild.get('last_error')}"
+                )
+
+        _set_owui_reset("cutting over")
+        write_upstream(candidate)
+        if not reload_nginx():
+            # Non-fatal: the slot is healthy and reconciled, and the supervisor
+            # retries the reload on its next tick.
+            print("owui reset: nginx reload failed after cutover; supervisor will retry",
+                  flush=True)
+        sync_owui_guards()
+        _state = {
+            "state": "ready",
+            "image": OWUI_IMAGE,
+            "port": candidate,
+            "container": _container_name(candidate),
+            "path": OWUI_EMBED_PATH,
+        }
+        _set_owui_reset("ready")
+        print(f"owui reset: settings rebuilt on port {candidate}", flush=True)
+    except Exception as exc:  # noqa: BLE001 — reported via owui_reset_state()
+        detail = str(exc)[:300]
+        _set_owui_reset("error", detail)
+        _state = {"state": "error", "error": detail, "phase": "reset"}
+        print(f"owui reset: failed: {detail}", flush=True)
+    finally:
+        _lock.release()
 
 
 def _run_container(port: int, env_path: Path) -> tuple[bool, str]:
@@ -521,10 +1287,14 @@ def ensure_open_webui(*, force_update: bool = False) -> dict[str, Any]:
         active_name = _container_name(active)
         running = _container_running(active_name)
         active_ready = http_ready(active)
-        env_ok = _policy_env_ok(active_name, env)
+        env_ok = _bootstrap_env_ok(active_name, _container_env_subset(env))
 
         # Sticky ready: serving HTTP with expected env — never touch it.
         if not force_update and active_ready and env_ok:
+            # Covers "booted before CP restart / first provisioning failed":
+            # retry cheaply (one localhost POST) until the seat is ours.
+            if ensure_owui_service_identity(active):
+                _policy_maybe_write(active, active_name)
             _state = {
                 "state": "ready",
                 "image": OWUI_IMAGE,
@@ -537,6 +1307,12 @@ def ensure_open_webui(*, force_update: bool = False) -> dict[str, Any]:
         # Healthy HTTP but stale env (policy bump after lemonseed-update) → recreate.
         # Mark starting immediately so the shell hides the old iframe before cutover.
         if not force_update and active_ready and not env_ok:
+            print(
+                f"owui env: {active_name} stale: "
+                f"{_bootstrap_env_drift(active_name, _container_env_subset(env))}; "
+                "recreating",
+                flush=True,
+            )
             force_update = True
             _state = {
                 "state": "starting",
@@ -616,6 +1392,15 @@ def ensure_open_webui(*, force_update: bool = False) -> dict[str, Any]:
             }
             return dict(_state)
 
+        # Take the primary-admin seat before cutover so no household user can
+        # sign in as OWUI's first user first (M6.3b).
+        if ensure_owui_service_identity(candidate):
+            # Reconcile the candidate slot before it serves anyone (D1: users
+            # never see a blank-slate OWUI); users can't reach it yet.
+            _policy_maybe_write(candidate, _container_name(candidate))
+
+        print(f"owui: cutover -> port {candidate} "
+              f"container {_container_name(candidate)}", flush=True)
         write_upstream(candidate)
         if not reload_nginx():
             # Keep the old slot running — cutting over without a reload leaves
@@ -671,6 +1456,14 @@ def supervise_modules_once() -> dict[str, Any]:
     """
     global _state, _health_fail_count
 
+    # Guards first: they must be in place before an admin can reach the OWUI UI
+    # on this tick, and cheap enough to evaluate every time (render + hash
+    # compare; the write and the reload are behind that compare).
+    try:
+        sync_owui_guards()
+    except Exception as exc:  # noqa: BLE001 — never kill the supervisor
+        print(f"owui guards: sync failed: {str(exc)[:200]}", flush=True)
+
     active = _active_port_from_upstream()
     name = _container_name(active)
     running = _container_running(name)
@@ -688,7 +1481,9 @@ def supervise_modules_once() -> dict[str, Any]:
 
     if running and ready:
         _health_fail_count = 0
-        return ensure_open_webui(force_update=False)
+        result = ensure_open_webui(force_update=False)
+        _policy_maybe_audit(active, name)
+        return result
 
     if not running:
         prev = _health_fail_count
@@ -747,11 +1542,18 @@ def modules_snapshot() -> dict[str, Any]:
     # Always report the live probe — never fake http_ready while nginx 502s.
     probe_ready = http_ready(active, timeout=1.5)
     lifecycle = str(snap.get("state") or "idle")
+    reset = owui_reset_state()
+    # A reset window means both slots are down at some point and the config
+    # table is empty; treat it like a blue/green so the shell waits on the
+    # interstitial instead of riding a half-configured 200.
+    resetting = reset.get("state") not in ("idle", "ready", "error")
     # During pull/start/replace, keep the shell on Getting Ready even if the
     # old slot still answers HTTP (policy blue/green after lemonseed-update).
-    updating = lifecycle in ("pulling", "starting", "busy", "waiting")
+    updating = resetting or lifecycle in ("pulling", "starting", "busy", "waiting")
     ready = bool(probe_ready and not updating)
-    if updating:
+    if resetting:
+        state = "resetting"
+    elif updating:
         state = lifecycle
     elif ready:
         state = "ready"
@@ -772,9 +1574,21 @@ def modules_snapshot() -> dict[str, Any]:
         "port": snap.get("port", active),
         "path": OWUI_EMBED_PATH,
         "http_ready": ready,
+        "service_ready": _service_identity_ready,
         "workflow": workflow,
         "task": task,
     }
+    if _service_account_id:
+        owui["service_account_id"] = _service_account_id
+    # M6.3b: manifest reconcile state — the shell's third iframe-gate
+    # condition and the Phase-4 portal tree payload. cp_pid tags the CP
+    # process generation so host-side smoke can spot a mid-run CP restart.
+    owui["owui_policy"] = {**owui_policy.state_summary(), "cp_pid": os.getpid()}
+    # M6.3b Phase 4B: declared vs *served* guard state, and reset progress.
+    # No config values in either, but they stay inside the same auth gating.
+    owui["owui_guards"] = owui_guard_state()
+    if reset.get("state") != "idle":
+        owui["owui_reset"] = reset
     if snap.get("error"):
         owui["error"] = snap["error"]
     if snap.get("reason") and not ready:
@@ -785,6 +1599,8 @@ def modules_snapshot() -> dict[str, Any]:
 
 
 def _owui_progress_copy(state: str, tag: str, snap: dict[str, Any]) -> tuple[str, str]:
+    if state == "resetting":
+        return "Configuring chat", "Rebuilding the chat interface settings"
     if state == "pulling" or snap.get("phase") == "pull":
         return "Configuring chat", f"Pulling the Open WebUI {tag} container"
     if state in ("starting", "busy"):

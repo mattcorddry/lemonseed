@@ -9,6 +9,7 @@
   lib,
   pkgs,
   lemonadePackage,
+  nix-amd-ai,
   ...
 }:
 
@@ -39,8 +40,49 @@ let
   # keep the image lean for constrained profiles (QEMU = cpu only).
   enableCuda = cfg.llamacppBackend == "cuda" || cfg.llamacppBackend == "auto";
   enableVulkan = cfg.llamacppBackend == "vulkan" || cfg.llamacppBackend == "auto";
-  llamaCppCuda = pkgs.llama-cpp.override { cudaSupport = true; };
-  llamaCppVulkan = pkgs.llama-cpp.override { vulkanSupport = true; };
+
+  # llama.cpp MUST track the version Lemonade 11.5.2 is built and pinned
+  # against (b10273, per the lemonade package's backend_versions.json). An
+  # independent older build breaks on new GGUF architectures (first casualty:
+  # "eagle3" in newer GPT-OSS GGUFs, absent from b9190) and on multi-slot
+  # server bugs (b9190's common_context_seq_rm aborts on lemond's
+  # update_slots path — NVIDIA crash loop). These packages are built against
+  # nix-amd-ai's pinned nixpkgs (the same one lemonadePackage uses) and carry
+  # their patches (e.g. the RDNA3.5 numerics fix from llama.cpp#28211).
+  #
+  # nix-amd-ai ships CPU (llama-cpp) and Vulkan (llama-cpp-vulkan) builds of
+  # the pinned b10273. It does NOT ship a CUDA build (b10236, a separate
+  # lemonade-sdk release with sm_120/Blackwell codegen). We therefore build
+  # llama-cpp from source with the *same pinned build number* — not from
+  # nixpkgs' drifting version (b9190 on 26.05). Bump LLAMA_BUILD_NUMBER
+  # together with the nix-amd-ai flake ref when rebasing; never let the CUDA
+  # build number drift from the Vulkan/CPU ones.
+  nixAmdPkgs = nix-amd-ai.packages.${pkgs.stdenv.hostPlatform.system} or nix-amd-ai.packages.x86_64-linux or nix-amd-ai.packages.aarch64-darwin;
+  # Must equal the "cuda" entry in lemonade's backend_versions.json (b10236
+  # for Lemonade 11.5.2). nixpkgs' llama-cpp no longer accepts a `buildNumber`
+  # override (the argument was removed when the package moved to a single
+  # hardcoded version), so we pin `version` + `src` directly to the b10236
+  # tag to track Lemonade's curated CUDA release instead of the nixpkgs
+  # channel version (b9190 on 26.05).
+  LLAMA_BUILD_NUMBER = 10236;
+  LLAMA_BUILD_NUMBER_STR = builtins.toString LLAMA_BUILD_NUMBER;
+  llamaCppCuda = (pkgs.llama-cpp.overrideAttrs (final: prev: {
+    version = LLAMA_BUILD_NUMBER_STR;
+    npmDepsHash = "sha256-B7uEynAG70a3xauBKc20RuFa9cnWaWzVBCh+LPLBnIM=";
+    src = pkgs.fetchFromGitHub {
+      owner = "ggml-org";
+      repo = "llama.cpp";
+      tag = "b${LLAMA_BUILD_NUMBER_STR}";
+      hash = "sha256-iIN2Y4I8pc6pImY8q8fnFZ6jyIzaccZHaAWf34QbAs8=";
+      leaveDotGit = true;
+      postFetch = ''
+        git -C "$out" rev-parse --short HEAD > $out/COMMIT
+        find "$out" -name .git -print0 | xargs -0 rm -rf
+      '';
+    };
+  })).override { cudaSupport = true; };
+  llamaCppVulkan = nixAmdPkgs.llama-cpp-vulkan;
+  llamaCppCpu = nixAmdPkgs.llama-cpp;
 
   sourceApiKey = ''
     if [ "''${EUID:-$(id -u)}" -eq 0 ] && [ -r ${envFile} ]; then
@@ -63,6 +105,11 @@ let
     no_fetch_executables = true;
     models_dir = modelsDir;
     max_loaded_models = 1;
+    # Upstream ships auto_check_model_updates=true, which re-fetches a model
+    # whenever its upstream revision moves. On an appliance that turns a reboot
+    # into a multi-gigabyte download and can fail outright offline; the cache is
+    # the product here, so weights are only ever fetched on an admin's choice.
+    auto_check_model_updates = false;
     llamacpp = {
       backend = lemondBackend;
       prefer_system = false;
@@ -130,6 +177,7 @@ let
           | .no_broadcast = true
           | .no_fetch_executables = true
           | .models_dir = $models
+          | .auto_check_model_updates = false
           | .llamacpp.backend = $backend
           | .llamacpp.prefer_system = false
           | .llamacpp.cpu_bin = $cpu
@@ -234,7 +282,7 @@ in
     environment.etc =
       {
         "lemonseed/lemond-backends/llamacpp-cpu".source =
-          "${pkgs.llama-cpp}/bin/llama-server";
+          "${llamaCppCpu}/bin/llama-server";
         "lemonseed/lemond.env-path".text = "${envFile}\n";
         "profile.d/lemonseed-lemond.sh".text = sourceApiKey;
       }

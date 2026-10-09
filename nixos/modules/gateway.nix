@@ -118,6 +118,17 @@ let
     include /run/lemonseed/auth-admin.conf;
   '';
 
+  # M6.3b Phase 4B: Lemonseed-managed Open WebUI paths, refused at the edge.
+  # The control plane renders this file from owui-policy.json; it is seeded
+  # empty, so a boot where the CP never ran blocks nothing (fail-open for the
+  # admin UI, while intent stays enforced by the reconcile loop).
+  # `if` + `return` runs in nginx's rewrite phase — before the auth_request in
+  # authGate — which is why an anonymous caller gets 403 rather than a login
+  # redirect on a guarded path (decision T4-A).
+  owuiGuards = ''
+    include /run/lemonseed/owui-guards.conf;
+  '';
+
   cpProxy = ''
     proxy_http_version 1.1;
     proxy_set_header Host $host;
@@ -189,7 +200,7 @@ let
     text = ''
       set -euo pipefail
       install -d -m 0755 /run/lemonseed
-      for f in auth-gate.conf auth-admin.conf; do
+      for f in auth-gate.conf auth-admin.conf owui-guards.conf; do
         if [[ ! -e /run/lemonseed/$f ]]; then
           : > /run/lemonseed/$f
           chmod 0644 /run/lemonseed/$f
@@ -439,6 +450,50 @@ in
         proxyPass = "http://127.0.0.1:8080";
         extraConfig = "${authGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
       };
+      # Model picker (M6.5): GET reads families + best-fit; POST records the
+      # user's choice and is admin-gated in the CP (like /settings/).
+      # Namespaced under /_lemonseed/ (not /api/models) so it does not shadow
+      # Open WebUI's own /api/models — the OWUI frontend needs that path for
+      # its OpenAI-style model list; the exact-match /api/models location used
+      # to win and silently returned the CP's picker payload to OWUI.
+      locations."= /_lemonseed/api/models" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+      };
+      # Open WebUI config ownership view (M6.3b 4A). Exact match so OWUI still
+      # owns every other path; admin-gated here *and* in the CP, because the
+      # payload merges Open WebUI's (unredacted) config export.
+      locations."= /_lemonseed/api/owui/config" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+      };
+      # Phase 4B admin actions (M6.3b): re-apply Lemonseed's intent now, and the
+      # config reset window. Same double gating as the ownership view. The reset
+      # handler returns 202 immediately and reports through /api/modules, so
+      # there is no long-held connection to time out here.
+      locations."= /_lemonseed/api/owui/reconcile" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+      };
+      locations."= /_lemonseed/api/owui/reset-config" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+      };
+      # GC e2e test endpoints (admin-gated): disk filler + cached-model list.
+      # Used by scripts/qemu-api-smoke-test.sh (QEMU_E2E_GC=1) to exercise the
+      # LRU model-eviction path; fill writes a large file to /var/tmp only.
+      locations."= /_lemonseed/api/gc-test/fill" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+      };
+      locations."= /_lemonseed/api/gc-test/fill/remove" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+      };
+      locations."= /_lemonseed/api/gc-test/models" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+      };
       locations."= /api/data" = {
         proxyPass = "http://127.0.0.1:8080";
         extraConfig = "${authGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
@@ -489,9 +544,24 @@ in
       };
 
       # Everything else (SPA assets, OWUI /api/v1, /c/…, …) → Open WebUI. [gated]
+      #
+      # This is the only location that carries the managed-path guards: every
+      # Open WebUI REST path (/api/v1, /openai, /ollama) is matched here, so one
+      # include covers the whole UI surface and "which requests are guarded?"
+      # stays answerable from one line. /ws/ deliberately has none (Socket.IO
+      # is the chat data path and mounts at /ws/socket.io).
+      #
+      # ``default_type`` is set here (not in the guard ``if``, where nginx
+      # rejects it) so a guard's JSON denial body is served as
+      # application/json and Open WebUI's client can read ``detail``; with the
+      # default text/plain it renders its own generic connection error instead
+      # of the reason. Nothing else in this location generates its own body —
+      # the auth gate 401s to @auth_unauthorized and upstream failures go to
+      # @owui_loading, both named locations with their own defaults — so the
+      # only responses this relabels are proxied ones that omit Content-Type.
       locations."/" = {
         proxyPass = "http://lemonseed_owui";
-        extraConfig = "${authGate}\nerror_page 502 503 504 = @owui_loading;\n${owuiProxy}";
+        extraConfig = "    default_type application/json;\n${owuiGuards}\n${authGate}\nerror_page 502 503 504 = @owui_loading;\n${owuiProxy}";
       };
     };
   };

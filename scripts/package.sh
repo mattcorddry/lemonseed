@@ -8,10 +8,15 @@ cd "${ROOT}"
 "${ROOT}/scripts/check-untracked.sh"
 
 if ! command -v nix >/dev/null 2>&1; then
-  # Multi-user Nix install default location (not a project path).
-  if [[ -x /nix/var/nix/profiles/default/bin/nix ]]; then
-    export PATH="/nix/var/nix/profiles/default/bin:${PATH}"
-  else
+  # Nix install default locations (not project paths): multi-user first,
+  # then the single-user profile (e.g. dev boxes with ~/.nix-profile).
+  for nix_bin in /nix/var/nix/profiles/default/bin/nix "${HOME}/.nix-profile/bin/nix"; do
+    if [[ -x "${nix_bin}" ]]; then
+      export PATH="$(dirname "${nix_bin}"):${PATH}"
+      break
+    fi
+  done
+  if ! command -v nix >/dev/null 2>&1; then
     echo "nix not found on PATH; source the Nix profile or install Nix" >&2
     exit 1
   fi

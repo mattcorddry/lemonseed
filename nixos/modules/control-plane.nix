@@ -1,6 +1,6 @@
 # Control plane on localhost:8080 (public entry is nginx :80).
 
-{ config, lib, pkgs, lemonadePackage, ... }:
+{ config, lib, pkgs, lemonadePackage, lemonadePythonSdk, ... }:
 
 let
   cpSrc = ../../control-plane;
@@ -8,7 +8,9 @@ let
   cpRoot = pkgs.runCommand "lemonseed-control-plane-src" { } ''
     mkdir -p "$out/catalog" "$out/static/brand"
     cp ${cpSrc}/stub.py ${cpSrc}/hardware.py ${cpSrc}/catalog.py ${cpSrc}/chat_ready.py \
-       ${cpSrc}/db.py ${cpSrc}/data_services.py ${cpSrc}/modules.py ${cpSrc}/auth.py "$out/"
+       ${cpSrc}/db.py ${cpSrc}/data_services.py ${cpSrc}/modules.py ${cpSrc}/auth.py \
+       ${cpSrc}/model_store.py ${cpSrc}/lemond_client.py ${cpSrc}/owui_client.py \
+       ${cpSrc}/owui_policy.py ${cpSrc}/owui_portal.py ${cpSrc}/owui-policy.json "$out/"
     cp ${cpSrc}/catalog/models.json "$out/catalog/"
     cp -r ${cpSrc}/static/brand/. "$out/static/brand/"
     # GRUB template for the A/B updater to refresh on the ESP (the installed
@@ -17,7 +19,7 @@ let
     cp ${bootSrc}/grub.cfg "$out/lemonseed/grub.cfg"
   '';
 
-  pythonEnv = pkgs.python3.withPackages (ps: [ ps.psycopg2 ps.bcrypt ]);
+  pythonEnv = pkgs.python3.withPackages (ps: [ ps.psycopg2 ps.bcrypt ps.requests lemonadePythonSdk ]);
 
   controlPlane = pkgs.writeShellApplication {
     name = "appliance-control-plane";
@@ -67,6 +69,10 @@ in
     ];
     serviceConfig = {
       Type = "simple";
+      # Suppress kernel console spam (e.g. NVRM "No NVIDIA GPU found") below
+      # crit level. Journald still captures everything; the console is not the
+      # debug channel.
+      ExecStartPre = [ "${pkgs.util-linux}/bin/dmesg -n crit" ];
       ExecStart = "${controlPlane}/bin/appliance-control-plane";
       Restart = "on-failure";
       RestartSec = "2s";

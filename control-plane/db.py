@@ -13,7 +13,7 @@ POSTGRES_ENV = Path("/var/lib/lemonseed/data/secrets/postgres.env")
 SECRETS_MODULES = Path("/var/lib/lemonseed/data/secrets/modules")
 CP_DB_NAME = "lemonseed_cp"
 CP_ROLE = "lemonseed_cp"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 RESERVED_MODULES = (
     {
@@ -188,6 +188,19 @@ def _apply_cp_schema(conn) -> None:
             )
             """
         )
+        # M6.3b: last-known-good OWUI config snapshot (single slot). Deliberately
+        # outside the OWUI database so it survives a broken/wiped OWUI DB.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS owui_config_lkg (
+              id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+              policy_hash TEXT NOT NULL,
+              owui_version TEXT NOT NULL,
+              config_map JSONB NOT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
         cur.execute(
             """
             INSERT INTO cp_meta (key, value)
@@ -302,3 +315,36 @@ def cp_set_meta(key: str, value: Any) -> bool:
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+# Open WebUI's own database name (see RESERVED_MODULES): the reset window in
+# modules.py needs it, and spelling it out here keeps the connection target and
+# the statement in one testable place.
+OWUI_DB_NAME = "open_webui"
+
+
+def truncate_owui_config() -> dict:
+    """Drop Open WebUI's config table (M6.3b Phase 4B admin reset).
+
+    The narrowest thing that satisfies "forget every setting": ``config`` holds
+    OWUI's settings map and nothing else — chats, models, files and accounts all
+    live in other tables, so a reset cannot lose user data.
+
+    Uses the postgres superuser (``_connect`` reads admin creds from
+    ``postgres.env``) rather than the module role, because TRUNCATE on a
+    customer-owned table should not be a right we hand to the app user.
+    Never raises: the caller is an admin-triggered flow that must report
+    failure, not die. Returns ``{"state": ..., "error": ...}``.
+    """
+    if not postgres_admin_dsn() or not pg_isready():
+        return {"state": "error", "error": "postgres is not available"}
+    try:
+        conn = _connect(OWUI_DB_NAME)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE TABLE config")
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 — service boundary; caller reports
+        return {"state": "error", "error": str(exc)[:300]}
+    return {"state": "ready", "error": None}

@@ -6,6 +6,7 @@ import json
 import re
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any, Optional
 
@@ -14,6 +15,16 @@ from urllib.request import Request, urlopen
 LEMOND_ENV_FILE = Path("/var/lib/lemonseed/lemonade/lemond.env")
 HARDWARE_CACHE = Path("/run/appliance/hardware.json")
 MODELS_DIR = Path("/var/lib/lemonseed/models")
+
+# GPU inventory is static for the lifetime of a boot — GPUs cannot appear or
+# disappear without a reboot. We therefore probe the expensive external tools
+# (nvidia-smi, llama-cli, vulkaninfo) exactly once per boot and serve every
+# later collect_hardware() call from the cache. Without this, the portal's
+# 5s /api/status poll + settings page reload would re-run nvidia-smi on an AMD
+# box (where it fails and spams the console) on every poll.
+_GPU_LOCK = threading.Lock()
+_GPU_CACHE: list[dict[str, Any]] = []
+_GPU_COLLECTED = False
 
 
 def _read_text(path: Path) -> Optional[str]:
@@ -86,7 +97,11 @@ def _mem_total_gb() -> float:
         for line in raw.splitlines():
             if line.startswith("MemTotal:"):
                 kb = int(line.split()[1])
-                return round(kb / (1024 * 1024), 2)
+                # Round to the nearest whole GiB: MemTotal is always below the
+                # installed DIMM size (kernel reservation, PCIe/VA space, iGPU
+                # GTT carve-out), and 8 GiB boxes report ~7.6–7.7. Nearest-GB
+                # keeps fit floors honest without over-crediting.
+                return float(round(kb / (1024 * 1024)))
     except (OSError, ValueError):
         pass
     return 0.0
@@ -271,6 +286,54 @@ def _gpus_from_system_info(info: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _collect_gpus() -> list[dict[str, Any]]:
+    """Probe external tools once per boot and cache the GPU inventory.
+
+    Safe to call from any thread: the first caller does the (slow) probe and
+    every later caller returns the cached result. lemond system-info is still
+    fetched fresh each time (it is a cheap localhost HTTP call and reflects
+    live model/backend state), but the GPU *inventory* is boot-static.
+
+    An empty result is NOT cached: at first boot the GPU driver (nvidia-smi,
+    Vulkan ICD) may not be ready when the CP starts. Caching an empty list
+    would permanently hide the GPU. We re-probe until a GPU is found or the
+    system has been up long enough that the driver will not appear late.
+    """
+    global _GPU_CACHE, _GPU_COLLECTED
+    with _GPU_LOCK:
+        if _GPU_COLLECTED:
+            return list(_GPU_CACHE)
+        gpus: list[dict[str, Any]] = []
+        system_info = _lemond_get("/v1/system-info", timeout=5.0)
+        healthy = isinstance(system_info, dict) and bool(system_info)
+        info = system_info if healthy else {}
+        gpus = _gpus_from_system_info(info) or _nvidia_gpus_smi()
+        # lemond 11.5's system-info reports NVIDIA only; add AMD Vulkan devices
+        # so an AMD box is not mistaken for "no GPU". Prefer llama-cli (reports
+        # real GTT/VRAM) over vulkaninfo (no memory size). De-dupe by name
+        # (the same physical GPU may be reported by both nvidia-smi and the
+        # Vulkan probe with different vendor labels).
+        seen = {g.get("name") for g in gpus}
+        for gpu in _amd_gpus_llama_cli() or _amd_gpus_vulkaninfo():
+            if gpu.get("name") not in seen:
+                gpus.append(gpu)
+                seen.add(gpu.get("name"))
+        _GPU_CACHE = gpus
+        # Only cache a non-empty result. An empty result means the driver may
+        # not be ready yet (first boot race); re-probe on the next call.
+        if gpus:
+            _GPU_COLLECTED = True
+        return list(gpus)
+
+
+def refresh_gpus() -> list[dict[str, Any]]:
+    """Force a fresh GPU probe (used once at CP startup after boot)."""
+    global _GPU_CACHE, _GPU_COLLECTED
+    with _GPU_LOCK:
+        _GPU_COLLECTED = False
+    return _collect_gpus()
+
+
 def _disk_free(path: Path) -> dict[str, int]:
     try:
         usage = shutil.disk_usage(path if path.exists() else path.parent)
@@ -285,20 +348,16 @@ def _disk_free(path: Path) -> dict[str, int]:
 
 
 def collect_hardware() -> dict[str, Any]:
-    """Build the Lemonseed hardware report; proxy lemond system-info when healthy."""
+    """Build the Lemonseed hardware report; proxy lemond system-info when healthy.
+
+    GPU inventory is cached for the boot (see _collect_gpus); only lemond
+    health, CPU, RAM, and disk are re-read each call.
+    """
     system_info = _lemond_get("/v1/system-info", timeout=5.0)
     healthy = isinstance(system_info, dict) and bool(system_info)
     info = system_info if healthy else {}
 
-    gpus = _gpus_from_system_info(info) or _nvidia_gpus_smi()
-    # lemond 11.5's system-info reports NVIDIA only; add AMD Vulkan devices so
-    # an AMD box is not mistaken for "no GPU". Prefer llama-cli (reports real
-    # GTT/VRAM) over vulkaninfo (no memory size). De-dupe by (vendor, name).
-    seen = {(g.get("vendor"), g.get("name")) for g in gpus}
-    for gpu in _amd_gpus_llama_cli() or _amd_gpus_vulkaninfo():
-        if (gpu.get("vendor"), gpu.get("name")) not in seen:
-            gpus.append(gpu)
-            seen.add((gpu.get("vendor"), gpu.get("name")))
+    gpus = _collect_gpus()
     cpu = _cpu_info()
     # Prefer lemond CPU fields when present.
     dev_cpu = (info.get("devices") or {}).get("cpu") or {}

@@ -4,12 +4,15 @@
 { lib, pkgs, ... }:
 
 let
-  # Forward journal to the serial console so `make test-qemu` captures
+  # Forward the journal to the SERIAL tty so `make test-qemu` captures
   # journald in the serial log (no console access to log in otherwise).
+  # TTYPath must be /dev/ttyS0: with console=tty0 last in kernelParams,
+  # /dev/console is the virtual terminal, invisible to the smoke harness.
+  # Drop-in under etc (a systemd.services ExtraConfig key is not valid).
   journaldConf = pkgs.writeText "journald-console.conf" ''
     [Journal]
     ForwardToConsole=yes
-    TTYPath=/dev/console
+    TTYPath=/dev/ttyS0
     MaxLevelConsole=info
   '';
 in
@@ -38,7 +41,5 @@ in
   users.users.root.hashedPassword = lib.mkForce ""; # empty password in qemu only
 
   # Console logging for the smoke-test serial log (see journaldConf).
-  systemd.services.systemd-journald.serviceConfig = {
-    ExtraConfig = [ journaldConf ];
-  };
+  environment.etc."systemd/journald.conf.d/lemonseed-console.conf".source = journaldConf;
 }

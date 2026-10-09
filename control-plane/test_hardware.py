@@ -262,14 +262,19 @@ class PlanModelTests(unittest.TestCase):
     def test_amd_vulkan_zero_vram_selects_small_model(self) -> None:
         # AMD Vulkan reports vram_gb=0; the planner must still select a model
         # (VRAM fit is delegated to lemond at load time) rather than bailing.
+        # With 32 GiB RAM the best Gemma that fits is 26B-A4B (20+10 <= 32);
+        # 31B needs 36 GiB.
         plan = catalog.plan_model(self._hw([{"vendor": "amd", "name": "RX 6800", "vram_gb": 0}]))
         self.assertEqual(plan["state"], "selected")
-        self.assertIsNotNone(plan["selection"])
+        self.assertEqual(plan["selection"]["id"], "Gemma-4-26B-A4B-it-GGUF")
 
-    def test_no_gpu_not_ready(self) -> None:
+    def test_no_gpu_cpu_inference_selects(self) -> None:
+        # 32 GiB RAM, no GPU: CPU inference is supported; the planner picks
+        # the largest model that fits in system RAM (weights + overhead).
         plan = catalog.plan_model(self._hw([]))
-        self.assertEqual(plan["state"], "not-ready")
-        self.assertIn("No GPU", plan["reason"])
+        self.assertEqual(plan["state"], "selected")
+        self.assertIsNotNone(plan["selection"])
+        self.assertIn("CPU inference", plan["reason"])
 
     def test_nvidia_cuda_unsupported_not_ready(self) -> None:
         plan = catalog.plan_model(

@@ -47,6 +47,21 @@ RATE_LIMIT_LOCKOUT_SECONDS = 900  # 15 min
 
 _USERNAME_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
 
+# Synthetic email domain for every portal identity (M6.3b). The appliance never
+# sends mail, so the domain only has to satisfy Open WebUI's format check — it
+# requires a dot in the domain but explicitly exempts ``@localhost``. That rules
+# out ``@lemonseed`` (rejected by ``POST /api/v1/auths/add``, so OWUI's own admin
+# UI could never create or edit such a row) and hostname-derived addresses, which
+# would have to be re-derived after the box renames itself following the factory
+# mDNS handoff — and OWUI keys identity on email, so a change duplicates the
+# account instead of renaming it.
+OWUI_EMAIL_DOMAIN = "localhost"
+
+
+def owui_email(username: str) -> str:
+    """Identity email for a portal username (see OWUI_EMAIL_DOMAIN)."""
+    return f"{username}@{OWUI_EMAIL_DOMAIN}"
+
 # Set only from auth_request_set (CP session-verify response headers) — never
 # from the client. Empty pre-auth → nginx omits the header entirely.
 GATE_SNIPPET = """\
@@ -325,6 +340,42 @@ def role(groups: list[str]) -> str:
     return "admin" if ADMIN_GROUP in {g.strip() for g in groups if g.strip()} else "user"
 
 
+def owui_identities() -> list[dict[str, Any]]:
+    """Reconcile intent for Open WebUI (M6.3b users collection).
+
+    One entry per user row: email is the join key (``owui_email(username)``,
+    or the row's own email when it has one) and is_admin mirrors admin-group
+    membership.
+    Empty list when Postgres is unavailable — the reconcile loop treats that
+    as "no identity truth this run" and skips user writes (users' desired set
+    empty means OWUI accounts only show as drift, never deletions).
+    """
+    if not _pg_ready():
+        return []
+    try:
+        conn = db.cp_connect()
+    except Exception:  # noqa: BLE001 — reconcile boundary
+        return []
+    try:
+        rows = _load_users(conn)
+    except Exception:  # noqa: BLE001 — reconcile boundary
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return [
+        {
+            "email": str(row.get("email") or owui_email(row["username"])),
+            "name": str(row.get("display_name") or row["username"]),
+            "is_admin": ADMIN_GROUP in (row.get("groups") or []),
+            "disabled": bool(row.get("disabled")),
+        }
+        for row in rows
+    ]
+
+
 def account_counts() -> tuple[Optional[int], Optional[int]]:
     """(user_count, enabled_admin_count) or (None, None) when PG is not ready."""
     if not _pg_ready():
@@ -406,7 +457,7 @@ def create_admin(username: str, password: str) -> dict[str, Any]:
     # OWUI trusted-header auth keys identity on email; the setup form has no
     # email field, so derive a deterministic local-part fallback to guarantee a
     # non-empty identity (and a stable one across re-logins / resets).
-    email = f"{username}@lemonseed.local"
+    email = owui_email(username)
 
     reset = reset_marker_present()
     password_hash = hash_password(password)
@@ -419,12 +470,17 @@ def create_admin(username: str, password: str) -> dict[str, Any]:
             )
         time.sleep(2)
 
+    # Provisioning (CP + module databases) may still be running even once
+    # Postgres accepts connections; wait it out under the same deadline.
     provision = data_services.ensure_provisioned()
-    if provision.get("state") != "ready":
-        raise ValueError(
-            f"data services are not ready yet ({provision.get('state')}); "
-            "wait a minute and submit setup again"
-        )
+    while provision.get("state") != "ready":
+        if time.monotonic() > deadline:
+            raise ValueError(
+                f"data services are not ready yet ({provision.get('state')}); "
+                "wait a minute and submit setup again"
+            )
+        time.sleep(2)
+        provision = data_services.ensure_provisioned()
 
     try:
         conn = db.cp_connect()

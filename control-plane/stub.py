@@ -8,11 +8,14 @@ Listens on 127.0.0.1:8080 behind nginx :80.
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
 import shlex
 import subprocess
+import sys
+import threading
 import time
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,10 +26,13 @@ from urllib.request import Request, urlopen
 from zoneinfo import available_timezones
 
 import auth
+import catalog
 import chat_ready
 import data_services
 import hardware
 import modules
+import owui_policy
+import owui_portal
 from catalog import plan_model
 
 
@@ -503,7 +509,7 @@ input, select {
 }
 .frame-fallback.hidden { display: none; }
 .landing {
-  max-width: 28rem; margin: 0 auto; padding: 1.5rem;
+  max-width: 32rem; margin: 0 auto; padding: 1.5rem;
   border: 1px solid var(--line); border-radius: 16px;
   background: rgba(15, 28, 24, 0.72);
   text-align: left;
@@ -803,7 +809,7 @@ def page_shell(snap: dict[str, Any], *, view: str = "chat") -> bytes:
     body = f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>{name}</title>{brand_head_links()}<style>{STYLE}</style>
+<title>{name}</title>{brand_head_links()}<style>{STYLE}{SETTINGS_MODEL_PICKER_CSS}</style>
 </head><body>
 <main class="app-shell">
 <header class="app-bar">
@@ -829,10 +835,13 @@ def page_shell(snap: dict[str, Any], *, view: str = "chat") -> bytes:
 </header>
 <div class="frame-wrap">
 <div class="frame-fallback {landing_class}" id="chat-fallback">
-  <div class="landing">
+  <div class="landing" id="landing-card">
     <h2 id="landing-title">Getting Ready</h2>
     <p id="landing-lede">Preparing this appliance…</p>
     <p class="status-line wait" id="landing-status">Starting…</p>
+    <div id="landing-picker" hidden>
+      <div id="landing-cards" class="model-cards"></div>
+    </div>
   </div>
 </div>
 <iframe id="chat-frame" class="{chat_frame_class}" title="Chat" src="about:blank" allow="clipboard-read; clipboard-write"></iframe>
@@ -842,6 +851,12 @@ def page_shell(snap: dict[str, Any], *, view: str = "chat") -> bytes:
 <script>
 let currentView = {json.dumps(view)};
 let chatBootstrapped = false;
+// Deep links point the OWUI iframe at an admin route. showChatFrame returns the
+// frame to the chat entry point when the admin clicks Chat themselves, but that
+// reset must not swallow the switch the admin just asked for -- bare-metal
+// review found "Open … workspace" landing back on the chat page because this
+// switch was indistinguishable from a Chat-tab click.
+let chatOverridden = false;
 let readyStreak = 0;
 const CHAT_SRC = '/?embed=1';
 const SETTINGS_SRC = '/settings/content/';
@@ -851,13 +866,37 @@ function landingCopy(chat, owui) {{
   const ui = owui.state || 'idle';
   const httpReady = !!owui.http_ready;
   const modelReady = chatState === 'ready';
-  const uiReady = ui === 'ready' && httpReady;
+  // M6.3b third gate: OWUI must be reconciled to Lemonseed intent before
+  // anyone sees it (no blank-slate chat interface — decision D1).
+  const policy = owui.owui_policy || {{}};
+  const policyOk = policy.ok === true;
+  const uiReady = ui === 'ready' && httpReady && policyOk;
+
+  // A settings reset stops Open WebUI, so nothing below this point can be true
+  // while it runs; say so plainly instead of falling through to "Preparing the
+  // chat interface…" (bare-metal review: the interstitial was uninformative).
+  if (owuiResetting(owui)) {{
+    return {{
+      title: 'Getting Ready',
+      workflow: 'Rebuilding chat settings',
+      task: 'Chats, models and accounts are untouched. This takes a minute…',
+      cls: 'wait',
+    }};
+  }}
 
   if (chatState === 'rebooting') {{
     return {{
       title: 'Rebooting',
       workflow: 'Applying GPU memory settings',
       task: 'The appliance is rebooting — this page will reconnect automatically…',
+      cls: 'wait',
+    }};
+  }}
+  if (chatState === 'awaiting-choice') {{
+    return {{
+      title: 'Large Language Model',
+      workflow: 'AI requires a Large Language Model to power the chat system. Select a model from the list below that best fits your needs, and Lemonseed will download it for you. These are large files and may take a long time to download on slower internet connections.',
+      task: '',
       cls: 'wait',
     }};
   }}
@@ -882,8 +921,18 @@ function landingCopy(chat, owui) {{
   if (!modelReady && chatState && chatState !== 'idle' && chatState !== 'ready') {{
     return {{
       title: 'Getting Ready',
-      workflow: chat.workflow || 'Downloading an initial LLM',
+      workflow: chat.workflow || 'Preparing the Large Language Model',
       task: chat.task || chat.message || 'Preparing a local model…',
+      cls: 'wait',
+    }};
+  }}
+  if (ui === 'ready' && httpReady && !policyOk) {{
+    return {{
+      title: 'Getting Ready',
+      workflow: 'Configuring chat',
+      task: policy.last_error
+        ? String(policy.last_error)
+        : 'Applying Lemonseed settings to the chat interface…',
       cls: 'wait',
     }};
   }}
@@ -897,7 +946,7 @@ function landingCopy(chat, owui) {{
   }}
   return {{
     title: 'Getting Ready',
-    workflow: chat.workflow || 'Downloading an initial LLM',
+    workflow: chat.workflow || 'Preparing the Large Language Model',
     task: chat.task || chat.message || 'Finishing setup…',
     cls: 'wait',
   }};
@@ -908,6 +957,10 @@ function showChatFrame() {{
   const panel = document.getElementById('panel-frame');
   const fallback = document.getElementById('chat-fallback');
   panel.classList.add('hidden');
+  if (chatOverridden) {{
+    chatOverridden = false;
+    chat.src = CHAT_SRC;
+  }}
   if (chatBootstrapped) {{
     fallback.classList.add('hidden');
     chat.classList.remove('hidden');
@@ -951,6 +1004,30 @@ function ensureChatLoaded() {{
   if (currentView === 'chat') showChatFrame();
 }}
 
+// True while a reset window is open (both slots down, settings being rebuilt).
+// 'idle' is absent from the payload; 'ready'/'error' are terminal and must not
+// hold the interstitial open forever.
+function owuiResetting(owui) {{
+  const reset = owui.owui_reset;
+  return !!(reset && reset.state && reset.state !== 'ready' && reset.state !== 'error');
+}}
+
+// A reset tears Open WebUI's config table out from under the running SPA, which
+// keeps serving a cached bundle whose settings no longer exist: the admin saw a
+// working chat page until they reloaded the page (found on bare metal). Drop the
+// frame so the interstitial covers the window and a fresh bundle loads once the
+// rebuilt slot is healthy again.
+function retireChatFrame() {{
+  if (!chatBootstrapped) return;
+  chatBootstrapped = false;
+  chatOverridden = false;
+  readyStreak = 0;
+  const chat = document.getElementById('chat-frame');
+  chat.src = 'about:blank';
+  chat.classList.add('hidden');
+  if (currentView === 'chat') showChatFrame();
+}}
+
 async function gatewayReachable() {{
   // End-to-end check through nginx (same path the SPA hits after embed).
   try {{
@@ -985,9 +1062,71 @@ window.addEventListener('popstate', () => {{
   setView(path === '/settings' ? 'settings' : 'chat', false);
 }});
 
+function makeLandingCard(name, desc, flag, selected, fits, onPick) {{
+  const card = document.createElement('button');
+  card.type = 'button';
+  card.className = 'model-card' + (selected ? ' selected' : '') + (fits ? '' : ' unfit');
+  const nameEl = document.createElement('span');
+  nameEl.className = 'model-card-name';
+  nameEl.textContent = name;
+  const descEl = document.createElement('span');
+  descEl.className = 'model-card-desc';
+  descEl.textContent = desc;
+  card.appendChild(nameEl);
+  card.appendChild(descEl);
+  if (flag) {{
+    const flagEl = document.createElement('span');
+    flagEl.className = 'model-card-flag';
+    flagEl.textContent = flag;
+    card.prepend(flagEl);
+  }}
+  if (fits) card.addEventListener('click', onPick);
+  return card;
+}}
+
+async function loadLandingPicker() {{
+  try {{
+    const res = await fetch('/_lemonseed/api/models', {{cache: 'no-store'}});
+    if (!res.ok) return;
+    const data = await res.json();
+    const cards = document.getElementById('landing-cards');
+    if (!cards) return;
+    cards.innerHTML = '';
+    for (const family of data.families || []) {{
+      const best = family.best_fit || {{}};
+      const size = best.weights_gb != null ? Number(best.weights_gb).toFixed(1) + ' GB' : '';
+      const name = [family.maker, family.name, size ? '(' + size + ')' : ''].filter(Boolean).join(' ');
+      const desc = family.fits ? (family.description || '') : 'No model from this family fits your hardware.';
+      cards.appendChild(makeLandingCard(name, desc, family.flag, !!family.selected, !!family.fits, () => chooseLandingFamily(family.id)));
+    }}
+  }} catch (_err) {{}}
+}}
+
+async function chooseLandingFamily(family) {{
+  try {{
+    const res = await fetch('/_lemonseed/api/models', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{family: family}}),
+    }});
+    if (!res.ok) return;
+    // Download is starting — the next poll leaves awaiting-choice and shows progress.
+    const picker = document.getElementById('landing-picker');
+    if (picker) picker.hidden = true;
+  }} catch (_err) {{}}
+}}
+
 async function refreshStatus() {{
   try {{
     const response = await fetch('/api/status', {{cache: 'no-store'}});
+    // Session expired (cookie cleared by logout or timeout): leave the shell
+    // via a full navigation. A fetch() here cannot be redirected, so without
+    // this the stale shell keeps polling and the user gets stuck behind a
+    // dead session (re-login then renders a second shell inside this one).
+    if (response.status === 401 || response.status === 403) {{
+      window.location.replace('/login?rd=' + encodeURIComponent(window.location.pathname));
+      return;
+    }}
     if (!response.ok) return;
     const data = await response.json();
     const telemetry = data.telemetry || {{}};
@@ -1000,6 +1139,7 @@ async function refreshStatus() {{
     const chat = data.chat || {{}};
     const ui = owui.state || 'idle';
     const httpReady = !!owui.http_ready;
+    const policyOk = !!(owui.owui_policy && owui.owui_policy.ok === true);
     const modelReady = chat.state === 'ready';
     const copy = landingCopy(chat, owui);
     const title = document.getElementById('landing-title');
@@ -1010,8 +1150,17 @@ async function refreshStatus() {{
     if (status) {{
       status.textContent = copy.task;
       status.className = 'status-line ' + copy.cls;
+      status.style.display = copy.task ? '' : 'none';
     }}
-    if (ui === 'ready' && httpReady && modelReady && await gatewayReachable()) {{
+    // Inline model picker on the first-login landing while awaiting a choice.
+    const picker = document.getElementById('landing-picker');
+    if (picker) {{
+      const awaiting = chat.state === 'awaiting-choice';
+      if (awaiting && picker.hidden) {{ picker.hidden = false; loadLandingPicker(); }}
+      else if (!awaiting && !picker.hidden) {{ picker.hidden = true; }}
+    }}
+    if (owuiResetting(owui)) retireChatFrame();
+    if (ui === 'ready' && httpReady && modelReady && policyOk && await gatewayReachable()) {{
       readyStreak += 1;
     }} else {{
       readyStreak = 0;
@@ -1051,6 +1200,370 @@ def telemetry_snapshot() -> dict[str, Any]:
     }
 
 
+SETTINGS_MODEL_PICKER_CSS = """
+.model-cards { display: flex; flex-direction: column; gap: 10px; margin: 10px 0; }
+/* Each model bubble IS the button. */
+.model-card {
+  display: grid; grid-template-columns: auto minmax(0, 30%) 1fr; align-items: center;
+  gap: 12px; padding: 12px 14px; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 12px; background: transparent;
+  text-align: left; color: inherit; font: inherit; width: 100%;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.model-card:hover { border-color: var(--accent); }
+.model-card.selected { border-color: var(--accent); background: rgba(198, 242, 122, 0.14); }
+.model-card.unfit { opacity: 0.55; cursor: not-allowed; }
+.model-card.unfit:hover { border-color: var(--line); }
+.model-card-flag { font-size: 1.3rem; line-height: 1; }
+.model-card-name { font-weight: 600; font-size: 0.95rem; line-height: 1.3; }
+.model-card-desc { color: var(--muted); font-size: 0.85rem; line-height: 1.4; margin: 0; }
+@media (max-width: 560px) {
+  .model-card { grid-template-columns: auto 1fr; }
+  .model-card-desc { grid-column: 1 / -1; }
+}
+"""
+
+
+OWUI_CONFIG_CSS = """
+/* Holds *problems* only (a setting that could not be applied, settings changed
+   in Open WebUI since boot). Empty means "nothing to act on", and an empty
+   flex box still takes a line, so it must actually be hidden. */
+.owui-strip { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 14px; }
+.owui-strip[hidden] { display: none; }
+.owui-pill {
+  border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px;
+  font-size: 0.78rem; color: var(--muted); white-space: nowrap;
+}
+.owui-pill b { color: var(--ink); font-weight: 600; }
+.owui-pill.bad { border-color: #ff9a8a; color: #ffc4ba; }
+/* Subsection label inside a panel (Status / Controls). Deliberately quieter
+   than h2 so the panel reads as one box with two groups. */
+.panel h3.subhead {
+  margin: 16px 0 8px; font-size: 0.72rem; font-weight: 600;
+  letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted);
+}
+.panel h3.subhead:first-of-type { margin-top: 4px; }
+.owui-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 14px 0 0; }
+.owui-hint { color: var(--muted); font-size: 0.8rem; margin: 10px 0 0; line-height: 1.5; }
+/* Reset progress is the one state in this panel the admin must not miss: the
+   chat interface is offline while it runs. Rendered as a banner, not a hint. */
+.owui-status {
+  border: 1px solid var(--line); border-left: 3px solid var(--accent);
+  border-radius: 10px; padding: 10px 12px; margin: 14px 0 0;
+  font-size: 0.9rem; line-height: 1.5;
+}
+.owui-status.bad { border-left-color: #ff9a8a; }
+.owui-status[hidden] { display: none; }
+"""
+
+# Plain string (not an f-string) on purpose: JS braces stay single.
+OWUI_CONFIG_JS = r"""
+function owuiEl(tag, cls, text) {
+  const el = document.createElement(tag);
+  if (cls) el.className = cls;
+  if (text != null) el.textContent = String(text);
+  return el;
+}
+
+// What a home user needs here: is the chat interface running, and do its
+// settings match Lemonseed's. Everything else in the payload (key-by-key
+// ownership, guard rules, policy hashes) is developer detail -- it lives in
+// the manifest and the log, not in a home admin's settings page.
+
+// Prefer what Open WebUI reports about itself; fall back to the tag of the
+// image this Lemonseed build ships. Never show a registry path as a version.
+function owuiVersionLabel(version, image) {
+  let raw = String(version || '').trim();
+  if (!raw) {
+    const tail = String(image || '').split('/').pop();
+    raw = (tail && tail.indexOf(':') >= 0) ? tail.split(':').pop() : '';
+  }
+  if (!raw) return '';
+  return (raw.charAt(0) === 'v' || raw.charAt(0) === 'V') ? raw : 'v' + raw;
+}
+
+// Reconcile stamps are always written in UTC (owui_policy._utcnow_iso), so
+// trimming the ISO text beats a timezone conversation in the browser.
+function owuiStamp(iso) {
+  const text = String(iso || '');
+  return text.length >= 16 ? text.slice(0, 16).replace('T', ' ') + ' UTC' : text;
+}
+
+// Only problems get a pill; "everything is fine" is the row's job.
+function owuiPill(host, label, value, title) {
+  const node = owuiEl('span', 'owui-pill bad', label + ' ');
+  node.appendChild(owuiEl('b', null, value == null ? '—' : value));
+  if (title) node.title = title;
+  host.appendChild(node);
+  return node;
+}
+
+function renderOwuiPolicy(policy) {
+  const counts = policy.drift_counts || {};
+  // The status row speaks docker's own words ("Up 59 minutes (healthy)") so it
+  // matches what an admin would see in `docker ps`.
+  const row = document.getElementById('owui-state');
+  if (row && policy.container_status) {
+    const text = String(policy.container_status);
+    row.textContent = text;
+    row.className = 'state ' + (text.indexOf('Up ') === 0
+      ? (text.indexOf('(unhealthy)') >= 0 ? 'wait' : 'ok') : 'bad');
+  }
+  const title = document.getElementById('owui-title');
+  if (title) {
+    const label = owuiVersionLabel(policy.owui_version, policy.container_image);
+    if (label) title.textContent = 'Open WebUI ' + label;
+  }
+  const config = document.getElementById('owui-config-state');
+  if (config) {
+    if (policy.ok) {
+      config.textContent = policy.last_reconciled
+        ? 'updated ' + owuiStamp(policy.last_reconciled) : 'updated';
+      config.className = 'state ok';
+      config.removeAttribute('title');
+    } else {
+      // Never claim a config was applied when the engine says otherwise; the
+      // hover text is the one place the real reason is reachable.
+      config.textContent = policy.last_reconciled ? 'needs attention' : 'not applied yet';
+      config.className = 'state bad';
+      if (policy.last_error) config.title = String(policy.last_error);
+    }
+  }
+  const strip = document.getElementById('owui-strip');
+  if (strip) {
+    strip.innerHTML = '';
+    if (counts.error) {
+      owuiPill(strip, 'could not be applied', counts.error, 'the control plane could not set these');
+    }
+    if (counts.pending) {
+      owuiPill(strip, 'changed in Open WebUI since boot', counts.pending,
+               'reported only: Lemonseed re-applies its settings at the next boot or after "Apply now"');
+    }
+    strip.hidden = !strip.firstChild;
+  }
+}
+
+async function loadOwuiConfig() {
+  const note = document.getElementById('owui-note');
+  const button = document.getElementById('owui-refresh');
+  // An empty <p> still occupies a line box, which reads as a gap between the
+  // Status and Controls subsections when there is nothing to report.
+  const setNote = (text) => { note.textContent = text; note.hidden = !text; };
+  button.disabled = true;
+  try {
+    const res = await fetch('/_lemonseed/api/owui/config', {cache: 'no-store'});
+    if (res.status === 403) {
+      setNote('Administration settings are visible to admins only.');
+      return;
+    }
+    if (!res.ok) {
+      setNote('Could not read the configuration view (HTTP ' + res.status + ').');
+      return;
+    }
+    const view = await res.json();
+    renderOwuiPolicy(view.policy || {});
+    // Only report what the admin can act on; "everything is fine" is the
+    // Status rows' job, and a paragraph per reload is noise.
+    const bits = [];
+    if (!view.live_available) {
+      bits.push('The chat interface is not answering right now, so this shows what '
+                + 'Lemonseed intends rather than what it currently holds.');
+    }
+    setNote(bits.join(' '));
+  } catch (_err) {
+    setNote('Could not read the configuration view.');
+  } finally {
+    button.disabled = false;
+  }
+}
+
+document.getElementById('owui-refresh').addEventListener('click', loadOwuiConfig);
+
+// --- Phase 4B admin actions -------------------------------------------------
+// Both are admin-only endpoints also gated in nginx; the CP re-checks the
+// admin group either way. Results go to the status banner, not a toast: an
+// apply or a reset changes whether the chat interface works, so its outcome
+// has to stay on screen after the admin stops looking at it.
+
+async function owuiApplyNow() {
+  const button = document.getElementById('owui-apply');
+  const refresh = document.getElementById('owui-refresh');
+  button.disabled = true;
+  refresh.disabled = true;
+  owuiStatus('Applying Lemonseed settings…');
+  try {
+    const res = await fetch('/_lemonseed/api/owui/reconcile', {method: 'POST', cache: 'no-store'});
+    const body = await res.json().catch(() => ({}));
+    if (res.status === 409) {
+      owuiStatus('A settings update is already running. Try again in a moment.', true);
+      return;
+    }
+    if (res.status === 503) {
+      owuiStatus('The chat interface is not ready to receive settings yet.', true);
+      return;
+    }
+    if (!res.ok) {
+      owuiStatus('Could not apply settings (HTTP ' + res.status + ').', true);
+      return;
+    }
+    const drift = body.drift || {};
+    if (body.ok) {
+      owuiStatus('Settings applied. Re-applied ' + (drift.fixed || 0)
+                 + ', already correct ' + (drift.ok || 0) + '.');
+    } else {
+      owuiStatus('Applied, but some settings could not be set: '
+                 + (body.last_error || 'check the control plane log for the reason'), true);
+    }
+  } catch (_err) {
+    owuiStatus('Could not reach the control plane.', true);
+    return;
+  } finally {
+    button.disabled = false;
+    refresh.disabled = false;
+  }
+  loadOwuiConfig();
+}
+
+let owuiResetTimer = null;
+
+// The banner doubles as "what is happening to the chat interface right now",
+// so it is a bordered block rather than the muted hint line above it.
+function owuiStatus(text, bad) {
+  const status = document.getElementById('owui-reset-status');
+  status.textContent = text || '';
+  status.hidden = !text;
+  status.classList.toggle('bad', !!bad);
+}
+
+function owuiResetPoll() {
+  clearTimeout(owuiResetTimer);
+  owuiResetTimer = setTimeout(async () => {
+    let reset = null;
+    try {
+      const res = await fetch('/api/modules', {cache: 'no-store'});
+      const body = await res.json();
+      reset = (body.open_webui || {}).owui_reset || null;
+    } catch (_err) {
+      reset = null;
+    }
+    if (!reset || reset.state === 'idle') {
+      owuiStatus('');
+      return;
+    }
+    if (reset.state === 'ready' || reset.state === 'error') {
+      owuiStatus(reset.state === 'ready'
+        ? 'Chat settings rebuilt. The chat interface is back.'
+        : 'Reset failed: ' + (reset.error || 'unknown error')
+          + '. Your chats, models and accounts were not changed.',
+        reset.state !== 'ready');
+      loadOwuiConfig();
+      return;
+    }
+    owuiStatus('Rebuilding chat settings (' + reset.state + ')… the chat interface '
+               + 'is offline until this finishes.');
+    owuiResetPoll();
+  }, 3000);
+}
+
+async function owuiResetConfig() {
+  // Server-rendered so the word the admin types and the one the control plane
+  // checks cannot drift apart across a deploy. Compared case-insensitively by
+  // the CP; single-line copy because window.prompt wraps awkwardly.
+  const phrase = document.getElementById('owui-reset').dataset.confirm || '';
+  const typed = window.prompt(
+    'Reset rebuilds the chat interface settings from Lemonseed defaults. Chats, '
+    + 'models and accounts are kept; settings changed in Open WebUI are lost. '
+    + 'Type ' + phrase + ' to confirm.',
+    '');
+  if (typed === null) return;
+  owuiStatus('');
+  try {
+    const res = await fetch('/_lemonseed/api/owui/reset-config', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({confirm: typed}),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (res.status === 400) {
+      owuiStatus('Confirmation did not match. Type ' + phrase + ' to reset.', true);
+      return;
+    }
+    if (res.status === 409) {
+      owuiStatus('Another change is already in progress.', true);
+      return;
+    }
+    if (res.status === 503) {
+      owuiStatus('The chat interface is not ready to be reset yet.', true);
+      return;
+    }
+    if (!res.ok) {
+      owuiStatus('Reset refused (HTTP ' + res.status + ').', true);
+      return;
+    }
+    owuiStatus('Rebuilding chat settings… the chat interface is offline until it '
+               + 'finishes.');
+    owuiResetPoll();
+  } catch (_err) {
+    owuiStatus('Could not reach the control plane.', true);
+  }
+}
+
+document.getElementById('owui-apply').addEventListener('click', owuiApplyNow);
+document.getElementById('owui-reset').addEventListener('click', owuiResetConfig);
+loadOwuiConfig();
+
+// A reset started before this page was opened is still running; adopt it, or the
+// banner stays blank while the chat interface is offline and the admin has no
+// idea why. Terminal states are deliberately not replayed on every visit.
+(async function owuiAdoptReset() {
+  try {
+    const res = await fetch('/api/modules', {cache: 'no-store'});
+    const body = await res.json();
+    const reset = (body.open_webui || {}).owui_reset;
+    if (!reset || reset.state === 'ready' || reset.state === 'error') return;
+    owuiStatus('Rebuilding chat settings (' + reset.state + ')… the chat interface '
+               + 'is offline until this finishes.');
+    owuiResetPoll();
+  } catch (_err) {}
+})();
+"""
+
+
+def _owui_version_label(version: Optional[str], image: Optional[str]) -> str:
+    """Render ``0.11.0``/``ghcr.io/…/open-webui:v0.11.0`` as ``v0.11.0`` ('' if unknown).
+
+    The portal names the chat panel after the version it is showing, so a
+    registry path must never leak into that label.
+    """
+    raw = str(version or "").strip()
+    if not raw:
+        tail = str(image or "").rsplit("/", 1)[-1]
+        raw = tail.split(":", 1)[1] if ":" in tail else ""
+    if not raw:
+        return ""
+    return raw if raw[0] in "vV" else "v" + raw
+
+
+def _fmt_utc(iso: Optional[str]) -> str:
+    """``2026-10-09T05:05:00+00:00`` -> ``2026-10-09 05:05 UTC``.
+
+    One format for both the server-rendered rows and the portal JS (which
+    trims the same ISO string), so the two can never disagree. Unparseable
+    input is shortened rather than dropped — a wrong-looking timestamp is
+    still more useful to an admin than a blank row.
+    """
+    text = str(iso or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text[:16].replace("T", " ")
+    utc = parsed.astimezone(datetime.timezone.utc) if parsed.tzinfo else parsed
+    return utc.strftime("%Y-%m-%d %H:%M UTC")
+
+
 def page_settings_content(snap: dict[str, Any]) -> bytes:
     setup = load_setup()
     chat = snap.get("chat") or chat_ready.chat_snapshot()
@@ -1062,6 +1575,10 @@ def page_settings_content(snap: dict[str, Any]) -> bytes:
         chat_label = "ready"
         chat_class = "ok"
         chat_lede = f"{display} is loaded for local chat."
+    elif chat_state == "awaiting-choice":
+        chat_label = "awaiting choice"
+        chat_class = "wait"
+        chat_lede = ""
     elif chat_state == "preparing":
         chat_label = f"preparing ({progress}%)"
         chat_class = "wait"
@@ -1096,23 +1613,55 @@ def page_settings_content(snap: dict[str, Any]) -> bytes:
     owui = mods.get("open_webui") or {}
     owui_state = escape(str(owui.get("state") or "idle"))
     owui_class = "ok" if owui.get("state") == "ready" else ("bad" if owui.get("state") == "error" else "wait")
+    # Prefer docker's own words ("Up 59 minutes (healthy)") — that is what an
+    # admin comparing with `docker ps` expects to read. The control plane's
+    # lifecycle word is the fallback where docker cannot answer (dev machines,
+    # unit tests), rather than showing an invented uptime.
+    container = modules.owui_container_status()
+    if container:
+        owui_status = container[0]
+        if owui_status.startswith("Up "):
+            owui_class = "wait" if "(unhealthy)" in owui_status else "ok"
+        else:
+            owui_class = "bad"
+    else:
+        owui_status = owui_state
+    owui_policy_state = owui.get("owui_policy") or {}
+    owui_version = _owui_version_label(
+        owui_policy_state.get("owui_version"),
+        (container[1] if container else None) or owui.get("image"),
+    )
+    owui_title = f"Open WebUI {owui_version}" if owui_version else "open webui"
+    # The engine's own verdict, not the container's: "updated <when>" only
+    # after a reconcile reported ok.
+    if owui_policy_state.get("ok"):
+        reconciled = _fmt_utc(owui_policy_state.get("last_reconciled"))
+        owui_config_text = f"updated {reconciled}" if reconciled else "updated"
+        owui_config_class = "ok"
+        owui_config_title = ""
+    else:
+        owui_config_text = ("needs attention"
+                            if owui_policy_state.get("last_reconciled") else "not applied yet")
+        owui_config_class = "bad"
+        owui_config_title = escape(str(owui_policy_state.get("last_error") or ""))
+    owui_config_hint = f' title="{owui_config_title}"' if owui_config_title else ""
 
     body = f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Settings</title>{brand_head_links()}<style>{STYLE}</style>
+<title>Settings</title>{brand_head_links()}<style>{STYLE}{SETTINGS_MODEL_PICKER_CSS}{OWUI_CONFIG_CSS}</style>
 </head><body><main class="embed-shell">
 <h1>Settings</h1>
 <section class="panel">
-<h2>Chat</h2>
-<div class="row"><span class="name">open webui</span><span class="state {owui_class}">{owui_state}</span></div>
-<div class="row"><span class="name">path</span><span class="state ok">/?embed=1</span></div>
-</section>
-<section class="panel">
-<h2>Local inference</h2>
+<h2>Lemonade AI Engine</h2>
 <div class="row"><span class="name">status</span><span class="state {chat_class}" id="chat-state">{chat_label}</span></div>
 <div class="row"><span class="name">model</span><span class="state ok" id="chat-model">{display}</span></div>
 <p class="lede" id="chat-lede">{chat_lede}</p>
+</section>
+<section class="panel" id="model-picker">
+<h2>Large Language Model</h2>
+<p class="lede">AI requires a Large Language Model to power the chat system. Select a model from the list below that best fits your needs, and Lemonseed will download it for you. These are large files and may take a long time to download on slower internet connections.</p>
+<div id="model-cards" class="model-cards"></div>
 </section>
 <section class="panel">
 <h2>Status</h2>
@@ -1121,9 +1670,26 @@ def page_settings_content(snap: dict[str, Any]) -> bytes:
 <div class="row"><span class="name">timezone</span><span class="state ok">{setup.get("timezone","UTC")}</span></div>
 {gpu_rows}
 </section>
+<section class="panel" id="owui-config">
+<h2>Chat</h2>
+<h3 class="subhead">Status</h3>
+<div class="row"><span class="name" id="owui-title">{owui_title}</span><span class="state {owui_class}" id="owui-state">{owui_status}</span></div>
+<div class="row"><span class="name">Lemonseed configuration</span><span class="state {owui_config_class}" id="owui-config-state"{owui_config_hint}>{owui_config_text}</span></div>
+<div class="owui-strip" id="owui-strip" hidden></div>
+<p class="owui-hint" id="owui-note">Loading…</p>
+<h3 class="subhead">Controls</h3>
+<p class="lede">Lemonseed configures the chat interface (Open WebUI) to work with the Lemonade AI engine. Here you can trigger Lemonseed to reapply the managed configuration parameters or reset the Open WebUI configuration database to defaults.</p>
+<p class="owui-status" id="owui-reset-status" hidden></p>
+<div class="owui-actions">
+<button type="button" id="owui-apply">Apply Lemonseed settings now</button>
+<button type="button" id="owui-reset" data-confirm="{modules.OWUI_RESET_CONFIRM}">Reset chat settings</button>
+<button type="button" id="owui-refresh">Refresh status</button>
+</div>
+</section>
 <section class="panel">
+<h2>API</h2>
 <details>
-<summary style="cursor:pointer;color:var(--muted)">Diagnostics</summary>
+<summary style="cursor:pointer;color:var(--muted)">System API Data</summary>
 <p class="lede" id="chat-reason">{reason}</p>
 <p class="lede"><a style="color:var(--accent)" href="/api/hardware">/api/hardware</a> ·
 <a style="color:var(--accent)" href="/api/chat">/api/chat</a> ·
@@ -1144,6 +1710,7 @@ async function refreshChat() {{
     let cls = 'wait';
     let lede = chat.message || '';
     if (state === 'ready') {{ label = 'ready'; cls = 'ok'; lede = model + ' is loaded for local chat.'; }}
+    else if (state === 'awaiting-choice') {{ label = 'awaiting choice'; cls = 'wait'; lede = ''; }}
     else if (state === 'preparing') {{ label = 'preparing (' + progress + '%)'; cls = 'wait'; }}
     else if (state === 'not-ready') {{ label = 'not ready'; cls = 'bad'; lede = chat.reason || lede; }}
     else if (state === 'error') {{ label = 'error'; cls = 'bad'; lede = chat.error || chat.reason || lede; }}
@@ -1156,7 +1723,64 @@ async function refreshChat() {{
   }} catch (_err) {{}}
 }}
 setInterval(refreshChat, 3000);
+
+function makeModelCard(name, desc, flag, selected, fits, onPick) {{
+  const card = document.createElement('button');
+  card.type = 'button';
+  card.className = 'model-card' + (selected ? ' selected' : '') + (fits ? '' : ' unfit');
+  const nameEl = document.createElement('span');
+  nameEl.className = 'model-card-name';
+  nameEl.textContent = name;
+  const descEl = document.createElement('span');
+  descEl.className = 'model-card-desc';
+  descEl.textContent = desc;
+  card.appendChild(nameEl);
+  card.appendChild(descEl);
+  if (flag) {{
+    const flagEl = document.createElement('span');
+    flagEl.className = 'model-card-flag';
+    flagEl.textContent = flag;
+    card.prepend(flagEl);
+  }}
+  if (fits) card.addEventListener('click', onPick);
+  return card;
+}}
+
+async function loadModelPicker() {{
+  try {{
+    const modelsRes = await fetch('/_lemonseed/api/models', {{cache: 'no-store'}});
+    if (!modelsRes.ok) return;
+    const data = await modelsRes.json();
+    const cards = document.getElementById('model-cards');
+    cards.innerHTML = '';
+    for (const family of data.families || []) {{
+      const best = family.best_fit || {{}};
+      const size = best.weights_gb != null ? Number(best.weights_gb).toFixed(1) + ' GB' : '';
+      const name = [family.maker, family.name, size ? '(' + size + ')' : ''].filter(Boolean).join(' ');
+      const desc = family.fits
+        ? (family.description || '')
+        : 'No model from this family fits your hardware.';
+      cards.appendChild(makeModelCard(name, desc, family.flag, !!family.selected, !!family.fits, () => chooseFamily(family.id)));
+    }}
+  }} catch (_err) {{}}
+}}
+
+async function chooseFamily(family) {{
+  try {{
+    const res = await fetch('/_lemonseed/api/models', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{family: family}}),
+    }});
+    if (!res.ok) {{ alert('Could not change model: ' + res.status); return; }}
+    // Re-render to reflect the new selection; the status row shows progress.
+    loadModelPicker();
+  }} catch (_err) {{ alert('Could not change model.'); }}
+}}
+
+loadModelPicker();
 </script>
+<script>{OWUI_CONFIG_JS}</script>
 </main></body></html>"""
     return body.encode()
 
@@ -1278,7 +1902,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, (json.dumps(obj) + "\n").encode(), "application/json")
 
     def _require_admin(self) -> bool:
-        """Return True (and send 403) if the caller is not in the admin group.
+        """True when the caller is an admin; sends 403 and returns False if not.
 
         nginx sets X-Forwarded-Groups from the CP session-verify response
         headers (via auth_request_set + proxy_set_header). When the auth gate
@@ -1394,6 +2018,193 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _handle_model_choice_post(self, raw: bytes) -> None:
+        """POST /_lemonseed/api/models — record the user's model family choice (admin).
+
+        Body: {"family": "qwen"} | {"family": "auto"}. Persisted on user-data,
+        then the chat worker re-plans and pulls/loads the new model.
+        """
+        if not self._require_admin():
+            return
+        try:
+            data = json.loads(raw.decode() or "{}")
+            if not isinstance(data, dict):
+                raise ValueError("expected a JSON object")
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            self._json(400, {"error": "bad request"})
+            return
+        family = str(data.get("family", "")).strip()
+        catalog_ = catalog.load_catalog()
+        known = {
+            str(f.get("id")) for f in (catalog_.get("families") or []) if isinstance(f, dict)
+        }
+        if family not in known and family != "auto":
+            self._json(400, {"error": f"unknown family: {family}"})
+            return
+        # Optional explicit model within the family (e.g. the QEMU e2e pins
+        # Gemma 12B for a deterministic pull regardless of box size).
+        model_id = data.get("model_id")
+        if isinstance(model_id, str):
+            model_id = model_id.strip() or None
+            if model_id is not None and family != "auto":
+                if not any(
+                    isinstance(m, dict)
+                    and m.get("id") == model_id
+                    and m.get("family") == family
+                    for m in (catalog_.get("models") or [])
+                ):
+                    self._json(400, {"error": f"unknown model: {model_id}"})
+                    return
+        saved = catalog.write_model_choice(family, model_id)
+        # A new choice invalidates any prior give-up decision for the old model
+        # and cancels an in-flight download so the user doesn't wait for a
+        # model they no longer want.
+        chat_ready.clear_gave_up()
+        chat_ready.cancel_active_pull()
+        chat_ready.ensure_chat_worker()
+        self._json(200, {"state": "ok", "choice": saved})
+
+    # ------------------------------------------------------------------
+    # QEMU e2e GC helpers (test-only; admin-gated like the model choice).
+    # The disk-space guard is exercised end-to-end by scripts/qemu-api-smoke-test.sh
+    # (QEMU_E2E_GC=1): fill /var past the 90% high-water mark, pull a model,
+    # and assert the LRU model was evicted via lemond's API. Not exposed in
+    # the UI and not routed by the gateway's public allowlist.
+    # ------------------------------------------------------------------
+
+    _GC_FILL_PATH = Path("/var/tmp/lemonseed-gc-test.bin")
+
+    def _handle_gc_test(self, raw: bytes) -> None:
+        if not self._require_admin():
+            return
+        try:
+            data = json.loads(raw.decode() or "{}")
+            if not isinstance(data, dict):
+                raise ValueError("expected a JSON object")
+            nbytes = int(data.get("bytes") or 0)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError):
+            self._json(400, {"error": "bad request"})
+            return
+        if nbytes <= 0 or nbytes > (16 << 30):
+            self._json(400, {"error": "bytes must be in (0, 16 GiB]"})
+            return
+        try:
+            self._GC_FILL_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with self._GC_FILL_PATH.open("wb") as fh:
+                chunk = b"\0" * (1 << 20)
+                remaining = nbytes
+                while remaining > 0:
+                    fh.write(chunk[: min(len(chunk), remaining)])
+                    remaining -= len(chunk)
+            self._json(200, {"state": "ok", "bytes": nbytes})
+        except OSError as exc:
+            self._json(500, {"error": f"fill failed: {exc}"})
+
+    def _handle_gc_test_remove(self) -> None:
+        if not self._require_admin():
+            return
+        try:
+            self._GC_FILL_PATH.unlink(missing_ok=True)
+            self._json(200, {"state": "ok"})
+        except OSError as exc:
+            self._json(500, {"error": f"remove failed: {exc}"})
+
+    def _handle_gc_test_models(self) -> None:
+        if not self._require_admin():
+            return
+        # lemond's /v1/models lists cached models (the `lemonade list` source).
+        key = hardware.lemonade_api_key()
+        try:
+            req = Request(
+                "http://127.0.0.1:13305/v1/models",
+                headers={"Authorization": f"Bearer {key}"} if key else {},
+            )
+            with urlopen(req, timeout=10) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            self._json(200, payload if isinstance(payload, dict) else {"data": []})
+        except Exception as exc:  # noqa: BLE001 — service boundary
+            self._json(502, {"error": f"lemond unreachable: {exc}"})
+
+    def _handle_owui_config_view(self) -> None:
+        """Open WebUI config ownership view: intent + fact + health (4A).
+
+        Three sources, one payload: the manifest (what Lemonseed intends), a
+        live ``configs/export`` (what Open WebUI actually holds) and the
+        engine's last drift report (how enforcement is going). Degrades rather
+        than fails: a rejected manifest still shows live keys classified
+        ``yours``; an unreachable Open WebUI still shows intent. Only the view
+        builder itself blowing up is worth a 5xx.
+        """
+        try:
+            manifest = owui_policy.load_manifest()
+        except owui_policy.ManifestError as exc:
+            manifest = None
+            manifest_error: Optional[str] = str(exc)[:300]
+        else:
+            manifest_error = None
+        export = modules.owui_config_export()
+        status = dict(owui_policy.state_summary())
+        # Docker's own view of the running container, for the portal's Status
+        # row (uptime wording + the image tag behind the version label). None
+        # simply omits the keys and the panel keeps the lifecycle word it
+        # rendered server-side.
+        container = modules.owui_container_status()
+        if container:
+            status["container_status"], status["container_image"] = container
+        if manifest_error:
+            status["manifest_error"] = manifest_error
+        try:
+            view = owui_portal.build_view(
+                manifest, status, export.get("data"),
+                guard_state=modules.owui_guard_state(),
+            )
+        except Exception as exc:  # noqa: BLE001 — HTTP boundary
+            self._json(502, {"ok": False, "error": f"config view failed: {str(exc)[:200]}"})
+            return
+        view["export_error"] = export.get("error")
+        self._json(200, view)
+
+    def _handle_owui_reconcile_post(self) -> None:
+        """Admin "apply Lemonseed settings now" (T4-E).
+
+        Status codes are the contract the portal JS branches on: 200 applied
+        (or reported drift), 409 something else is already running, 503 nothing
+        is serving yet to write to.
+        """
+        result = modules.request_policy_reconcile()
+        if result.get("reason") == "in flight":
+            self._json(409, result)
+            return
+        if result.get("reason") == "not ready":
+            self._json(503, result)
+            return
+        self._json(200, result)
+
+    def _handle_owui_reset_post(self, raw: bytes) -> None:
+        """Admin config reset (T4-C/T4-D): validate, then 202 and walk away.
+
+        The window itself takes minutes under emulation, so it must not hold
+        this connection; progress and the final result come from the
+        ``owui_reset`` field of ``/api/modules``.
+        """
+        try:
+            data = json.loads(raw.decode() or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._json(400, {"accepted": False, "reason": "expected a JSON body"})
+            return
+        confirm = data.get("confirm") if isinstance(data, dict) else None
+        result = modules.reset_owui_config(confirm if isinstance(confirm, str) else "")
+        if not result.get("accepted"):
+            reason = str(result.get("reason") or "")
+            if reason == "confirmation text did not match":
+                self._json(400, {**result, "confirm_text": modules.OWUI_RESET_CONFIRM})
+            elif reason in ("not ready",):
+                self._json(503, result)
+            else:
+                self._json(409, result)
+            return
+        self._json(202, result)
+
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         if path in ("/healthz", "/health"):
@@ -1410,23 +2221,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             ctype = BRAND_MIME.get(fp.suffix.lower(), "application/octet-stream")
             body = fp.read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "public, max-age=86400")
-            self.end_headers()
-            self.wfile.write(body)
+            self._send(200, body, ctype)
             return
         if path == "/favicon.ico":
             fp = BRAND_DIR / "favicon.ico"
             if fp.is_file():
-                body = fp.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "image/x-icon")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "public, max-age=86400")
-                self.end_headers()
-                self.wfile.write(body)
+                self._send(200, fp.read_bytes(), "image/x-icon")
                 return
             self._send(404, b"not found\n", "text/plain; charset=utf-8")
             return
@@ -1446,7 +2246,30 @@ class Handler(BaseHTTPRequestHandler):
             report = hardware.collect_hardware()
             self._json(200, plan_model(report))
             return
+        if path == "/_lemonseed/api/models":
+            report = hardware.collect_hardware()
+            hardware.persist_hardware(report)
+            self._json(
+                200,
+                {
+                    "families": catalog.families_view(report),
+                    "plan": plan_model(report),
+                },
+            )
+            return
+        if path == "/_lemonseed/api/gc-test/models":
+            self._handle_gc_test_models()
+            return
+        if path == "/_lemonseed/api/owui/config":
+            # M6.3b 4A: ownership view of the managed Open WebUI config tree.
+            # Admin-only by design: members must not enumerate the appliance's
+            # managed surface (and the payload merges the raw config export).
+            if not self._require_admin():
+                return
+            self._handle_owui_config_view()
+            return
         if path == "/api/data":
+            data_services.ensure_data_worker()
             data_services.ensure_provision_worker()
             self._json(200, data_services.data_snapshot())
             return
@@ -1458,6 +2281,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/status":
             maybe_complete_mdns_handoff(self)
             chat_ready.ensure_chat_worker()
+            data_services.ensure_data_worker()
             data_services.ensure_provision_worker()
             modules.ensure_module_worker()
             boot = boot_snapshot()
@@ -1564,6 +2388,28 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/logout":
             self._handle_logout()
             return
+        if path == "/_lemonseed/api/models":
+            self._handle_model_choice_post(raw)
+            return
+        if path == "/_lemonseed/api/gc-test/fill":
+            self._handle_gc_test(raw)
+            return
+        if path == "/_lemonseed/api/gc-test/fill/remove":
+            self._handle_gc_test_remove()
+            return
+        if path == "/_lemonseed/api/owui/reconcile":
+            # M6.3b 4B: admin-only, and gated in nginx too (adminGate). The
+            # endpoint is idempotent, but a member must not be able to force
+            # the appliance to re-assert (and thus undo) their changes.
+            if not self._require_admin():
+                return
+            self._handle_owui_reconcile_post()
+            return
+        if path == "/_lemonseed/api/owui/reset-config":
+            if not self._require_admin():
+                return
+            self._handle_owui_reset_post(raw)
+            return
         if path != "/setup":
             self._json(404, {"error": "not found"})
             return
@@ -1605,15 +2451,48 @@ class Handler(BaseHTTPRequestHandler):
             "text/html; charset=utf-8",
         )
 
+    def handle(self) -> None:  # noqa: N802
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError):
+            # Client went away (reboot, tab close, nginx abort). socketserver
+            # would otherwise dump a full traceback per occurrence.
+            self.log_message("client disconnected (%s)", self.path)
+        except Exception:  # noqa: BLE001
+            # Service boundary: log and keep the server alive.
+            import traceback
+
+            self.log_message("error handling %s", self.path)
+            traceback.print_exc(file=sys.stderr)
+
     def log_message(self, fmt: str, *args: Any) -> None:
         print("%s - %s" % (self.address_string(), fmt % args), flush=True)
+
+
+def _safe_refresh_gpus() -> None:
+    """One-time GPU inventory probe at CP startup (see hardware.refresh_gpus).
+
+    Runs off the request path; a failure must never take down the control
+    plane — the next collect_hardware() will retry the probe.
+    """
+    try:
+        hardware.refresh_gpus()
+    except Exception as exc:  # noqa: BLE001
+        print(f"hardware inventory: {exc}", flush=True)
 
 
 def main() -> None:
     # A reboot-pending marker from the previous boot is stale by definition
     # (we are up); clear it so the portal doesn't show "Rebooting…" forever.
     chat_ready.clear_reboot_pending()
+    # Probe the GPU inventory once at startup so the expensive external tools
+    # (nvidia-smi / llama-cli / vulkaninfo) run exactly once per boot, not on
+    # every portal poll. Runs in the background so it never delays listen.
+    threading.Thread(
+        target=_safe_refresh_gpus, name="lemonseed-hardware-inventory", daemon=True
+    ).start()
     chat_ready.ensure_chat_worker()
+    data_services.ensure_data_worker()
     data_services.ensure_provision_worker()
     modules.ensure_module_worker()
     auth.ensure_auth_gate_worker()

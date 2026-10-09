@@ -377,6 +377,23 @@ class AuthCreateAdminTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 auth.create_admin("admin", "longenough")
 
+    def test_provisioning_retries_until_ready(self) -> None:
+        # Postgres is up but provisioning is still running: create_admin must
+        # poll until ready (regression: first-admin bootstrap raced the
+        # provision worker on a fresh QEMU boot).
+        conn, _cur = _conn_with_cur()
+        with mock.patch.object(db, "cp_connect", return_value=conn), \
+                mock.patch.object(auth, "PG_WAIT_SECONDS", 100), \
+                mock.patch.object(
+                    data_services,
+                    "ensure_provisioned",
+                    side_effect=[{"state": "waiting"}, {"state": "ready"}],
+                ), \
+                mock.patch.object(auth.time, "monotonic", side_effect=[0.0, 1.0]), \
+                mock.patch.object(auth.time, "sleep"):
+            result = auth.create_admin("admin", "longenough")
+        self.assertEqual(result["state"], "ready")
+
     def test_db_error_wrapped(self) -> None:
         with mock.patch.object(db, "cp_connect", side_effect=RuntimeError("boom")):
             with self.assertRaises(ValueError):
@@ -395,7 +412,7 @@ class AuthCreateAdminTests(unittest.TestCase):
         self.assertIn("INSERT INTO users", sqls[0])
         # Deterministic local-part email fallback (OWUI keys identity on email).
         user_params = cur.execute.call_args_list[0].args[1]
-        self.assertEqual(user_params[2], "admin@lemonseed.local")
+        self.assertEqual(user_params[2], "admin@localhost")
         self.assertIn("INSERT INTO groups", sqls[1])
         self.assertIn("INSERT INTO groups", sqls[2])
         self.assertIn("INSERT INTO user_groups", sqls[3])
@@ -414,6 +431,18 @@ class AuthCreateAdminTests(unittest.TestCase):
         sqls = [call.args[0] for call in cur.execute.call_args_list]
         self.assertIn("DELETE FROM user_groups", sqls[0])
         self.assertFalse(self.marker.exists())
+
+
+class AuthEmailIdentityTests(unittest.TestCase):
+    """The synthetic email domain is a wire contract with Open WebUI."""
+
+    def test_owui_email_shape(self) -> None:
+        self.assertEqual(auth.owui_email("admin"), "admin@localhost")
+        # ``localhost`` is the one no-dot domain OWUI's validate_email_format
+        # exempts; adding a dot-free domain here would break its admin-side
+        # user-create path. Keep it bare (no hostname/FQDN): the box renames
+        # itself after the factory mDNS handoff and email is the identity key.
+        self.assertEqual(auth.OWUI_EMAIL_DOMAIN, "localhost")
 
 
 class AuthGateWorkerTests(unittest.TestCase):
@@ -438,9 +467,17 @@ class AuthGateWorkerTests(unittest.TestCase):
         auth._gate_synced = False
 
     def _wait_gate(self, expect_enabled: bool) -> bool:
+        """Wait for the worker's pass to *finish*, not just for the file to look right.
+
+        ``write_gate`` writes GATE_CONF then ADMIN_CONF, so polling on GATE_CONF
+        alone returns while the worker still has a write into the temp dir in
+        flight — which raced with tearDown and made TemporaryDirectory.cleanup
+        fail intermittently ("Directory not empty"). ``_gate_synced`` is set only
+        after every write the worker performs.
+        """
         for _ in range(100):
             text = auth.GATE_CONF.read_text() if auth.GATE_CONF.is_file() else None
-            if text is not None and bool(text.strip()) == expect_enabled:
+            if auth._gate_synced and text is not None and bool(text.strip()) == expect_enabled:
                 return True
             time.sleep(0.05)
         return False
