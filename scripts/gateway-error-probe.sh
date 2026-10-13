@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live test of the gateway's 5xx error contract, with a real nginx (M6.6 S5.4).
+# Live test of the gateway's error contract, with a real nginx (M6.6 S5.4, S5.6).
 #
 #   make test-gateway
 #
@@ -17,6 +17,9 @@
 #      bug this row set out to fix, and no amount of nesting fixes it.
 #   3. proxy_intercept_errors stays off, so a 500 produced *by* the control
 #      plane passes through instead of being disguised as "still starting".
+#   4. fetch() follows a 302 and reports the final response, so an expired
+#      session that redirects hands the portal login HTML at HTTP 200. The gate
+#      has to branch on the caller, and only nginx can tell us it really does.
 #
 # None of that is observable from a Python unit test, and reaching the failing
 # state in QEMU would mean stopping the control plane on a booted appliance. So
@@ -59,6 +62,12 @@ guard 'root ${cpStatic};'
 guard 'proxy_pass http://127.0.0.1:8080$request_uri;'
 guard 'error_page 500 502 503 504 =503 $lemonseed_error_target;'
 guard 'default      /_lemonseed/cp-down;'
+guard 'try_files /lemonseed.css =404;'
+# The auth gate's answer to an expired session. If this drifts, the mirror below
+# is no longer testing what ships, so fail rather than quietly pass.
+guard 'if ($http_x_requested_with = "fetch") {'
+guard 'lemonseed":"session-expired'
+guard 'return 302 /login?rd=$request_uri;'
 # Comments are allowed to name the pattern we removed (the module explains it),
 # so this one check runs against live directive text only.
 if grep -vE '^\s*#' "${GATEWAY}" | grep -qF '@cp_interstitial'; then
@@ -114,7 +123,13 @@ http {
   server {
     listen 127.0.0.1:${GATEWAY_PORT};
 
-    location @auth_unauthorized { return 302 /login?rd=\$request_uri; }
+    location @auth_unauthorized {
+      default_type application/json;
+      if (\$http_x_requested_with = "fetch") {
+        return 401 '{"detail":"Sign in again to continue.","lemonseed":"session-expired"}';
+      }
+      return 302 /login?rd=\$request_uri;
+    }
 
     location /_lemonseed/cp-down {
       internal;
@@ -122,6 +137,12 @@ http {
       try_files /cp-down.html =503;
       default_type text/html;
       add_header Cache-Control "no-store" always;
+    }
+    location = /_lemonseed/lemonseed.css {
+      root ${ROOT}/control-plane/static;
+      try_files /lemonseed.css =404;
+      default_type text/css;
+      add_header Cache-Control "public, max-age=0, must-revalidate";
     }
     location /_lemonseed/interstitial {
       internal;
@@ -195,6 +216,13 @@ echo "==> the contract, against a live nginx"
 # Control: a healthy location and the auth redirect must be untouched.
 probe "healthy location" 200 /ok
 probe "401 gate redirects" 302 /gated
+# The auth gate must answer the portal's own fetch() with a real 401. fetch()
+# follows a 302 silently and returns login HTML at HTTP 200, so `if (!res.ok)`
+# can never fire and an expired session looks like dead UI.
+probe "401 gate, xhr gets 401" 401 /gated -H 'X-Requested-With: fetch'
+# Negative control: the match is on our marker, not on any X-Requested-With.
+# jQuery's XMLHttpRequest is not our portal and must still get the redirect.
+probe "401 gate, other xhr still 302" 302 /gated -H 'X-Requested-With: XMLHttpRequest'
 # The bug: an unreachable upstream must produce a Lemonseed page, honestly 503.
 probe "root, cp down" 503 / -H 'Accept: text/html'
 probe "api, cp down" 503 /api/status
@@ -204,6 +232,9 @@ probe "embed, upstream down" 503 "/?embed=1" -H 'Sec-Fetch-Dest: iframe'
 probe "backend 500 passes through" 500 /api/boom
 # And the page itself is never directly reachable from the LAN.
 probe "fallback is internal" 404 /_lemonseed/cp-down
+# The shared theme root has to be readable with no session: it styles the login
+# and setup pages, and cp-down.html above.
+probe "theme stylesheet" 200 /_lemonseed/lemonseed.css
 
 # Body checks: the right page landed at the right status.
 root_body="$(curl -s --max-time 10 "${base}/")"
@@ -213,5 +244,30 @@ grep -q "SHELL /?embed=1" <<<"${embed_body}" || fail "embed lost the original re
 headers="$(curl -s -D - -o /dev/null --max-time 10 "${base}/")"
 grep -qi 'cache-control: no-store' <<<"${headers}" || fail "the not-ready page is cacheable"
 grep -qi 'content-type: text/html' <<<"${headers}" || fail "the not-ready page is not served as html"
+# The not-ready page links the shared stylesheet, so the theme is one file for
+# the whole appliance; a 404 here would leave the error page unstyled.
+css_headers="$(curl -s -D - -o /dev/null --max-time 10 "${base}/_lemonseed/lemonseed.css")"
+grep -qi 'content-type: text/css' <<<"${css_headers}" || fail "the theme is not served as css: ${css_headers}"
+grep -qi 'cache-control: public, max-age=0, must-revalidate' <<<"${css_headers}" \
+  || fail "the theme is cached without revalidation, so it would outlive an upgrade"
+css_body="$(curl -s --max-time 10 "${base}/_lemonseed/lemonseed.css")"
+grep -q -- '--accent' <<<"${css_body}" || fail "the theme root lost its palette variables"
+grep -q '.cp-down .card' <<<"${css_body}" || fail "the not-ready page's rules are not in the shared theme"
+
+# --- the expired-session contract, body by body ---------------------------------
+# A navigation still gets a redirect that remembers where the user was going.
+nav_headers="$(curl -s -D - -o /dev/null --max-time 10 "${base}/gated")"
+# nginx writes an absolute Location, so match on the path it carries.
+grep -qi 'location: [^[:space:]]*/login?rd=/gated' <<<"${nav_headers}" || fail "the redirect lost the original path: ${nav_headers}"
+# An XHR gets JSON it can render, and the marker the client keys off.
+xhr_headers="$(curl -s -D - -o /dev/null --max-time 10 -H 'X-Requested-With: fetch' "${base}/gated")"
+grep -qi 'content-type: application/json' <<<"${xhr_headers}" || fail "the 401 body is not json: ${xhr_headers}"
+xhr_body="$(curl -s --max-time 10 -H 'X-Requested-With: fetch' "${base}/gated")"
+# Parsed, not grepped: a body that is almost-JSON is exactly what breaks the
+# client silently, so make the browser's own parser the judge.
+python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["lemonseed"]=="session-expired", d; assert d["detail"].strip(), d' <<<"${xhr_body}" \
+  || fail "the 401 body is not the json the client expects: ${xhr_body}"
+printf '  %-28s %s\n' "401 body parses" "${xhr_body}"
 
 echo "OK: 5xx from a dead upstream renders a Lemonseed page at 503, and the shell keeps its path"
+echo "OK: an expired session redirects a navigation and answers an XHR with real JSON"

@@ -269,11 +269,20 @@ fi
 
 echo "${status_json}" | python3 -c '
 import json, sys
+# M6.6 step 5: this endpoint answers before anyone can sign in, so it must carry
+# the installer handoff fields and nothing else. The gated names are listed
+# explicitly because the regression this pins is a LAN device reading household
+# facts (notably how many admins exist) with no credentials at all.
 data = json.load(sys.stdin)
 assert data.get("status") == "ok", data
 assert data.get("role") == "control-plane", data
-lemond = (data.get("lemond") or {}).get("state")
-print(f"OK: role=control-plane lemond={lemond!r}")
+# mdns_name is legitimately null this early on a fresh disk, so only its key is
+# required here; the copy with a name in it is asserted after /setup.
+assert "setup" in data and "portal_url" in data, data
+gated = {"auth", "chat", "data", "modules", "telemetry", "session_store", "units", "lemond", "docker", "startup_ready"}
+leaked = sorted(k for k in data if k in gated)
+assert not leaked, "unauthenticated /api/status leaked: %s" % leaked
+print("OK: role=control-plane, public subset only (no gated keys)")
 '
 
 # --- Edge auth (M6.2): bootstrap the first admin + sign in, BEFORE any
@@ -303,11 +312,62 @@ if [[ "${setup_code}" != "200" && "${setup_code}" != "409" ]]; then
   exit 1
 fi
 
-echo "==> Waiting for auth state=enabled (remaining budget)"
+# The auth-state wait moved BELOW the login block: account counts are household
+# facts, so they now live only in the gated /api/system (M6.6 step 5).
+
+echo "==> CP-native login: sign-in page + credential login"
+# Retried, not asserted once: issuing a session needs Valkey, and this is now the
+# first thing that asks for one (it used to run after a wait for auth state=enabled,
+# which absorbed a slow data plane). A 503 here means "not yet", not "broken".
+login_deadline=$((deadline))
+page_code=""
+while (( SECONDS < login_deadline )); do
+  page_code="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: ${AUTH_HOST}" "http://127.0.0.1:${HOST_PORT}/login")"
+  [[ "${page_code}" == "200" ]] && break
+  sleep 3
+done
+[[ "${page_code}" == "200" ]] || {
+  echo "GET /login: expected 200, got ${page_code}" >&2; exit 1;
+}
+signin_deadline=$((deadline))
+signin_code=""
+while (( SECONDS < signin_deadline )); do
+  signin_code="$(curl -sS --max-time 60 -o /dev/null -c "${COOKIE_JAR}" \
+    -D /tmp/qemu-signin-hdr.txt -w '%{http_code}' \
+    -X POST "http://127.0.0.1:${HOST_PORT}/login" \
+    -H "Host: ${AUTH_HOST}" \
+    -H 'Content-Type: application/json' \
+    -d "{\"username\":\"${ADMIN_USERNAME}\",\"password\":\"${ADMIN_PASSWORD}\",\"rd\":\"/\"}")"
+  [[ "${signin_code}" == "302" ]] && break
+  echo "waiting: POST /login returned ${signin_code}" >&2
+  if ! kill -0 "$(cat "${PIDFILE}")" 2>/dev/null; then
+    echo "QEMU exited during login; tail ${LOG}:" >&2
+    tail -80 "${LOG}" >&2 || true
+    exit 1
+  fi
+  sleep 5
+done
+if [[ "${signin_code}" != "302" ]] || ! grep -qi '^set-cookie: lemonseed_session' /tmp/qemu-signin-hdr.txt; then
+  echo "POST /login: expected 302 + lemonseed_session cookie, got ${signin_code}" >&2
+  cat /tmp/qemu-signin-hdr.txt >&2 || true
+  exit 1
+fi
+
+# The session cookie must NOT be Secure (the appliance is HTTP-only). Verify
+# the jar actually captured it.
+if ! grep -qi 'lemonseed_session' "${COOKIE_JAR}"; then
+  echo "lemonseed_session cookie not captured in jar (Secure flag?)" >&2
+  cat /tmp/qemu-signin-hdr.txt >&2 || true
+  exit 1
+fi
+
+echo "==> Waiting for auth state=enabled (authenticated, remaining budget)"
+# Signed in, and against /api/system: /api/status no longer carries auth at all,
+# so reading account counts here doubles as proof the gated half answers.
 auth_deadline=$((deadline))
 auth_json=""
 while (( SECONDS < auth_deadline )); do
-  candidate="$(curl -fsS --max-time 10 "http://127.0.0.1:${HOST_PORT}/api/status" 2>/dev/null || true)"
+  candidate="$(poll_http "/api/system" 10 "${COOKIE_JAR}" "${AUTH_HOST}" 2>/dev/null || true)"
   if [[ -n "${candidate}" ]]; then
     auth_ok="$(echo "${candidate}" | python3 -c '
 import json, sys
@@ -335,45 +395,25 @@ done
 
 if [[ -z "${auth_json}" ]]; then
   echo "Timed out waiting for auth state=enabled" >&2
-  curl -fsS --max-time 5 "http://127.0.0.1:${HOST_PORT}/api/status" >&2 || true
+  curl -fsS --max-time 5 -b "${COOKIE_JAR}" -H "Host: ${AUTH_HOST}" \
+    --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
+    "http://${AUTH_HOST}:${HOST_PORT}/api/system" >&2 || true
   tail -80 "${LOG}" >&2 || true
   exit 1
 fi
 echo "${auth_json}" | python3 -c '
 import json, sys
-a = json.load(sys.stdin).get("auth") or {}
+data = json.load(sys.stdin)
+a = data.get("auth") or {}
 state = a.get("state")
 users = a.get("users")
 admins = a.get("admins")
 print("OK: auth state=%r users=%r admins=%r" % (state, users, admins))
 assert state == "enabled", a
 assert users == 1 and admins == 1, a
+# Setup is finished by now, so the name the installer handoff looks for exists.
+assert (data.get("setup") or {}).get("mdns_name"), data
 '
-
-echo "==> CP-native login: sign-in page + credential login"
-login_page_code="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: ${AUTH_HOST}" "http://127.0.0.1:${HOST_PORT}/login")"
-[[ "${login_page_code}" == "200" ]] || {
-  echo "GET /login: expected 200, got ${login_page_code}" >&2; exit 1;
-}
-signin_code="$(curl -sS --max-time 60 -o /dev/null -c "${COOKIE_JAR}" \
-  -D /tmp/qemu-signin-hdr.txt -w '%{http_code}' \
-  -X POST "http://127.0.0.1:${HOST_PORT}/login" \
-  -H "Host: ${AUTH_HOST}" \
-  -H 'Content-Type: application/json' \
-  -d "{\"username\":\"${ADMIN_USERNAME}\",\"password\":\"${ADMIN_PASSWORD}\",\"rd\":\"/\"}")"
-if [[ "${signin_code}" != "302" ]] || ! grep -qi '^set-cookie: lemonseed_session' /tmp/qemu-signin-hdr.txt; then
-  echo "POST /login: expected 302 + lemonseed_session cookie, got ${signin_code}" >&2
-  cat /tmp/qemu-signin-hdr.txt >&2 || true
-  exit 1
-fi
-
-# The session cookie must NOT be Secure (the appliance is HTTP-only). Verify
-# the jar actually captured it.
-if ! grep -qi 'lemonseed_session' "${COOKIE_JAR}"; then
-  echo "lemonseed_session cookie not captured in jar (Secure flag?)" >&2
-  cat /tmp/qemu-signin-hdr.txt >&2 || true
-  exit 1
-fi
 
 echo "==> Checking /api/boot"
 boot_json="$(poll_http "/api/boot" 30)"
@@ -1301,6 +1341,35 @@ api_unauth_code="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: ${AUTH_HOST
 [[ "${api_unauth_code}" == "302" ]] || {
   echo "GET /api/data unauthenticated: expected 302, got ${api_unauth_code}" >&2; exit 1;
 }
+# The full snapshot moved behind the gate in step 5, so it must be gated too.
+system_unauth_code="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: ${AUTH_HOST}" "http://127.0.0.1:${HOST_PORT}/api/system")"
+[[ "${system_unauth_code}" == "302" ]] || {
+  echo "GET /api/system unauthenticated: expected 302, got ${system_unauth_code}" >&2; exit 1;
+}
+
+# --- The regression M6.6 step 3 exists to fix, end to end through real nginx -----
+# A 302 here is the bug: fetch() follows it and hands back login HTML at HTTP 200,
+# so the portal's `if (!res.ok)` never fires and an expired session reads as dead
+# UI (or, worse, as "managed by Lemonseed") instead of a sign-in prompt.
+echo "==> Auth gate: an expired or absent session answers an XHR with a real 401"
+xhr_code="$(curl -sS -o /tmp/qemu-xhr-401.json -D /tmp/qemu-xhr-401.hdr -w '%{http_code}' \
+  -H "Host: ${AUTH_HOST}" -H 'X-Requested-With: fetch' \
+  "http://127.0.0.1:${HOST_PORT}/api/system")"
+[[ "${xhr_code}" == "401" ]] || {
+  echo "XHR /api/system unauthenticated: expected 401, got ${xhr_code}" >&2
+  cat /tmp/qemu-xhr-401.hdr >&2 || true
+  exit 1
+}
+grep -qi 'content-type: application/json' /tmp/qemu-xhr-401.hdr || {
+  echo "the XHR 401 is not json:" >&2; cat /tmp/qemu-xhr-401.hdr >&2; exit 1;
+}
+python3 -c '
+import json
+d = json.load(open("/tmp/qemu-xhr-401.json"))
+assert d.get("lemonseed") == "session-expired", d
+assert (d.get("detail") or "").strip(), d
+print("OK: 401 + renderable json the portal can act on")
+'
 
 echo "==> Authenticated requests (session cookie)"
 # --resolve maps the mDNS hostname to the QEMU host-forward port so curl sends
@@ -1308,7 +1377,7 @@ echo "==> Authenticated requests (session cookie)"
 # NOTE: /settings/ (admin-gated) is deliberately NOT probed here — it 403s in
 # the QEMU test env (Host/--resolve port + cookie-domain interaction) while
 # working on a real appliance. Verified on hardware instead (DESIGN M6.2).
-for p in / /api/data; do
+for p in / /api/data /api/system; do
   code="$(curl -sS -o /dev/null -b "${COOKIE_JAR}" \
     --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
     -w '%{http_code}' "http://${AUTH_HOST}:${HOST_PORT}${p}")"
@@ -1357,6 +1426,22 @@ for p in /healthz /api/status; do
     echo "GET ${p} unauthenticated: expected 200, got ${code}" >&2; exit 1;
   }
 done
+# The shared theme (M6.6 S5.8) styles the login and setup pages, so it must be
+# readable with no session and served by nginx out of the image -- not proxied to
+# the control plane, which the gateway's not-ready page also depends on.
+css_code="$(curl -sS -o /tmp/qemu-theme.css -D /tmp/qemu-theme.hdr -w '%{http_code}' \
+  "http://127.0.0.1:${HOST_PORT}/_lemonseed/lemonseed.css")"
+[[ "${css_code}" == "200" ]] || {
+  echo "GET /_lemonseed/lemonseed.css unauthenticated: expected 200, got ${css_code}" >&2
+  exit 1
+}
+grep -qi 'content-type: text/css' /tmp/qemu-theme.hdr || {
+  echo "the theme is not served as css:" >&2; cat /tmp/qemu-theme.hdr >&2; exit 1
+}
+grep -q -- '--accent' /tmp/qemu-theme.css || {
+  echo "the theme served by nginx has no palette variables" >&2; exit 1
+}
+echo "OK: open endpoints answer, including the shared theme"
 
 if [[ "${E2E_CHAT}" == "1" ]]; then
   echo "==> M6.5 e2e: pick Gemma + pull/load the model (state=ready)"

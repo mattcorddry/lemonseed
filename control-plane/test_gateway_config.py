@@ -27,6 +27,7 @@ from pathlib import Path
 CP = Path(__file__).resolve().parent
 ROOT = CP.parent
 GATEWAY = ROOT / "nixos" / "modules" / "gateway.nix"
+PROBE = ROOT / "scripts" / "gateway-error-probe.sh"
 CP_DOWN_HTML = CP / "static" / "cp-down.html"
 
 FIVE_XX = r"error_page 500 502 503 504 =503"
@@ -86,20 +87,41 @@ class CpDownPageTests(unittest.TestCase):
             self.assertNotIn(wrong, self.text, f"page copy blames {wrong!r}")
 
     def test_page_has_no_subresource_that_could_fail_the_same_way(self) -> None:
-        """No external hosts, no stylesheets, no fonts, no module scripts.
+        """No external hosts, no fonts, no module scripts.
 
-        The one allowed subresource is the brand mark, which nginx serves out of
-        SquashFS rather than from the service that is currently down. Checked on
-        the raw text: a commented-out CDN line is an invitation to re-break this.
+        The rule is about *what a subresource depends on*, not about having
+        subresources: anything this page fetches must come from the read-only
+        image that nginx serves directly, never from a service that can be down.
+        That is why the brand mark and /_lemonseed/lemonseed.css are allowed and
+        a CDN or a control-plane-rendered stylesheet is not -- the page renders
+        only because nginx is up and reading that store path, so a sibling file
+        in the same directory cannot fail the way a proxied asset does.
+
+        Checked on the raw text: a commented-out CDN line is an invitation to
+        re-break this.
         """
-        self.assertNotIn("<link", self.raw)
+        for src in re.findall(r'<(?:img|link)[^>]*?(?:src|href)="([^"]+)"', self.raw):
+            self.assertTrue(
+                src.startswith("/_lemonseed/"),
+                f"subresource {src} is not served straight from the image",
+            )
         self.assertNotIn("<script src", self.raw)
         self.assertNotIn("http://", self.raw)
         self.assertNotIn("https://", self.raw)
-        for src in re.findall(r'<img[^>]*src="([^"]+)"', self.raw):
-            self.assertTrue(
-                src.startswith("/_lemonseed/brand/"), f"unexpected img source {src}"
-            )
+
+    def test_the_theme_root_is_one_file_for_the_whole_appliance(self) -> None:
+        """S5.8: the error page and the control-plane pages share one stylesheet.
+
+        Two palettes is how a login page and an error page start to disagree.
+        """
+        self.assertIn('href="/_lemonseed/lemonseed.css"', self.raw)
+        css = (CP / "static" / "lemonseed.css").read_text(encoding="utf-8")
+        self.assertIn(":root", css)
+        # Page rules are namespaced: unscoped, cp-down's bare `p` and `button`
+        # rules would restyle every portal page that shares the file.
+        for selector in (".cp-down .card", ".cp-down p", ".cp-down button"):
+            self.assertIn(selector, css)
+        self.assertNotIn("<style>", self.raw)
 
     def test_retry_probe_is_the_status_endpoint_and_hands_back_to_the_shell(self) -> None:
         """/api/status is unauthenticated, and readiness is the CP's call.
@@ -243,6 +265,111 @@ class GatewayOrderingTests(unittest.TestCase):
     def test_restart_is_not_weakened(self) -> None:
         """The nginx module already sets Restart=always; do not downgrade it."""
         self.assertNotIn("Restart", self._unit())
+
+
+class AuthGateMirrorTests(unittest.TestCase):
+    """The live probe must mirror the auth gate it claims to reproduce.
+
+    ``scripts/gateway-error-probe.sh`` is the only thing that can execute nginx's
+    ``if``, because nginx's config language is not reachable from Python. Its
+    mirror is worthless the moment the module drifts, so compare the whole
+    directive bodies against each other instead of grepping for fragments that a
+    rewrite could satisfy by accident.
+    """
+
+    HEAD = "@auth_unauthorized"
+
+    def _body(self, path: Path) -> str:
+        blocks = _blocks(path.read_text(encoding="utf-8"), self.HEAD)
+        self.assertIn(self.HEAD, blocks, f"{path.name} lost its {self.HEAD} location")
+        return blocks[self.HEAD]
+
+    def _normalized(self, path: Path) -> str:
+        """One line per directive: no comments, no indentation, no shell escapes."""
+        lines = []
+        for raw in self._body(path).splitlines():
+            line = raw.replace("\\$", "$").strip()
+            if line and not line.startswith("#"):
+                lines.append(line)
+        return "\n".join(lines)
+
+    def test_the_probe_mirrors_the_shipped_gate(self) -> None:
+        shipped = self._normalized(GATEWAY)
+        probed = self._normalized(PROBE)
+        self.assertEqual(shipped, probed)
+
+    def test_the_gate_answers_the_two_kinds_of_caller_differently(self) -> None:
+        """Sanity on the mirror itself: both branches must really be there.
+
+        Without this, both sides could drift to the same single branch and the
+        equality test above would still pass.
+        """
+        body = self._normalized(PROBE)
+        self.assertIn('if ($http_x_requested_with = "fetch") {', body)
+        self.assertIn("session-expired", body)
+        self.assertIn("return 302 /login?rd=$request_uri;", body)
+
+
+class StatusSurfaceTests(unittest.TestCase):
+    """Which API paths the edge answers without a session (M6.6 step 5).
+
+    An open endpoint is a leak until somebody argues otherwise, so the open list
+    is closed: a new gated API that forgot its gate fails here even though
+    nothing about it existed when this test was written.
+    """
+
+    OPEN = ["/api/boot", "/api/status"]
+    PREFIX = 'locations."= /api/'
+
+    def setUp(self) -> None:
+        self.text = GATEWAY.read_text(encoding="utf-8")
+
+    def _open_api_paths(self) -> list[str]:
+        names = [
+            line.strip().split('"')[1][2:]
+            for line in self.text.splitlines()
+            if line.strip().startswith(self.PREFIX)
+        ]
+        # Guard against this scan silently matching nothing.
+        self.assertGreater(len(names), len(self.OPEN), f"scan found only {names}")
+        return sorted(n for n in names if "authGate" not in _nix_location(self.text, f"= {n}"))
+
+    def test_only_the_named_endpoints_answer_pre_login(self) -> None:
+        self.assertEqual(self._open_api_paths(), sorted(self.OPEN))
+
+    def test_the_full_snapshot_keeps_its_gate_and_its_fallback(self) -> None:
+        body = _nix_location(self.text, "= /api/system")
+        self.assertIn("authGate", body)
+        self.assertIn(FIVE_XX + " /_lemonseed/cp-down;", body)
+
+
+class ThemeSurfaceTests(unittest.TestCase):
+    """The one shared stylesheet has to be reachable before anyone signs in.
+
+    It styles the setup and login pages, which exist precisely because there is
+    no session yet, and it styles the gateway's not-ready page, which renders
+    while the control plane is down. Gating it or proxying it would break both.
+    """
+
+    NAME = "= /_lemonseed/lemonseed.css"
+
+    def setUp(self) -> None:
+        self.text = GATEWAY.read_text(encoding="utf-8")
+
+    def test_it_is_read_from_the_image_not_from_a_service(self) -> None:
+        body = _nix_location(self.text, self.NAME)
+        self.assertIn("try_files /lemonseed.css =404;", body)
+        self.assertIn("cpStatic", body)
+        self.assertNotIn("proxy_pass", body, "a proxied theme cannot render when the CP is down")
+
+    def test_it_is_not_gated(self) -> None:
+        self.assertNotIn("authGate", _nix_location(self.text, self.NAME))
+
+    def test_it_does_not_reuse_the_long_brand_expiry(self) -> None:
+        """The store path changes with the theme but the URL does not."""
+        body = _nix_location(self.text, self.NAME)
+        self.assertNotIn("expires", body)
+        self.assertIn("must-revalidate", body)
 
 
 if __name__ == "__main__":

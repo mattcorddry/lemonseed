@@ -392,6 +392,17 @@ in
       extraConfig = ''
         ${authVarDecls}
         location @auth_unauthorized {
+          # fetch() follows a 302 silently and hands back login HTML at HTTP
+          # 200, so a client's `if (!res.ok)` can never fire: that is how an
+          # expired admin session turned into dead UI (or a bogus "managed by
+          # Lemonseed") instead of a sign-in prompt. An XHR therefore gets a
+          # real 401 with a body it can render; only navigations redirect.
+          # `return` inside `if` is the one sanctioned use of `if` here, and
+          # default_type is at location level because it is not valid in `if`.
+          default_type application/json;
+          if ($http_x_requested_with = "fetch") {
+            return 401 '{"detail":"Sign in again to continue.","lemonseed":"session-expired"}';
+          }
           return 302 /login?rd=$request_uri;
         }
         location /_lemonseed/cp-down {
@@ -501,8 +512,10 @@ in
       };
 
       # Reserved Lemonseed JSON APIs (must win over OWUI /api/*).
-      # /api/boot + /api/status stay open (installer handoff, status probes);
-      # the rest are gated (M6.2).
+      # /api/boot + /api/status stay open: the installer handoff after reboot and
+      # the gateway's own not-ready page both have to reach them before anyone
+      # can sign in, so they answer with a subset that holds no household facts
+      # (M6.6 step 5). /api/system is the full snapshot and is gated.
       locations."= /api/boot" = {
         proxyPass = "http://127.0.0.1:8080";
         extraConfig = cpProxy;
@@ -510,6 +523,10 @@ in
       locations."= /api/status" = {
         proxyPass = "http://127.0.0.1:8080";
         extraConfig = "${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
+      locations."= /api/system" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
       locations."= /api/hardware" = {
         proxyPass = "http://127.0.0.1:8080";
@@ -589,6 +606,25 @@ in
         extraConfig = ''
           expires 7d;
           add_header Cache-Control "public";
+        '';
+      };
+
+      # The one stylesheet root (M6.6 S5.8): setup, login, the shell, the settings
+      # panel and the gateway's own not-ready page all read this file, so they
+      # cannot drift apart. Served from the read-only image, not the control
+      # plane, for two reasons: the login and setup pages need it *before* anyone
+      # has a session, and cp-down.html needs it while the control plane is down.
+      # `root` + `try_files` rather than `alias` because an exact-match location
+      # with root would otherwise look for /_lemonseed/lemonseed.css on disk.
+      # Revalidated rather than cached for a week: the store path changes when the
+      # theme changes, but the URL does not, so a long expiry would pin a stale
+      # theme across an upgrade.
+      locations."= /_lemonseed/lemonseed.css" = {
+        root = "${cpStatic}";
+        extraConfig = ''
+          try_files /lemonseed.css =404;
+          default_type text/css;
+          add_header Cache-Control "public, max-age=0, must-revalidate";
         '';
       };
 

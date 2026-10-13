@@ -22,6 +22,7 @@ import time
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import unquote
 
 import data_services
 import db
@@ -78,6 +79,28 @@ error_page 401 = @auth_unauthorized;
 # Admin group check is enforced by the CP (X-Forwarded-Groups), not nginx `if`
 # (which runs in the rewrite phase, before auth_request sets variables).
 ADMIN_SNIPPET = ""
+
+
+def safe_redirect_target(raw: str) -> str:
+    """Sanitize a post-login redirect target to a same-origin relative path.
+
+    The value arrives from a query string we did not compose ourselves, so the
+    rule is: keep it only if no browser could resolve it off-appliance.
+
+    Decoding *before* checking is deliberate -- ``%2f%2fevil.com`` must not
+    clear a test that only looked at the encoded form. A ``\\`` is rejected
+    because browsers resolve ``/\\host`` the same way they resolve ``//host``,
+    which is exactly the bypass this check exists to close.
+    """
+    rd = unquote((raw or "").strip())
+    if not rd.startswith("/"):
+        return "/"
+    # Only the path can change the origin; a ``//`` inside a query value is
+    # data for our own page, not a host.
+    path = rd.split("?", 1)[0].split("#", 1)[0]
+    if path.startswith("//") or "//" in path or "\\" in path or ":" in path:
+        return "/"
+    return rd
 
 _gate_lock = threading.Lock()
 _gate_synced = False

@@ -684,5 +684,53 @@ class AuthGateWorkerTests(unittest.TestCase):
             self.assertTrue(self._wait_gate(False))
 
 
+class RedirectTargetTests(unittest.TestCase):
+    """``rd`` is attacker-controlled text, so each rejected shape is its own case.
+
+    The gate hands us ``/login?rd=$request_uri`` verbatim and the login form
+    echoes the value back, so this function is the only thing standing between
+    a sign-in page and an off-appliance redirect. The ``/\\host`` case is the
+    one that used to be missing: browsers resolve it exactly like ``//host``.
+    """
+
+    def test_plain_path_is_kept(self) -> None:
+        self.assertEqual(auth.safe_redirect_target("/settings/"), "/settings/")
+
+    def test_query_string_survives(self) -> None:
+        # The truncation bug: nginx does not encode $request_uri, so a target
+        # with its own query string must still arrive whole.
+        self.assertEqual(
+            auth.safe_redirect_target("/settings/?tab=models"),
+            "/settings/?tab=models",
+        )
+
+    def test_empty_is_root(self) -> None:
+        self.assertEqual(auth.safe_redirect_target(""), "/")
+
+    def test_absolute_url_is_rejected(self) -> None:
+        self.assertEqual(auth.safe_redirect_target("http://evil.example/x"), "/")
+
+    def test_protocol_relative_is_rejected(self) -> None:
+        self.assertEqual(auth.safe_redirect_target("//evil.example"), "/")
+
+    def test_backslash_origin_is_rejected(self) -> None:
+        self.assertEqual(auth.safe_redirect_target(r"/\evil.example"), "/")
+
+    def test_encoded_double_slash_is_rejected(self) -> None:
+        # Decoding happens before checking, so the encoded form cannot sneak a
+        # host past a check that only looked at the raw string.
+        self.assertEqual(auth.safe_redirect_target("%2f%2fevil.example"), "/")
+
+    def test_scheme_hidden_in_the_path_is_rejected(self) -> None:
+        self.assertEqual(auth.safe_redirect_target("/http://evil.example"), "/")
+
+    def test_double_slash_after_the_path_is_rejected(self) -> None:
+        self.assertEqual(auth.safe_redirect_target("/a//evil.example"), "/")
+
+    def test_double_slash_inside_a_query_value_is_kept(self) -> None:
+        # The path decides the origin; a query value is just data for our page.
+        self.assertEqual(auth.safe_redirect_target("/a?next=//x"), "/a?next=//x")
+
+
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

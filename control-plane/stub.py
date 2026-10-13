@@ -44,6 +44,15 @@ SETUP_COMPLETE_FILE = Path("/etc/appliance-setup-complete")
 SETUP_STATE_FILE = Path("/etc/appliance-setup.json")
 HANDOFF_DONE_FILE = Path("/run/lemonseed/mdns-handoff-done")
 LEMOND_ENV_FILE = Path("/var/lib/lemonseed/lemonade/lemond.env")
+# One status, two meanings, two body shapes (M6.6): 403 from an OWUI guard is
+# "Lemonseed owns this setting" and carries lemonseed=managed-by-lemonseed;
+# 403 from the CP is "yours to see, not to do" and carries needs-admin. The
+# client keys off the marker, never off the status alone.
+NEEDS_ADMIN_MARKER = "needs-admin"
+# The portal labels its own requests so the edge can answer an XHR with a real
+# 401 instead of a 302 that fetch() would follow into login HTML at HTTP 200.
+XHR_HEADER = "X-Requested-With"
+XHR_MARKER = "fetch"
 # Brand icons: packaged under control-plane/static/brand, or repo assets/brand.
 _BRAND_CANDIDATES = (
     Path(__file__).resolve().parent / "static" / "brand",
@@ -354,203 +363,132 @@ def boot_snapshot() -> dict[str, Any]:
     }
 
 
-STYLE = """
-:root {
-  --bg0: #0f1c18;
-  --ink: #f2f7f4;
-  --muted: #a7bfb4;
-  --accent: #c6f27a;
-  --accent-ink: #142018;
-  --line: rgba(242, 247, 244, 0.14);
-  --ok: #9be67c;
-  --wait: #ffe2a8;
-  --bad: #ff8f8f;
-  --font: "Segoe UI", "Helvetica Neue", sans-serif;
+def status_public() -> dict[str, Any]:
+    """The half of the status surface an unauthenticated client may see (M6.6 step 5).
+
+    Exactly two clients reach the appliance before anyone signs in, and each
+    needs three things:
+
+    * the installer's post-reboot handoff recognises the box by ``role`` and
+      finds the portal through ``portal_url`` / ``setup.mdns_name``;
+    * the gateway's not-ready page reloads once ``status`` says ``ok``.
+
+    Everything else moved to ``/api/system`` behind the session gate: the full
+    snapshot carries household facts (account counts, telemetry, data-plane and
+    module state), which any device on the LAN could read before this split.
+    It also ran seven ``systemctl`` probes plus a Docker and a lemond query on
+    every poll, so an unauthenticated poller could make the appliance do real
+    work; spawning the background workers is now a signed-in caller's job (they
+    are started unconditionally at CP startup regardless).
+
+    Keys are listed rather than subtracted from the full snapshot on purpose.
+    The full status grows over time, and a filter would leak every new field by
+    default until somebody remembered to subtract it.
+    """
+    setup = load_setup()
+    return {
+        "status": "ok",
+        "role": "control-plane",
+        "version": appliance_version(),
+        "setup_complete": setup_complete(),
+        "setup": {"mdns_name": setup.get("mdns_name")},
+        "portal_url": f"http://{primary_mdns_slug()}.local/",
+    }
+
+
+# Every control-plane call the portal makes goes through portalFetch() below
+# (M6.6 step 4). The contract it implements is the reason it exists: fifteen
+# hand-written fetch() calls each invented their own answer to a dead session,
+# and the one that looked correct was unreachable. Twelve of them were
+# control-plane calls; the three that remain outside are noted where they are.
+#
+#   401  not signed in       -> navigate the TOP frame to /login, then bail.
+#                               The portal lives in an iframe, so a same-frame
+#                               redirect renders a login page inside the portal.
+#   403  signed in, not yours -> hand the response back so the caller renders
+#                               ``detail``. Never redirect: "not you" and "not
+#                               yours" are different failures, and a redirect
+#                               throws away the reason the server just explained.
+#   5xx  broken or starting   -> bounded retries with backoff, then a response
+#                               the caller can render. Never redirect.
+#
+# It also labels every request, which is how the edge knows to answer an XHR with
+# a real 401 instead of a 302 that fetch() follows into login HTML at HTTP 200.
+PORTAL_FETCH_JS = r"""
+// Bounded on purpose: the appliance is either coming up or genuinely broken, and
+// an unbounded retry loop turns one dead service into a browser that never stops
+// asking. Three tries, roughly 0.5s / 1s / 2s, then let the caller say something.
+const PORTAL_RETRY_DELAYS = [500, 1000, 2000];
+
+function portalGotoLogin() {
+  // rd must be where the *person* was, not where this document lives. The
+  // settings panel is an iframe of the shell, so using its own path would send
+  // the admin to /settings/content/ after sign-in: a bare fragment with no nav,
+  // no chat frame and no shell around it.
+  let here = window.location.pathname + (window.location.search || '');
+  try {
+    if (window.top !== window.self) {
+      here = window.top.location.pathname + (window.top.location.search || '');
+    }
+  } catch (err) {
+    // Reading another frame's location throws if it is ever cross-origin. The
+    // own-path fallback still gets them signed back in, just less precisely.
+  }
+  window.top.location = '/login?rd=' + encodeURIComponent(here);
 }
-* { box-sizing: border-box; }
-html, body {
-  margin: 0; min-height: 100%;
-  background:
-    radial-gradient(1100px 560px at 8% -10%, #2a5a45 0%, transparent 55%),
-    radial-gradient(900px 480px at 100% 0%, #1c3d55 0%, transparent 50%),
-    var(--bg0);
-  color: var(--ink); font-family: var(--font);
+
+function portalUnavailable(status) {
+  return {
+    ok: false,
+    status: status,
+    // Callers all read a JSON body; this keeps that one assumption true for a
+    // response that never had one. Callers gate on ok, so this is a bail-out.
+    json: async () => ({ detail: 'The appliance is not answering. Try again shortly.' }),
+  };
 }
-.shell { max-width: 36rem; margin: 0 auto; padding: 2.25rem 1.25rem 3rem; }
-.brand-mark {
-  display: flex; align-items: center; gap: 0.65rem; margin-bottom: 0.15rem;
+
+async function portalFetch(path, options) {
+  const init = Object.assign({cache: 'no-store'}, options || {});
+  init.headers = Object.assign({'X-Requested-With': 'fetch'}, init.headers || {});
+  const method = (init.method || 'GET').toUpperCase();
+  for (let attempt = 0; ; attempt += 1) {
+    let res = null;
+    try {
+      res = await fetch(path, init);
+    } catch (err) {
+      res = null;  // no answer at all: same shape to the caller as a 5xx
+    }
+    if (res && res.status === 401) {
+      portalGotoLogin();
+      return portalUnavailable(401);
+    }
+    // Only GET is retried. reset-config and reconcile are not idempotent in the
+    // way that matters: a retry after a lost response can run them twice.
+    const retryable = (res === null || res.status >= 500) && method === 'GET';
+    if (retryable && attempt < PORTAL_RETRY_DELAYS.length) {
+      await new Promise((done) => setTimeout(done, PORTAL_RETRY_DELAYS[attempt]));
+      continue;
+    }
+    if (res === null) return portalUnavailable(0);
+    return res;  // 2xx, and 403/409 for the caller to render
+  }
 }
-.brand-mark .logo {
-  display: block; width: 3.25rem; height: 3.25rem; margin: 0;
-  border-radius: 50%; object-fit: cover; flex-shrink: 0;
-  box-shadow: 0 0 0 1px rgba(255,255,255,0.08);
+
+// The one place that knows how to describe a refusal. A managed-path denial and
+// an ordinary permissions error both arrive as 403 carrying a detail written for
+// the operator; rendering it verbatim is what makes "Lemonseed owns this setting"
+// discoverable instead of looking like a broken button.
+async function portalError(res, fallback) {
+  if (res && typeof res.json === 'function') {
+    try {
+      const data = await res.json();
+      if (data && data.detail) return data.detail;
+    } catch (err) {
+      // An HTML error page has no detail to read; fall through to the fallback.
+    }
+  }
+  return fallback || 'That did not work.';
 }
-.brand-mark .wordmark {
-  font-size: clamp(1.35rem, 5vw, 1.65rem); font-weight: 700;
-  letter-spacing: 0.14em; color: var(--ink);
-}
-.logo {
-  display: block; width: 3.25rem; height: 3.25rem; margin: 0;
-  border-radius: 50%; object-fit: cover;
-  box-shadow: 0 0 0 1px rgba(255,255,255,0.08);
-}
-h1 { margin: 0.55rem 0 0.45rem; font-size: clamp(2rem, 8vw, 2.5rem); letter-spacing: -0.03em; }
-.lede { color: var(--muted); line-height: 1.45; margin: 0; }
-.panel {
-  margin-top: 1.5rem; padding: 1.1rem;
-  border: 1px solid var(--line); border-radius: 14px;
-  background: rgba(15, 28, 24, 0.55);
-}
-.panel h2 {
-  margin: 0 0 0.75rem; font-size: 0.9rem; letter-spacing: 0.04em;
-  text-transform: uppercase; color: var(--muted);
-}
-.row { display: flex; justify-content: space-between; gap: 1rem; padding: 0.35rem 0; }
-.row + .row { border-top: 1px solid var(--line); }
-.name { color: var(--muted); font-size: 0.92rem; }
-.state { font-variant-numeric: tabular-nums; font-weight: 600; }
-.state.ok { color: var(--ok); }
-.state.wait { color: var(--wait); }
-.state.bad { color: var(--bad); }
-.progress {
-  height: 0.7rem; overflow: hidden; border-radius: 999px;
-  background: rgba(255,255,255,0.1); margin: 0.85rem 0 0.55rem;
-}
-.progress > span {
-  display: block; height: 100%; background: linear-gradient(90deg, #7dcf6a, var(--accent));
-  transition: width 0.4s ease;
-}
-details { margin-top: 1rem; }
-summary { color: var(--muted); cursor: pointer; }
-label { display: block; margin: 0.85rem 0 0.35rem; color: var(--muted); font-size: 0.9rem; }
-input, select {
-  width: 100%; padding: 0.75rem 0.85rem; border-radius: 10px;
-  border: 1px solid var(--line); background: rgba(0,0,0,0.25); color: var(--ink);
-}
-.cta {
-  margin-top: 1.1rem; width: 100%; border: 0; border-radius: 999px;
-  padding: 0.9rem 1rem; font-size: 1rem; font-weight: 700;
-  background: var(--accent); color: var(--accent-ink); cursor: pointer;
-}
-.err { color: var(--bad); margin-top: 0.75rem; }
-.okmsg { color: var(--ok); margin-top: 0.75rem; }
-.app-shell {
-  max-width: none; margin: 0; padding: 0; min-height: 100vh;
-  display: flex; flex-direction: column;
-}
-.app-bar {
-  display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
-  padding: 0.55rem 1rem; border-bottom: 1px solid var(--line);
-  background: rgba(15, 28, 24, 0.92); backdrop-filter: blur(8px);
-}
-.app-bar .brand-logo {
-  display: block; width: 1.75rem; height: 1.75rem; margin: 0;
-  border-radius: 50%; object-fit: cover; flex-shrink: 0;
-  box-shadow: 0 0 0 1px rgba(255,255,255,0.1);
-}
-.app-bar .title { margin: 0; font-size: 1rem; font-weight: 600; }
-.app-bar .spacer { flex: 1; }
-.app-bar .nav {
-  display: flex; align-items: center; gap: 0.15rem;
-}
-.app-bar .nav a, .app-bar .nav span {
-  color: var(--muted); text-decoration: none; font-size: 0.88rem; font-weight: 600;
-  padding: 0.35rem 0.65rem; border-radius: 999px;
-}
-.app-bar .nav a:hover { color: var(--accent); background: rgba(255,255,255,0.06); }
-.app-bar .nav a.active { color: var(--accent-ink); background: var(--accent); }
-.app-bar .nav .disabled {
-  opacity: 0.45; cursor: default; pointer-events: none;
-}
-.app-bar .metrics {
-  display: none; align-items: center; gap: 0.85rem;
-}
-@media (min-width: 720px) { .app-bar .metrics { display: flex; } }
-.metric { min-width: 4.75rem; }
-.metric label {
-  display: block; font-size: 0.62rem; letter-spacing: 0.06em;
-  text-transform: uppercase; color: var(--muted); margin-bottom: 0.2rem;
-}
-.metric .bar {
-  height: 4px; border-radius: 999px; background: rgba(255,255,255,0.12); overflow: hidden;
-}
-.metric .bar > span {
-  display: block; height: 100%; background: linear-gradient(90deg, #7dcf6a, var(--accent));
-  transition: width 0.35s ease;
-}
-.app-bar .gear {
-  color: var(--muted); text-decoration: none; font-size: 1.15rem;
-  line-height: 1; padding: 0.25rem 0.45rem; border-radius: 8px;
-}
-.app-bar .gear:hover, .app-bar .gear.active { color: var(--accent); }
-.app-bar a {
-  color: var(--muted); text-decoration: none; font-size: 0.9rem; font-weight: 600;
-}
-.app-bar a:hover { color: var(--accent); }
-.embed-shell {
-  max-width: 42rem; margin: 0 auto; padding: 1.5rem 1rem 2.5rem;
-}
-.embed-shell h1 {
-  margin: 0 0 1rem; font-size: clamp(1.5rem, 5vw, 2rem); letter-spacing: -0.02em;
-}
-.frame-wrap iframe.hidden {
-  visibility: hidden;
-  pointer-events: none;
-  z-index: 0;
-}
-.frame-wrap { flex: 1; min-height: 0; position: relative; background: #0a1210; }
-.frame-wrap iframe {
-  position: absolute; inset: 0; width: 100%; height: 100%; border: 0; z-index: 1;
-}
-.frame-fallback {
-  position: absolute; inset: 0; display: flex; align-items: center;
-  justify-content: center; padding: 2rem; text-align: center; color: var(--muted);
-  z-index: 2;
-}
-.frame-fallback.hidden { display: none; }
-.landing {
-  max-width: 32rem; margin: 0 auto; padding: 1.5rem;
-  border: 1px solid var(--line); border-radius: 16px;
-  background: rgba(15, 28, 24, 0.72);
-  text-align: left;
-}
-.landing h2 {
-  margin: 0 0 0.5rem; font-size: 1.25rem; color: var(--ink); letter-spacing: -0.02em;
-}
-.landing p { margin: 0; color: var(--muted); line-height: 1.45; }
-.landing .status-line {
-  margin-top: 1rem; font-weight: 700; font-variant-numeric: tabular-nums;
-}
-.landing .status-line.ok { color: var(--ok); }
-.landing .status-line.wait { color: var(--wait); }
-.landing .status-line.bad { color: var(--bad); }
-.frame-wrap iframe.hidden { display: none; }
-.frame-fallback.hidden { display: none; }
-.login-page {
-  min-height: 100vh; display: flex; align-items: center; justify-content: center;
-  padding: 1.5rem;
-}
-.login-card {
-  width: 100%; max-width: 24rem; padding: 2rem 1.75rem 2.25rem;
-  border: 1px solid var(--line); border-radius: 16px;
-  background: rgba(15, 28, 24, 0.72);
-  text-align: center;
-}
-.login-card .brand-logo {
-  display: block; width: 3.25rem; height: 3.25rem; margin: 0 auto 0.5rem;
-  border-radius: 50%; object-fit: cover;
-  box-shadow: 0 0 0 1px rgba(255,255,255,0.1);
-}
-.login-card h1 { font-size: 1.75rem; margin: 0.25rem 0 0.2rem; }
-.login-card .lede { margin-bottom: 0.25rem; }
-.login-card .field { text-align: left; }
-.login-error { color: var(--bad); margin: 0.75rem 0 0; }
-.btn {
-  margin-top: 1.25rem; width: 100%; border: 0; border-radius: 999px;
-  padding: 0.85rem 1rem; font-size: 1rem; font-weight: 700; cursor: pointer;
-  background: var(--accent); color: var(--accent-ink);
-}
-.btn.primary { background: var(--accent); color: var(--accent-ink); }
 """
 
 
@@ -685,7 +623,7 @@ waitForStartup();
     body = f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Lemonseed setup</title>{brand_head_links()}<style>{STYLE}</style>
+<title>Lemonseed setup</title>{brand_head_links()}<link rel="stylesheet" href="/_lemonseed/lemonseed.css"/>
 </head><body><main class="shell">
 <div class="brand-mark">
 <img class="logo" src="/_lemonseed/brand/lemon-128.png" width="52" height="52" alt=""/>
@@ -736,6 +674,21 @@ if (timezoneSelect && !{json.dumps(bool(saved_timezone))}) {{
     return body.encode()
 
 
+def _redirect_target(query: str) -> str:
+    """Everything after ``rd=`` in a login query string, deliberately unparsed.
+
+    nginx composes the gate redirect as ``/login?rd=$request_uri`` without
+    encoding, and ``$request_uri`` legitimately contains ``?`` and ``&``
+    (``/settings/?tab=x``). Reading it as an ordinary query parameter truncates
+    the target at the second ``?``; taking the remainder keeps it whole and
+    leaves safety to ``auth.safe_redirect_target``, the layer that actually
+    knows what a browser would resolve.
+    """
+    if not query.startswith("rd="):
+        return ""
+    return query[len("rd=") :]
+
+
 def page_login(*, rd: str = "/", error: str = "") -> bytes:
     """Branded login page (replaces Authelia's unbranded sign-in)."""
     setup = load_setup()
@@ -745,7 +698,7 @@ def page_login(*, rd: str = "/", error: str = "") -> bytes:
     body = f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>{name} — Sign in</title>{brand_head_links()}<style>{STYLE}</style>
+<title>{name} — Sign in</title>{brand_head_links()}<link rel="stylesheet" href="/_lemonseed/lemonseed.css"/>
 </head><body>
 <main class="login-page">
 <div class="login-card">
@@ -762,27 +715,43 @@ def page_login(*, rd: str = "/", error: str = "") -> bytes:
 </div>
 </main>
 <script>
-// Submit as JSON (the CP expects application/json).
+// The gate can land this page inside the shell's iframe, and a page inside a
+// page is unusable, so break out to the top frame first (M6.6 D3).
+if (window.top !== window.self) {{
+  window.top.location = window.location.href;
+}}
+// Submit as JSON (the CP expects application/json) and label the request as
+// ours, so the CP answers with a body instead of a 302 that fetch() would
+// follow without ever exposing Location.
 document.getElementById('login-form').addEventListener('submit', async (ev) => {{
+  const form = ev.target;
   ev.preventDefault();
-  const fd = new FormData(ev.target);
-  const body = Object.fromEntries(fd.entries());
-  const res = await fetch('/login', {{
-    method: 'POST',
-    headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify(body),
-  }});
-  if (res.redirected || res.status === 302) {{
-    const loc = res.headers.get('Location') || '/';
-    location.href = loc;
-    return;
+  const card = document.querySelector('.login-card');
+  let message = '';
+  let target = '/';
+  try {{
+    const body = Object.fromEntries(new FormData(form).entries());
+    const res = await fetch('/login', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json', 'X-Requested-With': 'fetch'}},
+      body: JSON.stringify(body),
+    }});
+    const data = await res.json().catch(() => ({{}}));
+    if (res.ok) {{
+      window.top.location = data.target || '/';
+      return;
+    }}
+    message = data.detail || 'Sign in failed.';
+  }} catch (err) {{
+    message = 'The appliance is not answering yet. Try again in a moment.';
   }}
-  if (res.status === 401) {{
-    const err = document.createElement('p');
+  let err = card.querySelector('.login-error');
+  if (!err) {{
+    err = document.createElement('p');
     err.className = 'login-error';
-    err.textContent = 'Invalid username or password.';
-    document.querySelector('.login-card').insertBefore(err, document.querySelector('form'));
+    card.insertBefore(err, form);
   }}
+  err.textContent = message;
 }});
 </script>
 </body></html>"""
@@ -809,7 +778,7 @@ def page_shell(snap: dict[str, Any], *, view: str = "chat") -> bytes:
     body = f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>{name}</title>{brand_head_links()}<style>{STYLE}{SETTINGS_MODEL_PICKER_CSS}</style>
+<title>{name}</title>{brand_head_links()}<link rel="stylesheet" href="/_lemonseed/lemonseed.css"/>
 </head><body>
 <main class="app-shell">
 <header class="app-bar">
@@ -848,6 +817,7 @@ def page_shell(snap: dict[str, Any], *, view: str = "chat") -> bytes:
 <iframe id="panel-frame" class="{panel_frame_class}" title="Settings" src="{panel_src}"></iframe>
 </div>
 </main>
+<script>{PORTAL_FETCH_JS}</script>
 <script>
 let currentView = {json.dumps(view)};
 let chatBootstrapped = false;
@@ -1030,6 +1000,9 @@ function retireChatFrame() {{
 
 async function gatewayReachable() {{
   // End-to-end check through nginx (same path the SPA hits after embed).
+  // Deliberately NOT portalFetch: this is a probe whose whole job is to answer
+  // "is it up yet", so retrying and redirecting on auth would both slow it down
+  // and hide the very failure it exists to detect.
   try {{
     const response = await fetch('/_app/version.json', {{cache: 'no-store'}});
     return response.ok;
@@ -1047,15 +1020,19 @@ document.getElementById('nav-settings').addEventListener('click', (ev) => {{
   setView('settings', true);
 }});
 document.getElementById('nav-logout').addEventListener('click', async () => {{
-  // Clear the session cookie, then land on the login page.
+  // Tear the chat frame down before navigating. It carries its own Open WebUI
+  // session, so leaving it loaded keeps a signed-in, interactive chat on screen
+  // for as long as it takes the browser to paint /login (M6.6 step 4).
+  retireChatFrame();
+  // /logout answers 302 and fetch() follows it, so the cookie is cleared by the
+  // request itself; the navigation is what actually leaves the shell.
   try {{
-    const res = await fetch('/logout', {{method: 'POST'}});
-    if (res.redirected) {{
-      location.href = res.headers.get('Location') || '/login';
-      return;
-    }}
-  }} catch (_) {{}}
-  location.href = '/login';
+    await portalFetch('/logout', {{method: 'POST'}});
+  }} catch (_err) {{
+    // A failed logout still gets the user out of the shell: the cookie is
+    // HttpOnly and idle-expiring, and a stuck signed-in page is worse.
+  }}
+  window.top.location = '/login';
 }});
 window.addEventListener('popstate', () => {{
   const path = location.pathname.replace(/\\/$/, '') || '/';
@@ -1086,7 +1063,7 @@ function makeLandingCard(name, desc, flag, selected, fits, onPick) {{
 
 async function loadLandingPicker() {{
   try {{
-    const res = await fetch('/_lemonseed/api/models', {{cache: 'no-store'}});
+    const res = await portalFetch('/_lemonseed/api/models');
     if (!res.ok) return;
     const data = await res.json();
     const cards = document.getElementById('landing-cards');
@@ -1104,12 +1081,22 @@ async function loadLandingPicker() {{
 
 async function chooseLandingFamily(family) {{
   try {{
-    const res = await fetch('/_lemonseed/api/models', {{
+    const res = await portalFetch('/_lemonseed/api/models', {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
       body: JSON.stringify({{family: family}}),
     }});
-    if (!res.ok) return;
+    if (!res.ok) {{
+      // Before M6.6 this returned in silence: a non-admin clicking a card got no
+      // answer at all. The reason is already written for the operator.
+      const status = document.getElementById('landing-status');
+      if (status) {{
+        status.textContent = await portalError(res, 'Could not select that model.');
+        status.className = 'status-line bad';
+        status.style.display = '';
+      }}
+      return;
+    }}
     // Download is starting — the next poll leaves awaiting-choice and shows progress.
     const picker = document.getElementById('landing-picker');
     if (picker) picker.hidden = true;
@@ -1118,16 +1105,22 @@ async function chooseLandingFamily(family) {{
 
 async function refreshStatus() {{
   try {{
-    const response = await fetch('/api/status', {{cache: 'no-store'}});
-    // Session expired (cookie cleared by logout or timeout): leave the shell
-    // via a full navigation. A fetch() here cannot be redirected, so without
-    // this the stale shell keeps polling and the user gets stuck behind a
-    // dead session (re-login then renders a second shell inside this one).
-    if (response.status === 401 || response.status === 403) {{
-      window.location.replace('/login?rd=' + encodeURIComponent(window.location.pathname));
+    // /api/system is the gated full snapshot. /api/status is the open subset
+    // (installer handoff + the gateway's not-ready page) and no longer carries
+    // the telemetry, module and chat state this function reads.
+    const response = await portalFetch('/api/system');
+    // 401 is already handled inside portalFetch (top-frame navigation to /login).
+    // A 403 must NOT redirect: it means signed-in-but-not-permitted, and this
+    // polls every 5s, so a redirect here would be a login loop. Say it once.
+    if (!response.ok) {{
+      const denied = document.getElementById('landing-status');
+      if (denied && response.status === 403) {{
+        denied.textContent = await portalError(response, 'You cannot see the appliance status.');
+        denied.className = 'status-line bad';
+        denied.style.display = '';
+      }}
       return;
     }}
-    if (!response.ok) return;
     const data = await response.json();
     const telemetry = data.telemetry || {{}};
     const loadEl = document.getElementById('metric-load');
@@ -1199,62 +1192,6 @@ def telemetry_snapshot() -> dict[str, Any]:
         "storage_path": "/var/lib/lemonseed",
     }
 
-
-SETTINGS_MODEL_PICKER_CSS = """
-.model-cards { display: flex; flex-direction: column; gap: 10px; margin: 10px 0; }
-/* Each model bubble IS the button. */
-.model-card {
-  display: grid; grid-template-columns: auto minmax(0, 30%) 1fr; align-items: center;
-  gap: 12px; padding: 12px 14px; cursor: pointer;
-  border: 1px solid var(--line); border-radius: 12px; background: transparent;
-  text-align: left; color: inherit; font: inherit; width: 100%;
-  transition: border-color 0.15s ease, background 0.15s ease;
-}
-.model-card:hover { border-color: var(--accent); }
-.model-card.selected { border-color: var(--accent); background: rgba(198, 242, 122, 0.14); }
-.model-card.unfit { opacity: 0.55; cursor: not-allowed; }
-.model-card.unfit:hover { border-color: var(--line); }
-.model-card-flag { font-size: 1.3rem; line-height: 1; }
-.model-card-name { font-weight: 600; font-size: 0.95rem; line-height: 1.3; }
-.model-card-desc { color: var(--muted); font-size: 0.85rem; line-height: 1.4; margin: 0; }
-@media (max-width: 560px) {
-  .model-card { grid-template-columns: auto 1fr; }
-  .model-card-desc { grid-column: 1 / -1; }
-}
-"""
-
-
-OWUI_CONFIG_CSS = """
-/* Holds *problems* only (a setting that could not be applied, settings changed
-   in Open WebUI since boot). Empty means "nothing to act on", and an empty
-   flex box still takes a line, so it must actually be hidden. */
-.owui-strip { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 14px; }
-.owui-strip[hidden] { display: none; }
-.owui-pill {
-  border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px;
-  font-size: 0.78rem; color: var(--muted); white-space: nowrap;
-}
-.owui-pill b { color: var(--ink); font-weight: 600; }
-.owui-pill.bad { border-color: #ff9a8a; color: #ffc4ba; }
-/* Subsection label inside a panel (Status / Controls). Deliberately quieter
-   than h2 so the panel reads as one box with two groups. */
-.panel h3.subhead {
-  margin: 16px 0 8px; font-size: 0.72rem; font-weight: 600;
-  letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted);
-}
-.panel h3.subhead:first-of-type { margin-top: 4px; }
-.owui-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 14px 0 0; }
-.owui-hint { color: var(--muted); font-size: 0.8rem; margin: 10px 0 0; line-height: 1.5; }
-/* Reset progress is the one state in this panel the admin must not miss: the
-   chat interface is offline while it runs. Rendered as a banner, not a hint. */
-.owui-status {
-  border: 1px solid var(--line); border-left: 3px solid var(--accent);
-  border-radius: 10px; padding: 10px 12px; margin: 14px 0 0;
-  font-size: 0.9rem; line-height: 1.5;
-}
-.owui-status.bad { border-left-color: #ff9a8a; }
-.owui-status[hidden] { display: none; }
-"""
 
 # Plain string (not an f-string) on purpose: JS braces stay single.
 OWUI_CONFIG_JS = r"""
@@ -1351,7 +1288,7 @@ async function loadOwuiConfig() {
   const setNote = (text) => { note.textContent = text; note.hidden = !text; };
   button.disabled = true;
   try {
-    const res = await fetch('/_lemonseed/api/owui/config', {cache: 'no-store'});
+    const res = await portalFetch('/_lemonseed/api/owui/config');
     if (res.status === 403) {
       setNote('Administration settings are visible to admins only.');
       return;
@@ -1392,7 +1329,7 @@ async function owuiApplyNow() {
   refresh.disabled = true;
   owuiStatus('Applying Lemonseed settings…');
   try {
-    const res = await fetch('/_lemonseed/api/owui/reconcile', {method: 'POST', cache: 'no-store'});
+    const res = await portalFetch('/_lemonseed/api/owui/reconcile', {method: 'POST'});
     const body = await res.json().catch(() => ({}));
     if (res.status === 409) {
       owuiStatus('A settings update is already running. Try again in a moment.', true);
@@ -1403,7 +1340,9 @@ async function owuiApplyNow() {
       return;
     }
     if (!res.ok) {
-      owuiStatus('Could not apply settings (HTTP ' + res.status + ').', true);
+      // 403 arrives with a reason the control plane wrote (not an admin, or a
+      // path Lemonseed owns). HTTP codes are not a home-user error message.
+      owuiStatus(body.detail || 'Could not apply settings (HTTP ' + res.status + ').', true);
       return;
     }
     const drift = body.drift || {};
@@ -1440,7 +1379,7 @@ function owuiResetPoll() {
   owuiResetTimer = setTimeout(async () => {
     let reset = null;
     try {
-      const res = await fetch('/api/modules', {cache: 'no-store'});
+      const res = await portalFetch('/api/modules');
       const body = await res.json();
       reset = (body.open_webui || {}).owui_reset || null;
     } catch (_err) {
@@ -1478,9 +1417,8 @@ async function owuiResetConfig() {
   if (typed === null) return;
   owuiStatus('');
   try {
-    const res = await fetch('/_lemonseed/api/owui/reset-config', {
+    const res = await portalFetch('/_lemonseed/api/owui/reset-config', {
       method: 'POST',
-      cache: 'no-store',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({confirm: typed}),
     });
@@ -1498,7 +1436,7 @@ async function owuiResetConfig() {
       return;
     }
     if (!res.ok) {
-      owuiStatus('Reset refused (HTTP ' + res.status + ').', true);
+      owuiStatus(body.detail || 'Reset refused (HTTP ' + res.status + ').', true);
       return;
     }
     owuiStatus('Rebuilding chat settings… the chat interface is offline until it '
@@ -1518,7 +1456,7 @@ loadOwuiConfig();
 // idea why. Terminal states are deliberately not replayed on every visit.
 (async function owuiAdoptReset() {
   try {
-    const res = await fetch('/api/modules', {cache: 'no-store'});
+    const res = await portalFetch('/api/modules');
     const body = await res.json();
     const reset = (body.open_webui || {}).owui_reset;
     if (!reset || reset.state === 'ready' || reset.state === 'error') return;
@@ -1649,7 +1587,7 @@ def page_settings_content(snap: dict[str, Any]) -> bytes:
     body = f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Settings</title>{brand_head_links()}<style>{STYLE}{SETTINGS_MODEL_PICKER_CSS}{OWUI_CONFIG_CSS}</style>
+<title>Settings</title>{brand_head_links()}<link rel="stylesheet" href="/_lemonseed/lemonseed.css"/>
 </head><body><main class="embed-shell">
 <h1>Settings</h1>
 <section class="panel">
@@ -1694,13 +1632,14 @@ def page_settings_content(snap: dict[str, Any]) -> bytes:
 <p class="lede"><a style="color:var(--accent)" href="/api/hardware">/api/hardware</a> ·
 <a style="color:var(--accent)" href="/api/chat">/api/chat</a> ·
 <a style="color:var(--accent)" href="/api/modules">/api/modules</a> ·
-<a style="color:var(--accent)" href="/api/status">/api/status</a></p>
+<a style="color:var(--accent)" href="/api/system">/api/system</a></p>
 </details>
 </section>
+<script>{PORTAL_FETCH_JS}</script>
 <script>
 async function refreshChat() {{
   try {{
-    const response = await fetch('/api/chat', {{cache: 'no-store'}});
+    const response = await portalFetch('/api/chat');
     if (!response.ok) return;
     const chat = await response.json();
     const state = chat.state || 'idle';
@@ -1748,7 +1687,7 @@ function makeModelCard(name, desc, flag, selected, fits, onPick) {{
 
 async function loadModelPicker() {{
   try {{
-    const modelsRes = await fetch('/_lemonseed/api/models', {{cache: 'no-store'}});
+    const modelsRes = await portalFetch('/_lemonseed/api/models');
     if (!modelsRes.ok) return;
     const data = await modelsRes.json();
     const cards = document.getElementById('model-cards');
@@ -1767,15 +1706,21 @@ async function loadModelPicker() {{
 
 async function chooseFamily(family) {{
   try {{
-    const res = await fetch('/_lemonseed/api/models', {{
+    const res = await portalFetch('/_lemonseed/api/models', {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
       body: JSON.stringify({{family: family}}),
     }});
-    if (!res.ok) {{ alert('Could not change model: ' + res.status); return; }}
+    if (!res.ok) {{
+      // An HTTP status is not a message. A non-admin, or a family that stopped
+      // fitting, both have a real reason sitting in the body already.
+      const body = await res.json().catch(() => ({{}}));
+      alert(body.detail || 'Could not change model (HTTP ' + res.status + ').');
+      return;
+    }}
     // Re-render to reflect the new selection; the status row shows progress.
     loadModelPicker();
-  }} catch (_err) {{ alert('Could not change model.'); }}
+  }} catch (_err) {{ alert('Could not reach the control plane.'); }}
 }}
 
 loadModelPicker();
@@ -1881,7 +1826,13 @@ def complete_setup(
 class Handler(BaseHTTPRequestHandler):
     server_version = "LemonseedCP/0.3"
 
-    def _send(self, code: int, body: bytes, content_type: str) -> None:
+    def _send(
+        self,
+        code: int,
+        body: bytes,
+        content_type: str,
+        extra_headers: Optional[list[tuple[str, str]]] = None,
+    ) -> None:
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -1890,6 +1841,10 @@ class Handler(BaseHTTPRequestHandler):
         # endpoints after reboot; allow that cross-origin fetch.
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("X-Lemonseed-Role", "control-plane")
+        # Headers that must be emitted *with* the response, never queued before
+        # send_response() (that would put them ahead of the status line).
+        for key, value in extra_headers or ():
+            self.send_header(key, value)
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -1898,21 +1853,39 @@ class Handler(BaseHTTPRequestHandler):
             # socketserver would otherwise dump a full traceback per occurrence.
             self.log_message("client disconnected during response (%s)", self.path)
 
-    def _json(self, code: int, obj: Any) -> None:
-        self._send(code, (json.dumps(obj) + "\n").encode(), "application/json")
+    def _json(self, code: int, obj: Any, extra_headers: Optional[list[tuple[str, str]]] = None) -> None:
+        self._send(
+            code,
+            (json.dumps(obj) + "\n").encode(),
+            "application/json",
+            extra_headers=extra_headers,
+        )
+
+    def _is_xhr(self) -> bool:
+        """True when the caller identified itself as the portal's own fetch()."""
+        return self.headers.get(XHR_HEADER, "").strip() == XHR_MARKER
 
     def _require_admin(self) -> bool:
-        """True when the caller is an admin; sends 403 and returns False if not.
+        """True when the caller is an admin; sends JSON 403 and returns False if not.
 
         nginx sets X-Forwarded-Groups from the CP session-verify response
         headers (via auth_request_set + proxy_set_header). When the auth gate
         is disabled (pre-admin) the header is absent, which is fine: setup is
         not yet complete and /settings/ redirects to /setup anyway.
+
+        The body is JSON with ``detail`` because the portal renders ``detail``
+        for every 403 it gets, from any source (M6.6).
         """
         groups = self.headers.get("X-Forwarded-Groups", "")
         parts = {g.strip() for g in groups.split(",") if g.strip()}
         if "admin" not in parts:
-            self._send(403, b"forbidden\n", "text/plain; charset=utf-8")
+            self._json(
+                403,
+                {
+                    "detail": "You are signed in, but this needs an admin account.",
+                    "lemonseed": NEEDS_ADMIN_MARKER,
+                },
+            )
             return False
         return True
 
@@ -1963,10 +1936,7 @@ class Handler(BaseHTTPRequestHandler):
         """GET /login — branded login page."""
         if setup_complete() and not auth.admin_bootstrap_required():
             # Auth is active: show the login form.
-            rd = ""
-            if query:
-                params = parse_qs(query)
-                rd = params.get("rd", [""])[0]
+            rd = auth.safe_redirect_target(_redirect_target(query))
             body = page_login(rd=rd)
             self._send(200, body, "text/html; charset=utf-8")
             return
@@ -1985,18 +1955,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         username = str(data.get("username", "")).strip()
         password = str(data.get("password", ""))
-        rd = str(data.get("rd", "/"))
+        rd = auth.safe_redirect_target(str(data.get("rd", "/")))
 
         # Rate limiting by source IP.
         ip = self.client_address[0] if self.client_address else "unknown"
         if not auth.rate_limit_check(ip):
-            self._send(401, b"invalid username or password\n", "text/plain; charset=utf-8")
+            self._json(401, {"detail": "Too many attempts. Wait a minute and try again."})
             return
 
         user = auth.verify_credentials(username, password)
         if user is None:
             auth.rate_limit_record_failure(ip)
-            self._send(401, b"invalid username or password\n", "text/plain; charset=utf-8")
+            self._json(401, {"detail": "Invalid username or password."})
             return
 
         auth.rate_limit_reset(ip)
@@ -2012,16 +1982,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         except ValueError:
             # Account vanished or was disabled between check and issue.
-            self._send(401, b"invalid username or password\n", "text/plain; charset=utf-8")
+            self._json(401, {"detail": "Invalid username or password."})
             return
 
-        # Sanitize the redirect target: must be a same-origin relative path.
-        if not rd.startswith("/") or rd.startswith("//"):
-            rd = "/"
-
+        # A fetch() cannot read a 302's Location, so an XHR gets the target in a
+        # 200 body and navigates _top itself; a plain form post still gets the
+        # redirect. Same cookie either way.
+        cookie = f"{auth.SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax"
+        if self._is_xhr():
+            self._json(200, {"target": rd}, extra_headers=[("Set-Cookie", cookie)])
+            return
         self.send_response(302)
         self.send_header("Location", rd)
-        cookie = f"{auth.SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax"
         self.send_header("Set-Cookie", cookie)
         self.send_header("Content-Length", "0")
         self.end_headers()
@@ -2301,7 +2273,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, modules.modules_snapshot())
             return
         if path == "/api/status":
+            # Unauthenticated by design (installer handoff + the gateway's
+            # not-ready page). Keep this cheap and free of household facts; the
+            # full snapshot lives at /api/system behind the session gate.
             maybe_complete_mdns_handoff(self)
+            self._json(200, status_public())
+            return
+        if path == "/api/system":
+            # nginx gates this with the session (it is not admin-only: every user's
+            # shell polls it to decide when the chat frame may load).
             chat_ready.ensure_chat_worker()
             data_services.ensure_data_worker()
             data_services.ensure_provision_worker()

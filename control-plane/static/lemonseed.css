@@ -1,0 +1,302 @@
+/* Lemonseed's one stylesheet root (M6.6 S5.8).
+ *
+ * Everything the appliance renders -- setup, login, the app shell, the settings
+ * panel and the gateway's static not-ready page -- reads its theme from here,
+ * because nginx error pages and control-plane pages must not drift apart and a
+ * second palette is how they start to.
+ *
+ * Served by nginx out of the read-only image at /_lemonseed/lemonseed.css, so it
+ * is reachable before anyone signs in and while the control plane is down.
+ *
+ * Two consequences worth knowing before you add a rule:
+ *   - The gateway page (bottom of this file) is scoped under .cp-down. Do not
+ *     add bare element selectors to it; they would leak into the portal.
+ *   - Rules are plain CSS in a browser's cascade. The Python pages used to carry
+ *     this text inline, so nothing here may depend on server-side state; put
+ *     per-request values in the templates instead.
+ */
+:root {
+  --bg0: #0f1c18;
+  --ink: #f2f7f4;
+  --muted: #a7bfb4;
+  --accent: #c6f27a;
+  --accent-ink: #142018;
+  --line: rgba(242, 247, 244, 0.14);
+  --ok: #9be67c;
+  --wait: #ffe2a8;
+  --bad: #ff8f8f;
+  --font: "Segoe UI", "Helvetica Neue", sans-serif;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; min-height: 100%;
+  background:
+    radial-gradient(1100px 560px at 8% -10%, #2a5a45 0%, transparent 55%),
+    radial-gradient(900px 480px at 100% 0%, #1c3d55 0%, transparent 50%),
+    var(--bg0);
+  color: var(--ink); font-family: var(--font);
+}
+.shell { max-width: 36rem; margin: 0 auto; padding: 2.25rem 1.25rem 3rem; }
+.brand-mark {
+  display: flex; align-items: center; gap: 0.65rem; margin-bottom: 0.15rem;
+}
+.brand-mark .logo {
+  display: block; width: 3.25rem; height: 3.25rem; margin: 0;
+  border-radius: 50%; object-fit: cover; flex-shrink: 0;
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.08);
+}
+.brand-mark .wordmark {
+  font-size: clamp(1.35rem, 5vw, 1.65rem); font-weight: 700;
+  letter-spacing: 0.14em; color: var(--ink);
+}
+.logo {
+  display: block; width: 3.25rem; height: 3.25rem; margin: 0;
+  border-radius: 50%; object-fit: cover;
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.08);
+}
+h1 { margin: 0.55rem 0 0.45rem; font-size: clamp(2rem, 8vw, 2.5rem); letter-spacing: -0.03em; }
+.lede { color: var(--muted); line-height: 1.45; margin: 0; }
+.panel {
+  margin-top: 1.5rem; padding: 1.1rem;
+  border: 1px solid var(--line); border-radius: 14px;
+  background: rgba(15, 28, 24, 0.55);
+}
+.panel h2 {
+  margin: 0 0 0.75rem; font-size: 0.9rem; letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--muted);
+}
+.row { display: flex; justify-content: space-between; gap: 1rem; padding: 0.35rem 0; }
+.row + .row { border-top: 1px solid var(--line); }
+.name { color: var(--muted); font-size: 0.92rem; }
+.state { font-variant-numeric: tabular-nums; font-weight: 600; }
+.state.ok { color: var(--ok); }
+.state.wait { color: var(--wait); }
+.state.bad { color: var(--bad); }
+.progress {
+  height: 0.7rem; overflow: hidden; border-radius: 999px;
+  background: rgba(255,255,255,0.1); margin: 0.85rem 0 0.55rem;
+}
+.progress > span {
+  display: block; height: 100%; background: linear-gradient(90deg, #7dcf6a, var(--accent));
+  transition: width 0.4s ease;
+}
+details { margin-top: 1rem; }
+summary { color: var(--muted); cursor: pointer; }
+label { display: block; margin: 0.85rem 0 0.35rem; color: var(--muted); font-size: 0.9rem; }
+input, select {
+  width: 100%; padding: 0.75rem 0.85rem; border-radius: 10px;
+  border: 1px solid var(--line); background: rgba(0,0,0,0.25); color: var(--ink);
+}
+.cta {
+  margin-top: 1.1rem; width: 100%; border: 0; border-radius: 999px;
+  padding: 0.9rem 1rem; font-size: 1rem; font-weight: 700;
+  background: var(--accent); color: var(--accent-ink); cursor: pointer;
+}
+.err { color: var(--bad); margin-top: 0.75rem; }
+.okmsg { color: var(--ok); margin-top: 0.75rem; }
+.app-shell {
+  max-width: none; margin: 0; padding: 0; min-height: 100vh;
+  display: flex; flex-direction: column;
+}
+.app-bar {
+  display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+  padding: 0.55rem 1rem; border-bottom: 1px solid var(--line);
+  background: rgba(15, 28, 24, 0.92); backdrop-filter: blur(8px);
+}
+.app-bar .brand-logo {
+  display: block; width: 1.75rem; height: 1.75rem; margin: 0;
+  border-radius: 50%; object-fit: cover; flex-shrink: 0;
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.1);
+}
+.app-bar .title { margin: 0; font-size: 1rem; font-weight: 600; }
+.app-bar .spacer { flex: 1; }
+.app-bar .nav {
+  display: flex; align-items: center; gap: 0.15rem;
+}
+.app-bar .nav a, .app-bar .nav span {
+  color: var(--muted); text-decoration: none; font-size: 0.88rem; font-weight: 600;
+  padding: 0.35rem 0.65rem; border-radius: 999px;
+}
+.app-bar .nav a:hover { color: var(--accent); background: rgba(255,255,255,0.06); }
+.app-bar .nav a.active { color: var(--accent-ink); background: var(--accent); }
+.app-bar .nav .disabled {
+  opacity: 0.45; cursor: default; pointer-events: none;
+}
+.app-bar .metrics {
+  display: none; align-items: center; gap: 0.85rem;
+}
+@media (min-width: 720px) { .app-bar .metrics { display: flex; } }
+.metric { min-width: 4.75rem; }
+.metric label {
+  display: block; font-size: 0.62rem; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--muted); margin-bottom: 0.2rem;
+}
+.metric .bar {
+  height: 4px; border-radius: 999px; background: rgba(255,255,255,0.12); overflow: hidden;
+}
+.metric .bar > span {
+  display: block; height: 100%; background: linear-gradient(90deg, #7dcf6a, var(--accent));
+  transition: width 0.35s ease;
+}
+.app-bar .gear {
+  color: var(--muted); text-decoration: none; font-size: 1.15rem;
+  line-height: 1; padding: 0.25rem 0.45rem; border-radius: 8px;
+}
+.app-bar .gear:hover, .app-bar .gear.active { color: var(--accent); }
+.app-bar a {
+  color: var(--muted); text-decoration: none; font-size: 0.9rem; font-weight: 600;
+}
+.app-bar a:hover { color: var(--accent); }
+.embed-shell {
+  max-width: 42rem; margin: 0 auto; padding: 1.5rem 1rem 2.5rem;
+}
+.embed-shell h1 {
+  margin: 0 0 1rem; font-size: clamp(1.5rem, 5vw, 2rem); letter-spacing: -0.02em;
+}
+.frame-wrap iframe.hidden {
+  visibility: hidden;
+  pointer-events: none;
+  z-index: 0;
+}
+.frame-wrap { flex: 1; min-height: 0; position: relative; background: #0a1210; }
+.frame-wrap iframe {
+  position: absolute; inset: 0; width: 100%; height: 100%; border: 0; z-index: 1;
+}
+.frame-fallback {
+  position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; padding: 2rem; text-align: center; color: var(--muted);
+  z-index: 2;
+}
+.frame-fallback.hidden { display: none; }
+.landing {
+  max-width: 32rem; margin: 0 auto; padding: 1.5rem;
+  border: 1px solid var(--line); border-radius: 16px;
+  background: rgba(15, 28, 24, 0.72);
+  text-align: left;
+}
+.landing h2 {
+  margin: 0 0 0.5rem; font-size: 1.25rem; color: var(--ink); letter-spacing: -0.02em;
+}
+.landing p { margin: 0; color: var(--muted); line-height: 1.45; }
+.landing .status-line {
+  margin-top: 1rem; font-weight: 700; font-variant-numeric: tabular-nums;
+}
+.landing .status-line.ok { color: var(--ok); }
+.landing .status-line.wait { color: var(--wait); }
+.landing .status-line.bad { color: var(--bad); }
+.frame-wrap iframe.hidden { display: none; }
+.frame-fallback.hidden { display: none; }
+.login-page {
+  min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  padding: 1.5rem;
+}
+.login-card {
+  width: 100%; max-width: 24rem; padding: 2rem 1.75rem 2.25rem;
+  border: 1px solid var(--line); border-radius: 16px;
+  background: rgba(15, 28, 24, 0.72);
+  text-align: center;
+}
+.login-card .brand-logo {
+  display: block; width: 3.25rem; height: 3.25rem; margin: 0 auto 0.5rem;
+  border-radius: 50%; object-fit: cover;
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.1);
+}
+.login-card h1 { font-size: 1.75rem; margin: 0.25rem 0 0.2rem; }
+.login-card .lede { margin-bottom: 0.25rem; }
+.login-card .field { text-align: left; }
+.login-error { color: var(--bad); margin: 0.75rem 0 0; }
+.btn {
+  margin-top: 1.25rem; width: 100%; border: 0; border-radius: 999px;
+  padding: 0.85rem 1rem; font-size: 1rem; font-weight: 700; cursor: pointer;
+  background: var(--accent); color: var(--accent-ink);
+}
+.btn.primary { background: var(--accent); color: var(--accent-ink); }
+
+/* --- Gateway not-ready page (control-plane/static/cp-down.html) -------------
+ * Same file, deliberately scoped. Unscoped, `p { color: var(--muted) }` and the
+ * bare `button` rules below would leak into every portal page, and `.shell` and
+ * `h1` are used by both. Scope is what lets one stylesheet serve both without one
+ * page silently restyling the other, which is the trap a shared CSS root usually
+ * is. `:root` and `html, body` are not repeated here: the palette and the
+ * background above are exactly what this page was duplicating.
+ */
+.cp-down .shell { max-width: 34rem; margin: 0 auto; padding: 3rem 1.25rem; }
+.cp-down .card {
+  border: 1px solid var(--line); border-radius: 14px;
+  background: rgba(9, 22, 18, 0.55); padding: 1.75rem 1.5rem;
+}
+.cp-down .brand { display: flex; align-items: center; gap: .65rem; margin-bottom: 1.1rem; }
+.cp-down .brand img { width: 34px; height: 34px; }
+.cp-down .brand span { font-size: 1.05rem; letter-spacing: .04em; color: var(--accent); }
+.cp-down h1 { font-size: 1.4rem; margin: 0 0 .6rem; }
+.cp-down p { color: var(--muted); line-height: 1.55; margin: 0 0 1rem; }
+.cp-down .status { display: flex; align-items: center; gap: .55rem; font-size: .95rem; }
+.cp-down .dot { width: .6rem; height: .6rem; border-radius: 50%; background: var(--wait);
+                animation: pulse 1.6s ease-in-out infinite; }
+.cp-down .dot.ready { background: var(--ok); animation: none; }
+.cp-down button {
+  margin-top: 1.35rem; padding: .5rem 1rem; border-radius: 9px;
+  border: 1px solid var(--line); background: transparent; color: var(--ink);
+  font: inherit; font-size: .9rem; cursor: pointer;
+}
+.cp-down button:hover { border-color: var(--accent); color: var(--accent); }
+.cp-down .hint { margin: 1.25rem 0 0; font-size: .8rem; color: var(--muted); }
+@keyframes pulse { 0%,100% { opacity: .35 } 50% { opacity: 1 } }
+
+/* --- Model picker cards (portal landing + settings) -------------------------
+ * Moved out of Python for the same reason as everything else here: the picker is
+ * rendered by two different pages and had one stylesheet to keep in step.
+ */
+.model-cards { display: flex; flex-direction: column; gap: 10px; margin: 10px 0; }
+/* Each model bubble IS the button. */
+.model-card {
+  display: grid; grid-template-columns: auto minmax(0, 30%) 1fr; align-items: center;
+  gap: 12px; padding: 12px 14px; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 12px; background: transparent;
+  text-align: left; color: inherit; font: inherit; width: 100%;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.model-card:hover { border-color: var(--accent); }
+.model-card.selected { border-color: var(--accent); background: rgba(198, 242, 122, 0.14); }
+.model-card.unfit { opacity: 0.55; cursor: not-allowed; }
+.model-card.unfit:hover { border-color: var(--line); }
+.model-card-flag { font-size: 1.3rem; line-height: 1; }
+.model-card-name { font-weight: 600; font-size: 0.95rem; line-height: 1.3; }
+.model-card-desc { color: var(--muted); font-size: 0.85rem; line-height: 1.4; margin: 0; }
+@media (max-width: 560px) {
+  .model-card { grid-template-columns: auto 1fr; }
+  .model-card-desc { grid-column: 1 / -1; }
+}
+
+
+/* --- Chat-interface panel ----------------------------------------------------
+ */
+/* Holds *problems* only (a setting that could not be applied, settings changed
+   in Open WebUI since boot). Empty means "nothing to act on", and an empty
+   flex box still takes a line, so it must actually be hidden. */
+.owui-strip { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 14px; }
+.owui-strip[hidden] { display: none; }
+.owui-pill {
+  border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px;
+  font-size: 0.78rem; color: var(--muted); white-space: nowrap;
+}
+.owui-pill b { color: var(--ink); font-weight: 600; }
+.owui-pill.bad { border-color: #ff9a8a; color: #ffc4ba; }
+/* Subsection label inside a panel (Status / Controls). Deliberately quieter
+   than h2 so the panel reads as one box with two groups. */
+.panel h3.subhead {
+  margin: 16px 0 8px; font-size: 0.72rem; font-weight: 600;
+  letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted);
+}
+.panel h3.subhead:first-of-type { margin-top: 4px; }
+.owui-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 14px 0 0; }
+.owui-hint { color: var(--muted); font-size: 0.8rem; margin: 10px 0 0; line-height: 1.5; }
+/* Reset progress is the one state in this panel the admin must not miss: the
+   chat interface is offline while it runs. Rendered as a banner, not a hint. */
+.owui-status {
+  border: 1px solid var(--line); border-left: 3px solid var(--accent);
+  border-radius: 10px; padding: 10px 12px; margin: 14px 0 0;
+  font-size: 0.9rem; line-height: 1.5;
+}
+.owui-status.bad { border-left-color: #ff9a8a; }
+.owui-status[hidden] { display: none; }

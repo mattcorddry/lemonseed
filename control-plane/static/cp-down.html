@@ -6,11 +6,15 @@
   the window between nginx opening :80 and the CP being able to answer, which a
   browser otherwise sees as the raw nginx 502 page.
 
-  Deliberately self-contained: the only subresource is the lemon mark, which
-  nginx serves straight out of the read-only SquashFS (location
-  /_lemonseed/brand/), not from the control plane that is currently down. No
-  stylesheet link, no fonts, no scripts — an error page that depends on the
-  failed service to render is not an error page.
+  Self-contained in the only way that matters: every subresource here is served
+  by nginx out of the read-only SquashFS (the lemon mark from /_lemonseed/brand/,
+  the theme from /_lemonseed/lemonseed.css), never from the control plane that is
+  currently down. That distinction is what makes the stylesheet link safe — this
+  page only ever renders *because* nginx is up and reading that store path, so a
+  sibling file in the same directory cannot fail the way a proxied asset would.
+  No external hosts, no fonts, no script tags that load a file. Rules for this
+  page are scoped under body.cp-down in that stylesheet so they cannot leak into
+  the portal.
 -->
 <html lang="en">
 <head>
@@ -18,48 +22,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 <title>Lemonseed is getting ready</title>
-<style>
-  :root {
-    --bg0: #0f1c18;
-    --ink: #f2f7f4;
-    --muted: #a7bfb4;
-    --accent: #c6f27a;
-    --line: rgba(242, 247, 244, 0.14);
-    --font: "Segoe UI", "Helvetica Neue", sans-serif;
-  }
-  html, body {
-    margin: 0; min-height: 100%;
-    background:
-      radial-gradient(1100px 560px at 8% -10%, #2a5a45 0%, transparent 55%),
-      radial-gradient(900px 480px at 100% 0%, #1c3d55 0%, transparent 50%),
-      var(--bg0);
-    color: var(--ink); font-family: var(--font);
-  }
-  .shell { max-width: 34rem; margin: 0 auto; padding: 3rem 1.25rem; }
-  .card {
-    border: 1px solid var(--line); border-radius: 14px;
-    background: rgba(9, 22, 18, 0.55); padding: 1.75rem 1.5rem;
-  }
-  .brand { display: flex; align-items: center; gap: .65rem; margin-bottom: 1.1rem; }
-  .brand img { width: 34px; height: 34px; }
-  .brand span { font-size: 1.05rem; letter-spacing: .04em; color: var(--accent); }
-  h1 { font-size: 1.4rem; margin: 0 0 .6rem; }
-  p { color: var(--muted); line-height: 1.55; margin: 0 0 1rem; }
-  .status { display: flex; align-items: center; gap: .55rem; font-size: .95rem; }
-  .dot { width: .6rem; height: .6rem; border-radius: 50%; background: #ffe2a8;
-         animation: pulse 1.6s ease-in-out infinite; }
-  .dot.ready { background: #9be67c; animation: none; }
-  @keyframes pulse { 0%,100% { opacity: .35 } 50% { opacity: 1 } }
-  button {
-    margin-top: 1.35rem; padding: .5rem 1rem; border-radius: 9px;
-    border: 1px solid var(--line); background: transparent; color: var(--ink);
-    font: inherit; font-size: .9rem; cursor: pointer;
-  }
-  button:hover { border-color: var(--accent); color: var(--accent); }
-  .hint { margin: 1.25rem 0 0; font-size: .8rem; color: var(--muted); }
-</style>
+<link rel="stylesheet" href="/_lemonseed/lemonseed.css">
 </head>
-<body>
+<body class="cp-down">
 <main class="shell">
   <div class="card">
     <div class="brand">

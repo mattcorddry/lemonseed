@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -21,6 +22,10 @@ from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 CP = Path(__file__).resolve().parent
+# The one theme root (M6.6 S5.8). Read once: several tests need to check that a
+# rule survived the move out of stub.py, and a test that re-reads the file each
+# time is a test that can disagree with itself.
+THEME_CSS = (CP / "static" / "lemonseed.css").read_text(encoding="utf-8")
 sys.path.insert(0, str(CP))
 
 
@@ -1725,32 +1730,153 @@ class StubHttpTests(unittest.TestCase):
         self.assertEqual(code, 200)
         html = body.decode()
         self.assertIn("app-shell", html)
-        # The shell must bail out to /login when its session expires, instead
-        # of polling forever behind a dead session (nested-shell bug).
-        self.assertIn("window.location.replace('/login?rd='", html)
+        # The old assertion here pinned the literal string
+        # "window.location.replace('/login?rd='". Deleted on purpose (M6.6 step 3):
+        # that branch was unreachable (it polled /api/status, which was ungated,
+        # and conflated 401 with 403), and pinning its text is how it survived.
+        # How the shell now recovers from 401/403/5xx is asserted behaviorally,
+        # not by string, in SessionContractTests and PortalFetchTests.
 
-    @mock.patch.object(stub, "boot_snapshot")
-    def test_api_status_role(self, boot: mock.Mock) -> None:
-        boot.return_value = {
-            "version": "test",
-            "startup_ready": False,
-            "lemond": {"state": "starting"},
-            "docker": {"state": "ready"},
-            "units": {},
-        }
+    # M6.6 step 5: /api/status answers with no session, so its key set *is* the
+    # boundary that keeps household facts off the LAN. Pinned exactly rather than
+    # as "does not contain X", because a filter over the full snapshot would pass
+    # every test that only looks for known-bad keys while leaking each new one.
+    PUBLIC_STATUS_KEYS = {
+        "status",
+        "role",
+        "version",
+        "setup_complete",
+        "setup",
+        "portal_url",
+    }
+
+    @mock.patch.object(stub, "setup_complete", return_value=True)
+    @mock.patch.object(stub, "primary_mdns_slug", return_value="lemon-test")
+    @mock.patch.object(
+        stub,
+        "load_setup",
+        return_value={"mdns_name": "lemon-test", "name": "Lemon Test", "timezone": "UTC"},
+    )
+    def test_api_status_is_exactly_the_open_subset(
+        self, _setup: mock.Mock, _slug: mock.Mock, _complete: mock.Mock
+    ) -> None:
         code, body = self._get("/api/status")
         self.assertEqual(code, 200)
         data = json.loads(body.decode())
-        self.assertEqual(data["role"], "control-plane")
+        self.assertEqual(set(data), self.PUBLIC_STATUS_KEYS)
         self.assertEqual(data["status"], "ok")
+        self.assertEqual(data["role"], "control-plane")
+        # The installer's handoff needs both of these: it identifies the box by
+        # role, then finds the portal to redirect to.
+        self.assertEqual(data["setup"], {"mdns_name": "lemon-test"})
+        self.assertEqual(data["portal_url"], "http://lemon-test.local/")
+
+    def test_api_status_reads_no_household_state(self) -> None:
+        """Nothing behind the gate is even consulted while answering a pre-login poll.
+
+        Checking the producers rather than the response keys survives a rename on
+        either side, and catches the case where a field is present but empty.
+        """
+        producers = (
+            (stub, "boot_snapshot"),
+            (stub, "telemetry_snapshot"),
+            (stub.auth, "auth_status"),
+            (stub.auth, "account_counts"),
+            (stub.sessions, "store_status"),
+            (stub.chat_ready, "chat_snapshot"),
+            (stub.modules, "modules_snapshot"),
+            (stub.data_services, "data_snapshot"),
+        )
+        mocks = []
+        with contextlib.ExitStack() as stack:
+            for owner, name in producers:
+                mocks.append((name, stack.enter_context(mock.patch.object(owner, name))))
+            code, body = self._get("/api/status")
+        self.assertEqual(code, 200)
+        json.loads(body.decode())
+        consulted = sorted(name for name, m in mocks if m.called)
+        self.assertEqual(consulted, [])
+
+    def test_api_status_does_not_revive_the_background_workers(self) -> None:
+        """Spawning provisioning work must not be an unauthenticated side effect.
+
+        The workers are started at CP startup, so a poll only ever *revives* one;
+        that job moved to /api/system with the rest of the full snapshot.
+        """
+        with contextlib.ExitStack() as stack:
+            chat = stack.enter_context(mock.patch.object(stub.chat_ready, "ensure_chat_worker"))
+            mods = stack.enter_context(mock.patch.object(stub.modules, "ensure_module_worker"))
+            prov = stack.enter_context(
+                mock.patch.object(stub.data_services, "ensure_provision_worker")
+            )
+            code, _body = self._get("/api/status")
+        self.assertEqual(code, 200)
+        self.assertEqual((chat.called, mods.called, prov.called), (False, False, False))
+
+    @mock.patch.object(stub, "boot_snapshot")
+    def test_api_system_revives_the_background_workers(self, boot: mock.Mock) -> None:
+        boot.return_value = {"version": "test", "startup_ready": True, "units": {}}
+        with contextlib.ExitStack() as stack:
+            chat = stack.enter_context(mock.patch.object(stub.chat_ready, "ensure_chat_worker"))
+            mods = stack.enter_context(mock.patch.object(stub.modules, "ensure_module_worker"))
+            prov = stack.enter_context(
+                mock.patch.object(stub.data_services, "ensure_provision_worker")
+            )
+            data = stack.enter_context(mock.patch.object(stub.data_services, "ensure_data_worker"))
+            code, _body = self._get("/api/system")
+        self.assertEqual(code, 200)
+        self.assertEqual(
+            (chat.called, mods.called, prov.called, data.called),
+            (True, True, True, True),
+        )
+
+    @mock.patch.object(stub, "setup_complete", return_value=True)
+    @mock.patch.object(auth, "reset_marker_present", return_value=False)
+    @mock.patch.object(auth, "admin_bootstrap_required", return_value=False)
+    def test_the_shell_polls_the_gated_snapshot_not_the_open_subset(
+        self,
+        _bootstrap: mock.Mock,
+        _reset: mock.Mock,
+        _complete: mock.Mock,
+    ) -> None:
+        """Reading the open subset would leave the chat frame gated forever.
+
+        /api/status deliberately has no chat, module or telemetry state, so a
+        shell that polled it would sit on the landing page showing nothing while
+        the appliance was perfectly healthy.
+        """
+        code, body = self._get("/")
+        self.assertEqual(code, 200)
+        html = body.decode()
+        self.assertIn("portalFetch('/api/system')", html)
+        self.assertNotIn("portalFetch('/api/status'", html)
+
+    def _system_snapshot(self) -> dict:
+        """GET /api/system with the background workers held still.
+
+        Those workers supervise Docker containers, and ``make test`` must run with
+        no Docker; a dedicated test already pins that the endpoint revives them.
+        """
+        with contextlib.ExitStack() as stack:
+            for owner, name in (
+                (stub.chat_ready, "ensure_chat_worker"),
+                (stub.modules, "ensure_module_worker"),
+                (stub.data_services, "ensure_provision_worker"),
+                (stub.data_services, "ensure_data_worker"),
+            ):
+                stack.enter_context(mock.patch.object(owner, name))
+            code, body = self._get("/api/system")
+        self.assertEqual(code, 200)
+        return json.loads(body.decode())
 
     @mock.patch.object(stub, "boot_snapshot")
     @mock.patch.object(stub.sessions, "store_status", return_value="unavailable")
-    def test_api_status_reports_the_session_store(self, store: mock.Mock, boot: mock.Mock) -> None:
+    def test_api_system_reports_the_session_store(self, store: mock.Mock, boot: mock.Mock) -> None:
         """M6.6 S5.6: sessions fail closed, so their health has to be visible.
 
         Before this, ping() had no caller at all and "nobody can sign in because
-        Valkey is down" was invisible from the outside.
+        Valkey is down" was invisible from the outside. Step 5 moved the answer
+        behind the gate along with the rest of the full snapshot.
         """
         boot.return_value = {
             "version": "test",
@@ -1759,11 +1885,23 @@ class StubHttpTests(unittest.TestCase):
             "docker": {"state": "ready"},
             "units": {},
         }
-        code, body = self._get("/api/status")
-        self.assertEqual(code, 200)
-        data = json.loads(body.decode())
+        data = self._system_snapshot()
         self.assertEqual(data["session_store"], "unavailable")
         store.assert_called_once()
+
+    @mock.patch.object(stub, "boot_snapshot")
+    def test_api_system_is_the_full_snapshot(self, boot: mock.Mock) -> None:
+        """The gated half keeps everything the shell needs to gate the chat frame."""
+        boot.return_value = {
+            "version": "test",
+            "startup_ready": False,
+            "lemond": {"state": "starting"},
+            "docker": {"state": "ready"},
+            "units": {},
+        }
+        data = self._system_snapshot()
+        for key in ("chat", "data", "modules", "auth", "telemetry", "session_store"):
+            self.assertIn(key, data)
 
     @mock.patch.object(stub.data_services, "ensure_data_worker")
     @mock.patch.object(stub.data_services, "ensure_provision_worker")
@@ -1961,6 +2099,61 @@ class SessionGateHttpTests(unittest.TestCase):
         self.assertIn("lemonseed_session=signed-token", cookie)
         self.assertIn("HttpOnly", cookie)
         self.assertIn("SameSite=Lax", cookie)
+
+    def test_xhr_login_answers_200_with_the_target(self) -> None:
+        """fetch() cannot read a 302's Location, so it must not be given one."""
+        user = {"username": "matt", "email": "", "groups": ["admin"], "display_name": ""}
+        with mock.patch.object(auth, "verify_credentials", return_value=user):
+            with mock.patch.object(auth, "create_session", return_value="signed-token"):
+                code, headers, body = self._call(
+                    "POST",
+                    "/login",
+                    {"username": "matt", "password": "pw", "rd": "/settings/?tab=models"},
+                    {"X-Requested-With": "fetch"},
+                )
+        self.assertEqual(code, 200)
+        self.assertNotIn("Location", headers)
+        self.assertIn("lemonseed_session=signed-token", headers.get("Set-Cookie", ""))
+        # The query string survives, which is the whole point of the round trip.
+        self.assertEqual(json.loads(body.decode())["target"], "/settings/?tab=models")
+
+    def test_xhr_login_failure_is_json_with_a_readable_reason(self) -> None:
+        with mock.patch.object(auth, "verify_credentials", return_value=None):
+            code, headers, body = self._call(
+                "POST",
+                "/login",
+                {"username": "matt", "password": "wrong"},
+                {"X-Requested-With": "fetch"},
+            )
+        self.assertEqual(code, 401)
+        self.assertIn("application/json", headers.get("Content-Type", ""))
+        self.assertTrue(json.loads(body.decode())["detail"])
+
+    @mock.patch.object(auth, "admin_bootstrap_required", return_value=False)
+    @mock.patch.object(stub, "setup_complete", return_value=True)
+    def test_login_page_keeps_a_query_string_in_rd(self, _c: mock.Mock, _b: mock.Mock) -> None:
+        """nginx sends rd unencoded, so a target with its own ? must not truncate."""
+        _code, _headers, body = self._call("GET", "/login?rd=/settings/?tab=models")
+        self.assertIn('value="/settings/?tab=models"', body.decode())
+
+    @mock.patch.object(auth, "admin_bootstrap_required", return_value=False)
+    @mock.patch.object(stub, "setup_complete", return_value=True)
+    def test_login_page_refuses_an_off_appliance_rd(self, _c: mock.Mock, _b: mock.Mock) -> None:
+        # %5c is a backslash: browsers resolve /\host like //host, and the
+        # percent-encoded form is how it would actually arrive over the wire.
+        for raw in ("//evil.example", "%2f%2fevil.example", "/%5cevil.example"):
+            with self.subTest(rd=raw):
+                _code, _headers, body = self._call("GET", f"/login?rd={raw}")
+                self.assertIn('value="/"', body.decode())
+
+    @mock.patch.object(auth, "admin_bootstrap_required", return_value=False)
+    @mock.patch.object(stub, "setup_complete", return_value=True)
+    def test_login_page_breaks_out_of_the_shell_frame(self, _c: mock.Mock, _b: mock.Mock) -> None:
+        """The gate can land this page inside the iframe; a page in a page is dead."""
+        _code, _headers, body = self._call("GET", "/login")
+        html = body.decode()
+        self.assertIn("window.top !== window.self", html)
+        self.assertIn("window.top.location", html)
 
     def test_logout_succeeds_even_when_the_store_is_unreachable(self) -> None:
         """A broken data plane must not trap someone in a signed-in shell."""
@@ -2180,8 +2373,13 @@ class OwuiAdminActionTests(unittest.TestCase):
     @mock.patch.object(stub.modules, "request_policy_reconcile")
     def test_reconcile_requires_admin(self, reconcile: mock.Mock) -> None:
         for headers in ({}, self.MEMBER):
-            code, _body = self._post("/_lemonseed/api/owui/reconcile", {}, headers)
+            code, payload = self._post("/_lemonseed/api/owui/reconcile", {}, headers)
             self.assertEqual(code, 403)
+            # The body is the contract, not decoration: the portal renders
+            # `detail` for every 403, and must be able to tell "not yours"
+            # apart from "Lemonseed owns this" without a second status code.
+            self.assertIn("detail", payload)
+            self.assertEqual(payload["lemonseed"], stub.NEEDS_ADMIN_MARKER)
         reconcile.assert_not_called()
 
     @mock.patch.object(stub.modules, "request_policy_reconcile",
@@ -2439,8 +2637,12 @@ class OwuiConfigPanelTests(unittest.TestCase):
         self.assertEqual(html.count("<h2>API</h2>"), 1)
         self.assertIn('cursor:pointer;color:var(--muted)">System API Data</summary>', html)
         self.assertNotIn("Diagnostics", html)
-        for endpoint in ("/api/hardware", "/api/status"):
+        # /api/system, not /api/status: step 5 cut the open subset down to what
+        # the installer handoff needs, so the diagnostic disclosure has to point
+        # at the full snapshot an admin actually reads.
+        for endpoint in ("/api/hardware", "/api/system"):
             self.assertIn(endpoint, html)
+        self.assertNotIn('href="/api/status"', html)
 
     def test_ownership_detail_is_gone_and_the_dead_link_is_gone(self) -> None:
         """Bare-metal review: the per-key view is diagnostics, not UI.
@@ -2465,7 +2667,7 @@ class OwuiConfigPanelTests(unittest.TestCase):
         """An empty flex box still occupies a line, so the strip needs hidden."""
         html = stub.page_settings_content(dict(self.SNAP)).decode()
         self.assertIn('<div class="owui-strip" id="owui-strip" hidden></div>', html)
-        self.assertIn(".owui-strip[hidden] { display: none; }", stub.OWUI_CONFIG_CSS)
+        self.assertIn(".owui-strip[hidden] { display: none; }", THEME_CSS)
         # Only problems get a pill, and they are always rendered bad.
         self.assertNotIn("owui-pill ok", stub.OWUI_CONFIG_JS)
         self.assertIn("strip.hidden = !strip.firstChild", stub.OWUI_CONFIG_JS)
@@ -2497,6 +2699,47 @@ class OwuiConfigPanelTests(unittest.TestCase):
         # Terminal states must not pin the interstitial open forever.
         self.assertIn("reset.state !== 'ready'", html)
         self.assertIn("reset.state !== 'error'", html)
+
+
+class SharedThemeTests(unittest.TestCase):
+    """One stylesheet root for the whole appliance (M6.6 S5.8).
+
+    Inlined CSS is how a login page and a nginx error page end up disagreeing
+    about what Lemonseed looks like, so every page links the same file and none
+    carries its own copy.
+    """
+
+    LINK = 'href="/_lemonseed/lemonseed.css"'
+
+    def _pages(self) -> dict[str, str]:
+        snap = {"version": "test", "chat": {}, "hardware": {}, "modules": {}}
+        return {
+            "setup": stub.page_setup(dict(snap)).decode(),
+            "login": stub.page_login(rd="/").decode(),
+            "shell": stub.page_shell(dict(snap), view="chat").decode(),
+            "settings": stub.page_settings_content(dict(snap)).decode(),
+        }
+
+    def test_every_page_links_the_shared_theme(self) -> None:
+        for name, html in self._pages().items():
+            with self.subTest(page=name):
+                self.assertIn(self.LINK, html)
+                self.assertNotIn("<style>", html, f"{name} still inlines its own theme")
+
+    def test_the_stylesheet_exists_where_the_gateway_looks_for_it(self) -> None:
+        """gateway.nix serves control-plane/static/lemonseed.css by name."""
+        css = THEME_CSS
+        self.assertIn(":root", css)
+        self.assertIn("--accent", css)
+        # Rules that used to live in Python must have moved with it, or the
+        # rendered pages are now unstyled for those components.
+        for selector in (".model-card", ".owui-actions", ".login-card"):
+            self.assertIn(selector, css)
+
+    def test_no_page_style_constant_survived_the_move(self) -> None:
+        """A leftover copy in Python is the drift this row set out to remove."""
+        for name in ("STYLE", "SETTINGS_MODEL_PICKER_CSS", "OWUI_CONFIG_CSS"):
+            self.assertFalse(hasattr(stub, name), f"stub.{name} is a second copy of the theme")
 
 
 if __name__ == "__main__":

@@ -1,13 +1,14 @@
 # M6.6 — Session & error contract
 
-**Status:** decisions settled 2026-10-12. **Steps 1–2 built and validated** (`make test`
-green, QEMU smoke passed, `schema_version=4` observed on a persisted schema-v3 disk).
-**Step 5's error-page half built** — but not as drafted here: read
+**Status:** **built 2026-10-13.** Steps 1–5 are all in, plus the S5.8 stylesheet
+extraction. `make test` and `make lint` green at every step; `make test-gateway`
+and `make test-qemu` green (see the *Gate* section for how the QEMU runs were grouped).
+Step 5's error-page half did **not** ship as drafted here — read
 [`GATEWAY-ERROR-AND-PULL-CONTRACT-M66.md`](./GATEWAY-ERROR-AND-PULL-CONTRACT-M66.md)
-for what actually shipped (a static `/_lemonseed/cp-down` page chosen by
-`error_page … =503`, because nginx will not run `error_page` inside `@cp_interstitial`;
-the `/api/status` split is still open). **Step 3 — the login redirect and the
-JSON-401/403/5xx XHR contract — is the remaining M6 work.**
+for what actually happened (a static `/_lemonseed/cp-down` page chosen by
+`error_page … =503`, because nginx will not run `error_page` inside
+`@cp_interstitial`). The deltas from the work-breakdown table are recorded under
+*What changed while building* so this stays the accurate record of the design.
 **Scope:** M6 close-out. Everything here is portal/CP/gateway behavior; no model,
 data-plane, or Open WebUI policy changes.
 
@@ -219,7 +220,39 @@ response, and today they are all in one open endpoint.
 | **4. Client** | One `portalFetch()` in `stub.py` used by every portal call (put the JS in a plain-string block à la `OWUI_CONFIG_JS`; `page_shell` is one giant f-string and JS braces are already doubled); frame-aware `/login`; `#nav-logout` gains frame teardown (`retireChatFrame()` exists and is currently only called on OWUI reset) | Shell does not keep polling a dead session; re-login does not nest a second shell | Any test asserting the old `refreshStatus` status-handling shape |
 | **5. Status split + error pages** | `status_public()` subset vs gated full; `gateway.nix` nested `error_page 500 502 503 504 = @cp_down` inside `@cp_interstitial` serving a **static** page | Anonymous `/api/status` returns the subset and **no** admin counts; full status requires a session; CP-down probe asserts a Lemonseed page (not nginx's) with the appliance's own markup | Update the `/api/status` payload assertions to the split |
 
-### Two things that changed while building
+### What changed while building
+
+**The gated half of the status surface is a new path, `/api/system`.** The table said
+"subset vs gated full" without naming a path, and one URL cannot be both open and
+gated. `/api/status` keeps the open name and the open subset, so an **installer USB
+already in the field** still recognizes the appliance by `role` and still finds the
+portal by `portal_url` after reboot — the alternative (keeping `/api/status` full and
+gating it) breaks every installer built before this release. `status_public()` lists
+its keys instead of subtracting them from the full snapshot, so a field added to the
+full snapshot later cannot leak by default.
+
+**`portalFetch()` retries GET only.** The draft said "retry 5xx with backoff". A reset
+or a reconcile whose response was lost in transit would otherwise run a second time,
+and neither is safe to repeat.
+
+**Three portal calls stay outside `portalFetch`, deliberately,** and each reason is
+written in the JS beside it: the setup page's `/api/boot` poll and the login form's
+own `POST /login` (both pre-auth — routing a failed sign-in through `portalFetch`
+would reload the login page forever, since a bad password *is* a 401), and the
+`/_app/version.json` reachability probe (retrying and auth-navigating would hide the
+exact failure it exists to detect). `PortalCallSiteTests` keeps that set closed.
+
+**The contract is tested by executing it, not by matching text.**
+`control-plane/test_portal_fetch.py` loads `stub.PORTAL_FETCH_JS` into a V8 context
+with `fetch`/`window` stubbed and asserts whether the code navigated the top frame,
+how many times it retried, and what it returned. A string assertion over rendered HTML
+passes happily while the neighboring branch is broken, which is the failure mode this
+table kept producing.
+
+**The shared stylesheet is scoped where it is shared.** `/_lemonseed/lemonseed.css`
+carries the portal theme *and* the not-ready page's rules, the latter namespaced under
+`body.cp-down`: unscoped, the error page's bare `p` and `button` rules would restyle
+every portal page that now reads the same file.
 
 **Ordinary logout drops one session; it does not bump the generation counter.** The
 table above originally said logout does both. Bumping the counter on logout would
@@ -298,13 +331,11 @@ with `urlopen`, so the contract is testable end-to-end without mocks:
 - Existing boot-order assertions must stay green; adding a Valkey dependency to
   the gate is the one change that could disturb them.
 
-**Bare metal (flag for the user).** Anything the QEMU harness can't see: a real
-long-lived browser session across an appliance reboot (**currently expected:
-signed out** — acceptable per D2, not desired; worth noticing because it is the
-symptom we would revisit if we adopt a reboot-surviving key namespace), and an
-expired-session tab left open overnight (expected: a sign-in prompt, not a
-"managed by Lemonseed" error box). The reboot case is the only M6.6 behavior that
-unit and QEMU tests genuinely cannot cover.
+**Bare metal (flag for the user).** Anything the QEMU harness can't see: whether
+the client contract actually holds in a real browser — an expired-session tab, a
+second tab noticing a logout, and the settings panel rendering once the theme left
+Python. QEMU can prove the server answers `401` with renderable JSON; only a browser
+can prove a tab reacts to it by showing the login page *in the top frame*.
 
 ## Deliberately not here
 
@@ -333,3 +364,33 @@ Per the standing rule, no step advances until **both** are green:
 Step 1 (schema migrations) and step 2 (Valkey sessions) change boot and CP HTTP
 behavior, so the QEMU gate is mandatory, not optional. Steps 1 and 3–5 also change
 what an upgrade does to an existing box, which is the bare-metal checkpoint.
+
+### How the runs were actually grouped
+
+Steps 1 and 2 shared one QEMU run, and steps 3–5 shared another. The rule used is the
+one stated for step 1: **a step earns its own run only if it carries QEMU signal that
+the neighbor's run would not also produce.** Steps 3 and 4 are CP-internal and portal
+JS, but step 3 changed the gateway's answer to an expired XHR, which is only
+observable through real nginx on a booted appliance, so 3 and 4 rode along with 5
+rather than covering less than a shared run would.
+
+`make test` and `make lint` ran after every step, not once at the end.
+
+### Gate record
+
+| Check | Result |
+|-------|--------|
+| `make test` | 632 tests OK, up from 584 when this work started. 50 new tests, 2 deleted. New: the executed `portalFetch` contract (17), `rd` sanitization (10), the status split (7), the XHR sign-in and frame-breakout contract (5), the theme surface (7), the auth-gate mirror (2), the open/gated API surface (2). Removed: the `window.location.replace('/login?rd='` string pin, `test_api_status_role` (superseded by the exact-subset test, and its `boot_snapshot` mock no longer had a caller), and `test_api_status_reports_the_session_store`, which became `test_api_system_reports_the_session_store` when the answer moved behind the gate. The settings panel's `/api/status` diagnostics link was retargeted to `/api/system` rather than dropped, and now asserts the open subset is *not* linked. |
+| `make lint` | clean |
+| `make test-gateway` | passes against live nginx, now including the XHR-401 branch, a negative control on the header match, and the shared theme |
+| `make test-qemu` | passed for steps 1–2 and for 3–5. The 3–5 run asserts, against the booted appliance: unauthenticated `/api/status` carries the public subset and **no** gated keys; auth state is read from `/api/system` with a session; an unauthenticated **XHR** on a gated path gets a real `401` with renderable JSON through real nginx (the motivating regression); the shared theme is readable with no session |
+| Bare metal | three checks, on the upgraded box. **(1) Two tabs, logout in one:** the other flipped to the login page within a few seconds — this is the load-bearing result, because it is an active tab polling `/api/system`, taking a real `401`, and navigating `window.top`; nothing in the HTTP tests can cover that last hop. **(2) Settings page** renders as expected after the theme moved from Python strings to `static/lemonseed.css`. **(3) A tab left open overnight** with an expired session stayed put on the Open WebUI prompt until reloaded, then landed on the login page with no frame nesting of the login page or an error page. (3) is expected: a hidden tab left running overnight is throttled or frozen by the browser, and no page script runs while frozen. The two-tab case is the control that proves the mechanism, since it exercises the same poll-and-navigate path on a tab the browser was still servicing. Reloading a frozen tab revalidates immediately, which is the behavior the user sees. |
+
+One caveat on the 3–5 run: `portalGotoLogin()` was tightened after that image was
+built (an expired session from inside the settings iframe now sends `rd` to the
+shell's `/settings/` rather than to the bare `/settings/content/` fragment). It is
+browser-only JavaScript with no HTTP surface, so nothing in the smoke test can reach
+it; the executed JS suite covers it. The image the user ran bare metal on was built
+after that tightening, so the shipped JS was what the unit suite pins. The specific
+case — session expiring *while the settings iframe is the visible view* — was not
+exercised; the overnight check was the shell's default chat view.
