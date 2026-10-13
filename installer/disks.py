@@ -17,7 +17,6 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-
 SYS_BLOCK = Path("/sys/block")
 LVM_PARTTYPE = "e6d6d379-f507-44c2-a33c-2081b433ad87"
 STORAGE_PARTLABEL = "lemonseed-user-data"

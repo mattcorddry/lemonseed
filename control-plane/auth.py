@@ -1,7 +1,9 @@
 """CP-native edge auth: login, signed session tokens, nginx gate (M6.2).
 
-Account truth lives in the CP state store (db.py, Postgres). Sessions are
-stateless HMAC-SHA256 signed tokens in a cookie — no session store to GC.
+Account truth lives in the CP state store (db.py, Postgres). A cookie token is
+only a *credential*; whether it is still live is decided by the Valkey-backed
+session store (sessions.py, M6.6 D2), which also makes the idle window slide and
+lets one account be revoked on its next request (M6.6 D1).
 All credential handling stays in the control plane (no bcrypt on the
 installer).
 """
@@ -21,8 +23,9 @@ from base64 import urlsafe_b64decode, urlsafe_b64encode
 from pathlib import Path
 from typing import Any, Optional
 
-import db
 import data_services
+import db
+import sessions
 
 LEMONSEED_STATE_DIR = Path("/var/lib/lemonseed")
 SESSION_SECRET_FILE = LEMONSEED_STATE_DIR / "session-secret"
@@ -35,9 +38,7 @@ ADMIN_GROUP = "admin"
 BASE_GROUP = "users"
 PG_WAIT_SECONDS = 180
 
-# Session token parameters.
-SESSION_INACTIVITY_SECONDS = 3600  # 1h
-SESSION_ABSOLUTE_SECONDS = 36000  # 10h
+# Idle/absolute session windows live in sessions.py (one source of truth).
 SESSION_COOKIE = "lemonseed_session"
 
 # Rate limiting: 5 failures per 5-minute window per IP → 15-min lockout.
@@ -130,11 +131,23 @@ def _sign(payload: bytes, secret: bytes) -> bytes:
     return hmac.new(secret, payload, hashlib.sha256).digest()
 
 
-def issue_token(username: str, email: str, groups: list[str], display_name: str = "") -> str:
+def issue_token(
+    username: str,
+    email: str,
+    groups: list[str],
+    display_name: str = "",
+    sid: str = "",
+    generation: int = 0,
+) -> str:
     """Create a signed session token: base64url(payload).base64url(hmac).
 
     ``display_name`` (claim ``n``) is the human-readable name forwarded to OWUI
     so it can label the account; it falls back to the username when empty.
+
+    ``sid`` (claim ``s``) names the server-side session record, and ``gen`` is the
+    account's session generation at mint time. Both are re-checked on verify, which
+    is what turns this token from a self-sufficient credential into a reference to
+    state that can be revoked.
     """
     secret = _load_session_secret()
     if secret is None:
@@ -146,8 +159,10 @@ def issue_token(username: str, email: str, groups: list[str], display_name: str 
             "e": email,
             "g": groups,
             "n": display_name or username,
+            "s": sid,
+            "gen": generation,
             "iat": now,
-            "exp": now + SESSION_ABSOLUTE_SECONDS,
+            "exp": now + sessions.SESSION_ABSOLUTE_SECONDS,
         },
         separators=(",", ":"),
     ).encode("utf-8")
@@ -176,6 +191,142 @@ def verify_token(token: str) -> Optional[dict[str, Any]]:
     if int(data.get("exp", 0)) < int(time.time()):
         return None
     return data
+
+
+def _as_int(value: Any, default: int = -1) -> int:
+    """Coerce a stored field without letting a bad value raise on the gate path."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def user_generation(username: str) -> Optional[int]:
+    """Current session generation for an account; None if missing or disabled.
+
+    None fails closed: ``verify_session`` reads it as "no live session", so a
+    Postgres outage cannot leave stale sessions authenticating. The portal is
+    already unusable without the data plane, and login has always required it.
+    """
+    if not _pg_ready():
+        return None
+    try:
+        conn = db.cp_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT token_generation FROM users"
+                    " WHERE username = %s AND disabled = FALSE",
+                    (username,),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 — fail closed, same as a missing account
+        return None
+    return None if row is None else _as_int(row[0], 0)
+
+
+def revoke_sessions(username: str) -> bool:
+    """Invalidate every outstanding token for one account.
+
+    Bumps the generation counter that tokens carry, so disable, demote, delete and
+    "sign out everywhere" all take effect on the account's next request — the
+    revocation path M6.2 never had. Not used by an ordinary logout, which must not
+    evict the user's other devices.
+    """
+    if not _pg_ready():
+        return False
+    try:
+        conn = db.cp_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET token_generation = token_generation + 1"
+                    " WHERE username = %s",
+                    (username,),
+                )
+                return cur.rowcount > 0
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 — caller reports, and verify still fails closed
+        return False
+
+
+def create_session(user: dict[str, Any]) -> str:
+    """Open a server-side session for a verified user; return its cookie token.
+
+    Raises ``sessions.SessionStoreUnavailable`` when Valkey is down: issuing a
+    cookie we could not later validate would hand out access that cannot be
+    revoked or expired, which is worse than a failed sign-in.
+    """
+    username = str(user["username"])
+    generation = user_generation(username)
+    if generation is None:
+        raise ValueError("account is missing or disabled")
+    now = int(time.time())
+    sid = secrets.token_urlsafe(16)
+    record = {
+        "u": username,
+        "e": user.get("email", ""),
+        "g": list(user.get("groups", [])),
+        "n": user.get("display_name") or username,
+        "gen": generation,
+        "iat": now,
+    }
+    if not sessions.create(sid, record, now=now):
+        raise sessions.SessionStoreUnavailable("session is outside its absolute window")
+    return issue_token(
+        username,
+        record["e"],
+        record["g"],
+        record["n"],
+        sid=sid,
+        generation=generation,
+    )
+
+
+def verify_session(token: str) -> Optional[dict[str, Any]]:
+    """The gate's full check. Returns the session record, or None to sign in again.
+
+    Four things must all hold: the signature is valid, a live session record
+    exists for its id, the account's generation still matches (revocation), and
+    the absolute ceiling has not passed (which also slides the idle window).
+
+    Raises ``sessions.SessionStoreUnavailable`` when the store cannot be reached.
+    The handler answers 503 rather than 401 so "appliance is broken" and "please
+    sign in" stay distinguishable all the way to the browser.
+    """
+    data = verify_token(token)
+    if data is None:
+        return None
+    sid = str(data.get("s") or "")
+    if not sid:
+        # A cookie from before M6.6, or one forged without a session id: there is
+        # no server-side record to trust, so it cannot authenticate.
+        return None
+    record = sessions.read(sid)
+    if record is None or record.get("u") != data.get("u"):
+        return None
+    username = str(record.get("u") or "")
+    generation = user_generation(username)
+    if generation is None or generation != _as_int(record.get("gen")):
+        return None
+    if not sessions.refresh(sid, _as_int(record.get("iat"), 0)):
+        return None
+    return record
+
+
+def drop_session(token: str) -> None:
+    """Best-effort teardown at logout. The caller clears the cookie regardless.
+
+    Only a token whose signature verifies contributes a session id, so an
+    unauthenticated request cannot delete someone else's session.
+    """
+    data = verify_token(token)
+    sid = str((data or {}).get("s") or "")
+    if sid:
+        sessions.drop_quietly(sid)
 
 
 def verify_credentials(username: str, password: str) -> Optional[dict[str, Any]]:
@@ -413,6 +564,7 @@ def reload_nginx() -> None:
     try:
         result = subprocess.run(
             ["systemctl", "reload", "nginx.service"],
+            check=False,
             capture_output=True,
             text=True,
             timeout=15,

@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 
 from disks import list_candidate_disks, pick_default
 from install import InstallError, image_base_url, run_install
-from preflight import evaluate_host, MIN_DISK_BYTES
+from preflight import MIN_DISK_BYTES, evaluate_host
 
 HOST = os.environ.get("LEMONSEED_INSTALLER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("LEMONSEED_INSTALLER_PORT", "80"))

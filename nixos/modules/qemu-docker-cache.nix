@@ -9,18 +9,25 @@
 let
   inherit (pkgs.dockerTools) pullImage;
 
+  # Same pins the control plane and the boot start scripts use (S5.1), so the
+  # QEMU tarballs can never be validated against a different image than the
+  # appliance runs. `hash` stays literal: pullImage is a fixed-output
+  # derivation, and rebasing a digest is an explicit
+  # `make refresh-image-pins` + rebuild.
+  imagePins = builtins.fromJSON (builtins.readFile ../../control-plane/container-images.json);
+
   stripShebang = content: lib.removePrefix "#!/usr/bin/env bash\n" content;
 
   postgresTar = pullImage {
-    imageName = "pgvector/pgvector";
-    imageDigest = "sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b";
-    finalImageTag = "pg16";
+    imageName = imagePins.postgres.name;
+    imageDigest = imagePins.postgres.digest;
+    finalImageTag = imagePins.postgres.tag;
     hash = "sha256-U6UYjiGamk4h4XhBcg2uT7KsabAiL2huXshsE2mKiKc=";
   };
   valkeyTar = pullImage {
-    imageName = "valkey/valkey";
-    imageDigest = "sha256:e0eb7c480958d32bdc4357a74bdd70653ae15f2f9b4c93c4a5a9fad1dc471c84";
-    finalImageTag = "8-alpine";
+    imageName = imagePins.valkey.name;
+    imageDigest = imagePins.valkey.digest;
+    finalImageTag = imagePins.valkey.tag;
     hash = "sha256-cooDV26PtwfximfR/1zOReap5b7MTsIvZNxrcmIvYAM=";
   };
 

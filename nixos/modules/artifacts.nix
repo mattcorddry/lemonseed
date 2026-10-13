@@ -39,5 +39,17 @@ in
     ln -s ${config.system.build.applianceKernel} "$out/vmlinuz"
     ln -s ${config.system.build.applianceInitrd} "$out/initrd.img"
     printf '%s\n' ${lib.escapeShellArg version} > "$out/version"
+
+    # Pin the system closure explicitly. mksquashfs output is opaque to nix's
+    # reference scanner, so the production image advertises 113 references and
+    # *none* of them the toplevel (the qemu image keeps one, by luck). A build
+    # root on these artifacts therefore does not pin the system closure, so
+    # `scripts/nix-gc.sh` — run at the end of every build by package.sh —
+    # collects the toplevel along with the CUDA llama.cpp stack, forcing a
+    # from-source GPU recompile on the next build. A plain text store path *is*
+    # detected, so this line keeps the closure reachable for as long as this
+    # version's build root exists.
+    # Not an artifact: scripts/package.sh installs only the three files above.
+    printf '%s\n' ${lib.escapeShellArg "${toplevel}"} > "$out/closure-root"
   '';
 }

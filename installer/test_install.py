@@ -13,8 +13,9 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-import install  # noqa: E402
 import syslog  # noqa: E402
+
+import install  # noqa: E402
 
 
 class LogTests(unittest.TestCase):

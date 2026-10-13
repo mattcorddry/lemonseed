@@ -1,5 +1,8 @@
 # M6.3b Phase 4B — Enforcement: guards, manual reconcile, config reset
 
+> **Milestone design artifact.** Phase plan for M6.3b Phase 4B; superseded by
+> `DESIGN.md` for how the appliance behaves today.
+
 Status: **all gate decisions taken (T4-A…T4-F); building.** T4-F resolved as **F1** —
 no extra port forward in the QEMU harness; the guest stays reachable only through
 nginx, so the smoke run resembles production.

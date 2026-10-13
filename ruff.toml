@@ -1,0 +1,46 @@
+# Ruff configuration for the Lemonseed repo — used by `make lint`.
+#
+# Ruff is **not** an appliance dependency: `make lint` runs it from nixpkgs
+# (`nix run nixpkgs#ruff`). The control-plane interpreter on the box stays
+# stdlib + psycopg2/bcrypt/requests/lemonade-sdk; see
+# nixos/modules/control-plane.nix. Nothing in the Nix build reads this file.
+#
+# Rule selection is deliberate. We enforce rules that catch real defects
+# (undefined names, dead code, unread unpacked values, unnecessary nesting)
+# and defer broad stylistic migrations. Adding a rule should happen together
+# with cleaning its existing findings, in the same change set.
+
+line-length = 100
+
+[lint]
+select = [
+    "F",              # undefined names, unused imports/vars, f-string hygiene
+    "E4", "E7", "E9",  # import/statement style + syntax and runtime errors
+    "I001",           # import ordering
+    "SIM102",         # collapsible `if`s
+    "SIM103",         # `return` the condition instead of if/return True/False
+    "PLC0206",        # iterate .items() instead of indexing by key
+    "PLW1510",        # subprocess.run needs an explicit check= (CP inspects
+                      # returncode itself; check=False must be written down)
+    "RUF059",         # unpacked values that are never read
+    "RUF100",         # stale `noqa` directives
+]
+
+ignore = [
+    # AGENTS.md tells us to write `Optional[...]`; `Optional` → `X | None`
+    # (UP045) is a 135-finding sweep across files we did not otherwise touch.
+    # Revisit as a standalone change if we ever drop that guidance.
+    "UP045",
+    # These ValueError raises are deliberately caught by the enclosing
+    # `except ValueError` in the same handler (HTTP 400). Raising TypeError
+    # instead — what TRY004 wants — would turn a 400 into a 500.
+    "TRY004",
+]
+
+# Rules we deliberately keep suppressed *at the call site* (`# noqa: BLE001` on
+# the CP's service-boundary `except Exception` handlers; `N802`/`PLC0415` in
+# HTTP handlers) but do not select here. Declaring them `external` tells RUF100
+# those directives are intentional instead of "stale", so we keep the
+# documentation without having to enable the rules. (`E402` is *not* listed — it
+# is live via `E4`, and our sys.path-insert imports genuinely need it.)
+external = ["BLE001", "N802", "PLC0415"]

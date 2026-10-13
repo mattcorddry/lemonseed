@@ -188,7 +188,6 @@ def best_fit_model(
 def families_view(hardware: dict[str, Any]) -> list[dict[str, Any]]:
     """Picker payload: one entry per family with the best-fit model for this box."""
     catalog = load_catalog()
-    models = [m for m in (catalog.get("models") or []) if isinstance(m, dict)]
     choice = read_model_choice()
     out: list[dict[str, Any]] = []
     for family in catalog.get("families") or []:

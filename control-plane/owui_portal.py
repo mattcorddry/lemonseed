@@ -17,7 +17,9 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from owui_policy import MASK, is_secret_key, mask_setting
+# MASK is re-exported: callers compare a view row's value against the same
+# sentinel that produced it, so it belongs to this module's output contract.
+from owui_policy import MASK, is_secret_key, mask_setting  # noqa: F401  (re-export)
 
 # Classifications (badge ids; the portal CSS/JS and the smoke test key off these).
 CLASS_MANAGED = "managed"          # Lemonseed re-asserts this every boot

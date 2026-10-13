@@ -1,11 +1,15 @@
 # M6.3b Phase 3 — `owui_policy` engine: implementation plan
 
+> **Milestone design artifact.** Phase plan for M6.3b Phase 3; superseded by
+> `DESIGN.md` for how the appliance behaves today.
+
 Status: **Phase 3 landed 2026-10-07** (`make test` 316 green; `make test-qemu`
 green ×2 — boot-revert + audit-pending two-run proof). Approved at the gate of
 2026-10-06 with decisions recorded in §12.
-Spec source of truth: `DESIGN.md` §M6.3b — this plan implements it, it does not
-re-open it. Where this plan and DESIGN.md conflict, DESIGN.md wins and this
-document gets corrected.
+Spec source of truth at the time of writing: the M6.3b section of `DESIGN.md`,
+now [`OWUI-DURABLE-CONFIG-M63B.md`](./OWUI-DURABLE-CONFIG-M63B.md) — this plan
+implements it, it does not re-open it. Where this plan and that record (or
+`DESIGN.md` as built) conflict, they win and this document gets corrected.
 
 Phase status: Phase 1 (service identity), Phase 2 (the persistence flip) and
 Phase 3 (the policy engine) are landed and validated (`make test` +

@@ -9,8 +9,10 @@ let
     mkdir -p "$out/catalog" "$out/static/brand"
     cp ${cpSrc}/stub.py ${cpSrc}/hardware.py ${cpSrc}/catalog.py ${cpSrc}/chat_ready.py \
        ${cpSrc}/db.py ${cpSrc}/data_services.py ${cpSrc}/modules.py ${cpSrc}/auth.py \
-       ${cpSrc}/model_store.py ${cpSrc}/lemond_client.py ${cpSrc}/owui_client.py \
-       ${cpSrc}/owui_policy.py ${cpSrc}/owui_portal.py ${cpSrc}/owui-policy.json "$out/"
+       ${cpSrc}/sessions.py ${cpSrc}/model_store.py ${cpSrc}/lemond_client.py \
+       ${cpSrc}/owui_client.py \
+       ${cpSrc}/owui_policy.py ${cpSrc}/owui_portal.py ${cpSrc}/owui-policy.json \
+       ${cpSrc}/image_pins.py ${cpSrc}/container-images.json "$out/"
     cp ${cpSrc}/catalog/models.json "$out/catalog/"
     cp -r ${cpSrc}/static/brand/. "$out/static/brand/"
     # GRUB template for the A/B updater to refresh on the ESP (the installed
@@ -19,7 +21,9 @@ let
     cp ${bootSrc}/grub.cfg "$out/lemonseed/grub.cfg"
   '';
 
-  pythonEnv = pkgs.python3.withPackages (ps: [ ps.psycopg2 ps.bcrypt ps.requests lemonadePythonSdk ]);
+  # `redis` is the Valkey client for the M6.6 session store (sessions.py). Keep
+  # this list runtime-only; test dependencies belong in scripts/run-unit-tests.sh.
+  pythonEnv = pkgs.python3.withPackages (ps: [ ps.psycopg2 ps.bcrypt ps.requests ps.redis lemonadePythonSdk ]);
 
   controlPlane = pkgs.writeShellApplication {
     name = "appliance-control-plane";

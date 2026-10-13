@@ -54,10 +54,11 @@
 
       packages.${system} = let
         pkgs = nixpkgs.legacyPackages.${system};
+        imagePins = builtins.fromJSON (builtins.readFile ./control-plane/container-images.json);
         qemuOwuiImage = pkgs.dockerTools.pullImage {
-          imageName = "ghcr.io/open-webui/open-webui";
-          imageDigest = "sha256:72c0ba641ba75e7aa52655cb242570906ececd09b1140fb736483038a22b3228";
-          finalImageTag = "v0.11.0";
+          imageName = imagePins.open_webui.name;
+          imageDigest = imagePins.open_webui.digest;
+          finalImageTag = imagePins.open_webui.tag;
           hash = "sha256-dDz7zdzDbuLB81rQm0yeFQFsn1uhLuinoRMTM5UZExI=";
         };
       in

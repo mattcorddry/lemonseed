@@ -7,7 +7,8 @@ the engine — a strict loader/validator, resolvers, a *pure* planner (the
 entire mode-semantics surface), entity handlers, and the CP-side state store
 + last-known-good (LKG) snapshot.
 
-Layering (DESIGN.md M6.3b / proposals/OWUI-POLICY-ENGINE.md §5):
+Layering (proposals/M6/OWUI-DURABLE-CONFIG-M63B.md /
+proposals/M6/OWUI-POLICY-ENGINE.md §5):
 
     load_manifest()  strict; a bad file means keep the last-good manifest and
                      write nothing.
@@ -180,7 +181,7 @@ def _sub_placeholders_for_regex(text: str) -> str:
     def repl(match: re.Match) -> str:
         token = match.group(1)
         if token not in PLACEHOLDER_TOKENS:
-            raise ValueError(f"unknown placeholder %%%s%%" % token)
+            raise ValueError("unknown placeholder %%%s%%" % token)
         return "[^/]+"
 
     return _PLACEHOLDER_RE.sub(repl, text)

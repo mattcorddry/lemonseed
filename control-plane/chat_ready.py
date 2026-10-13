@@ -9,14 +9,19 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
-
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 import catalog
 from catalog import plan_model, select_backend
-from hardware import MODELS_DIR, collect_hardware, largest_gpu_index, lemonade_api_key, persist_hardware
+from hardware import (
+    MODELS_DIR,
+    collect_hardware,
+    largest_gpu_index,
+    lemonade_api_key,
+    persist_hardware,
+)
 from lemond_client import get_client
 from model_store import ensure_model_space
 
@@ -285,6 +290,7 @@ def _run_lemonade(args: list[str], timeout: int) -> subprocess.CompletedProcess[
         env["LEMONADE_API_KEY"] = key
     return subprocess.run(
         ["lemonade", *args],
+        check=False,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -313,7 +319,7 @@ def _run_lemonade_pull(model_id: str) -> subprocess.CompletedProcess[str]:
     except subprocess.TimeoutExpired:
         proc.kill()
         stdout, stderr = proc.communicate()
-        raise RuntimeError(f"lemonade pull timed out after 3600s")
+        raise RuntimeError("lemonade pull timed out after 3600s")
     finally:
         with _pull_lock:
             if _pull_process is proc:
@@ -337,11 +343,12 @@ def _choice_changed(model_id: str) -> bool:
         choice = catalog.read_model_choice()
     except Exception:  # noqa: BLE001
         return False
-    family = str(choice.get("family") or "auto")
     chosen_model = choice.get("model_id")
     if isinstance(chosen_model, str) and chosen_model:
         return chosen_model != model_id
     # Family-level choice: re-plan and see if we still land on the same model.
+    # plan_model() honors the stored family choice internally (resolve_plan_choice),
+    # so the family does not need to be read again here.
     try:
         hardware = collect_hardware()
         plan = plan_model(hardware)

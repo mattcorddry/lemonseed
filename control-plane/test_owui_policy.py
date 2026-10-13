@@ -627,7 +627,7 @@ class TestResolvers(unittest.TestCase):
             spec=owui_policy.ValueSpec("secret", name="KEY", wrap_list=True),
             mode="managed", cadence="at_boot", optional=False, reason="t",
         )
-        value, err = owui_policy.resolve_setting_value(
+        value, _err = owui_policy.resolve_setting_value(
             entry, owui_policy.ResolverContext(secrets={"KEY": "v"})
         )
         self.assertEqual(value, ["v"])
@@ -1134,6 +1134,19 @@ class TestReconcile(unittest.TestCase):
     BOOT = frozenset({"at_boot"})
 
     def setUp(self) -> None:
+        # These are module-level globals shared with every other test class, so
+        # snapshot and restore them; leaving them mutated leaks a "reconciled"
+        # status into whichever class runs next (order-dependent failures). See
+        # DESIGN.md "test isolation".
+        self.addCleanup(setattr, owui_policy, "_last_good_manifest",
+                        owui_policy._last_good_manifest)
+        status_snapshot = dict(owui_policy._status)
+
+        def _restore_status() -> None:
+            owui_policy._status.clear()
+            owui_policy._status.update(status_snapshot)
+
+        self.addCleanup(_restore_status)
         owui_policy._last_good_manifest = None
         owui_policy._status.update({
             "ok": False, "state": "idle", "manifest_error": None,

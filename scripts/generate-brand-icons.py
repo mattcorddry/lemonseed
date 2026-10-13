@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Generate icon-sized Lemonseed brand assets from assets/brand/lemon.jpg|.png.
+"""Generate icon-sized Lemonseed brand assets from assets/brand/sources/*.png
 
-Source image: https://lemonseed.ai/lemon.jpg (drop into assets/brand/lemon.jpg
-when regenerating). Requires Pillow.
+Requires Pillow.
 """
 
 from __future__ import annotations
@@ -19,6 +18,7 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parents[1]
 BRAND = ROOT / "assets" / "brand"
+SOURCE = BRAND / "source"
 DESTS = (
     ROOT / "control-plane" / "static" / "brand",
     ROOT / "installer" / "static" / "brand",
@@ -27,11 +27,9 @@ SIZES = (16, 32, 48, 64, 128, 256, 512)
 
 
 def main() -> None:
-    src = BRAND / "lemon.jpg"
+    src = SOURCE / "lemon-full.png"
     if not src.is_file():
-        src = BRAND / "lemon.png"
-    if not src.is_file():
-        print(f"missing source image under {BRAND}", file=sys.stderr)
+        print(f"missing source image {SOURCE}/lemon-full.png", file=sys.stderr)
         sys.exit(1)
 
     img = Image.open(src).convert("RGBA")

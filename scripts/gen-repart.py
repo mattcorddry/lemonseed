@@ -122,8 +122,8 @@ def emit_repart(part: dict, index: int) -> str:
     name = part["name"]
     label = part.get("label", name)
     lines = [
-        f"# Generated from partitions.yaml — do not edit by hand",
-        f"[Partition]",
+        "# Generated from partitions.yaml — do not edit by hand",
+        "[Partition]",
         f"Type={role_type(part)}",
         f"Label={label}",
     ]

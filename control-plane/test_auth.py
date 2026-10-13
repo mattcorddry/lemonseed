@@ -14,8 +14,9 @@ CP = Path(__file__).resolve().parent
 sys.path.insert(0, str(CP))
 
 import auth  # noqa: E402
-import db  # noqa: E402
 import data_services  # noqa: E402
+import db  # noqa: E402
+import sessions  # noqa: E402
 
 
 def _conn_with_cur():
@@ -190,10 +191,17 @@ class TokenTests(unittest.TestCase):
         self.assertIsNone(auth.verify_token(token))
 
     def test_expired_token_rejected(self) -> None:
-        token = auth.issue_token("matt", "", ["users"])
-        with mock.patch.object(auth, "SESSION_ABSOLUTE_SECONDS", -10):
+        # The absolute window lives in sessions.py now (one source of truth).
+        with mock.patch.object(sessions, "SESSION_ABSOLUTE_SECONDS", -10):
             expired = auth.issue_token("matt", "", ["users"])
         self.assertIsNone(auth.verify_token(expired))
+
+    def test_token_carries_a_session_reference_and_generation(self) -> None:
+        """The cookie is a *reference* to revocable state, not self-sufficient."""
+        token = auth.issue_token("matt", "", ["users"], sid="sid-1", generation=7)
+        data = auth.verify_token(token)
+        self.assertEqual(data["s"], "sid-1")
+        self.assertEqual(data["gen"], 7)
 
     def test_no_secret_returns_none(self) -> None:
         self.secret_file.unlink()
@@ -202,6 +210,188 @@ class TokenTests(unittest.TestCase):
     def test_malformed_token_rejected(self) -> None:
         for bad in ("", "noperiod", "!!!.!!!", "a.b.c"):
             self.assertIsNone(auth.verify_token(bad))
+
+
+class SessionLifecycleTests(unittest.TestCase):
+    """``verify_session`` is the gate's real check (M6.6).
+
+    Four things must hold: signature, a live store record, the account's current
+    generation, and room under the absolute ceiling. Each gets its own case
+    because each is a different way a user could otherwise keep access.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.secret_file = Path(self._tmp.name) / "session-secret"
+        self.secret_file.write_bytes(b"0123456789abcdef0123456789abcdef")
+        self.now = int(time.time())
+        self.store: dict[str, dict[str, object]] = {}
+        self.generation = 3
+
+        self.record = {
+            "u": "matt",
+            "e": "matt@localhost",
+            "g": ["admin"],
+            "n": "Matt",
+            "gen": self.generation,
+            "iat": self.now,
+        }
+        patches = [
+            mock.patch.object(auth, "SESSION_SECRET_FILE", self.secret_file),
+            mock.patch.object(auth, "user_generation", side_effect=lambda _u: self.generation),
+            mock.patch.object(sessions, "read", side_effect=lambda sid: self.store.get(sid)),
+            mock.patch.object(sessions, "create", side_effect=self._fake_create),
+            mock.patch.object(sessions, "refresh", return_value=True),
+            mock.patch.object(sessions, "drop_quietly", side_effect=self._fake_drop),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.token = auth.issue_token(
+            "matt", "matt@localhost", ["admin"], "Matt", sid="sid-1", generation=self.generation
+        )
+        self.store["sid-1"] = dict(self.record)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _fake_create(self, sid, record, now=None):
+        self.store[sid] = dict(record)
+        return True
+
+    def _fake_drop(self, sid):
+        return self.store.pop(sid, None) is not None
+
+    def test_create_session_stores_state_and_returns_a_matching_token(self) -> None:
+        token = auth.create_session(
+            {
+                "username": "matt",
+                "email": "matt@localhost",
+                "groups": ["admin"],
+                "display_name": "Matt",
+            }
+        )
+        payload = auth.verify_token(token)
+        self.assertTrue(payload["s"])
+        stored = self.store[payload["s"]]
+        self.assertEqual(stored["gen"], self.generation)
+        self.assertEqual(stored["g"], ["admin"])
+        self.assertEqual(stored["n"], "Matt")
+
+    def test_create_session_refuses_an_unknown_or_disabled_account(self) -> None:
+        self.generation = None
+        with self.assertRaises(ValueError):
+            auth.create_session({"username": "matt", "email": "", "groups": []})
+
+    def test_create_session_fails_closed_when_the_store_is_down(self) -> None:
+        with mock.patch.object(
+            sessions, "create", side_effect=sessions.SessionStoreUnavailable("down")
+        ):
+            with self.assertRaises(sessions.SessionStoreUnavailable):
+                auth.create_session({"username": "matt", "email": "", "groups": []})
+
+    def test_verify_session_accepts_a_live_record(self) -> None:
+        self.assertEqual(auth.verify_session(self.token), self.record)
+
+    def test_verify_session_rejects_a_pre_m66_cookie(self) -> None:
+        """A token with no session id has no revocable state, so it cannot sign in."""
+        legacy = auth.issue_token("matt", "matt@localhost", ["admin"], "Matt")
+        self.assertIsNone(auth.verify_session(legacy))
+
+    def test_verify_session_rejects_when_the_record_is_gone(self) -> None:
+        del self.store["sid-1"]
+        self.assertIsNone(auth.verify_session(self.token))
+
+    def test_verify_session_rejects_a_revoked_generation(self) -> None:
+        """Disable / demote / delete / sign-out-everywhere all land here."""
+        self.generation = self.generation + 1
+        self.assertIsNone(auth.verify_session(self.token))
+
+    def test_verify_session_rejects_a_missing_or_disabled_account(self) -> None:
+        self.generation = None
+        self.assertIsNone(auth.verify_session(self.token))
+
+    def test_verify_session_rejects_a_record_belonging_to_someone_else(self) -> None:
+        self.store["sid-1"]["u"] = "eve"
+        with mock.patch.object(auth, "user_generation", side_effect=lambda _u: 3):
+            self.assertIsNone(auth.verify_session(self.token))
+
+    def test_verify_session_rejects_at_the_absolute_ceiling(self) -> None:
+        with mock.patch.object(sessions, "refresh", return_value=False):
+            self.assertIsNone(auth.verify_session(self.token))
+
+    def test_verify_session_propagates_an_unreachable_store(self) -> None:
+        """Must not degrade to None, or 503 (broken) becomes 401 (sign in again)."""
+        with mock.patch.object(
+            sessions, "read", side_effect=sessions.SessionStoreUnavailable("down")
+        ):
+            with self.assertRaises(sessions.SessionStoreUnavailable):
+                auth.verify_session(self.token)
+
+    def test_verify_session_fails_closed_on_a_corrupt_record(self) -> None:
+        self.store["sid-1"]["gen"] = "not-a-number"
+        self.assertIsNone(auth.verify_session(self.token))
+
+    def test_drop_session_removes_only_a_verified_tokens_record(self) -> None:
+        auth.drop_session("garbage-cookie")
+        self.assertIn("sid-1", self.store)
+        auth.drop_session(self.token)
+        self.assertNotIn("sid-1", self.store)
+
+
+class SessionGenerationDbTests(unittest.TestCase):
+    """The generation counter against a mocked connection."""
+
+    def setUp(self) -> None:
+        self._patches = [
+            mock.patch.object(db, "postgres_admin_dsn", return_value="postgresql://u:p@h/p"),
+            mock.patch.object(db, "pg_isready", return_value=True),
+        ]
+        for patch in self._patches:
+            patch.start()
+
+    def tearDown(self) -> None:
+        for patch in self._patches:
+            patch.stop()
+
+    def test_user_generation_reads_the_column(self) -> None:
+        conn, cur = _conn_with_cur()
+        cur.fetchone.return_value = (5,)
+        with mock.patch.object(db, "cp_connect", return_value=conn):
+            self.assertEqual(auth.user_generation("matt"), 5)
+        conn.close.assert_called_once()
+
+    def test_user_generation_is_none_for_a_missing_or_disabled_account(self) -> None:
+        conn, cur = _conn_with_cur()
+        cur.fetchone.return_value = None
+        with mock.patch.object(db, "cp_connect", return_value=conn):
+            self.assertIsNone(auth.user_generation("matt"))
+
+    @mock.patch.object(db, "pg_isready", return_value=False)
+    def test_user_generation_is_none_when_pg_is_not_ready(self, _ready: mock.Mock) -> None:
+        with mock.patch.object(db, "cp_connect") as connect:
+            self.assertIsNone(auth.user_generation("matt"))
+        connect.assert_not_called()
+
+    def test_user_generation_fails_closed_on_a_db_error(self) -> None:
+        conn, cur = _conn_with_cur()
+        cur.execute.side_effect = RuntimeError("boom")
+        with mock.patch.object(db, "cp_connect", return_value=conn):
+            self.assertIsNone(auth.user_generation("matt"))
+
+    def test_revoke_sessions_bumps_the_counter(self) -> None:
+        conn, cur = _conn_with_cur()
+        cur.rowcount = 1
+        with mock.patch.object(db, "cp_connect", return_value=conn):
+            self.assertTrue(auth.revoke_sessions("matt"))
+        sql = cur.execute.call_args_list[0].args[0]
+        self.assertIn("token_generation = token_generation + 1", sql)
+
+    def test_revoke_sessions_reports_an_unknown_account(self) -> None:
+        conn, cur = _conn_with_cur()
+        cur.rowcount = 0
+        with mock.patch.object(db, "cp_connect", return_value=conn):
+            self.assertFalse(auth.revoke_sessions("nobody"))
 
 
 class VerifyCredentialsTests(unittest.TestCase):

@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Optional
 from unittest import mock
 
 CP = Path(__file__).resolve().parent
@@ -16,6 +17,7 @@ sys.path.insert(0, str(CP))
 
 import data_services  # noqa: E402
 import db  # noqa: E402
+from image_pins import digest_ref, tag_ref  # noqa: E402
 
 
 class DbProvisioningTests(unittest.TestCase):
@@ -67,6 +69,130 @@ class DbProvisioningTests(unittest.TestCase):
         self.assertEqual(result["state"], "ready")
         self.assertEqual(result["cp_database"], "lemonseed_cp")
         self.assertEqual(len(result["modules"]), 2)
+
+
+class _FakeCursor:
+    """Stand-in for a psycopg2 cursor over the ``cp_meta`` version row.
+
+    Stateful where it matters: the ``schema_version`` SELECT reads ``version``
+    and the UPSERT writes it back, so the migration runner can be driven twice
+    against one instance and behave like a real database. Doubles as its own
+    context manager so ``with conn.cursor() as cur`` works unchanged.
+    """
+
+    def __init__(self, version: Optional[int] = None) -> None:
+        self.version = version
+        self.statements: list[str] = []
+        self._probe_pending = False
+
+    def execute(self, sql: str, params: object = None) -> None:
+        self.statements.append(sql)
+        self._probe_pending = "FROM cp_meta WHERE key = 'schema_version'" in sql
+        if "INSERT INTO cp_meta" in sql and "schema_version" in sql:
+            self.version = json.loads(params[0])  # type: ignore[index]
+
+    def fetchone(self):
+        if self._probe_pending:
+            return None if self.version is None else (self.version,)
+        return None
+
+    def __enter__(self) -> "_FakeCursor":
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        return False
+
+    def ddl(self) -> list[str]:
+        return [
+            s.strip()
+            for s in self.statements
+            if s.strip().upper().startswith(("ALTER ", "CREATE "))
+        ]
+
+
+class SchemaMigrationTests(unittest.TestCase):
+    """``SCHEMA_VERSION`` must mean something on an already-deployed box.
+
+    M6.3b shipped ``schema_version`` as a metadata row only, with every statement
+    a ``CREATE TABLE IF NOT EXISTS`` and no ``ALTER TABLE`` anywhere: a new column
+    would have been silently absent in the field while tests passed. These assert
+    the runner actually executes DDL, exactly once, in order.
+    """
+
+    def test_fresh_database_reaches_current_version(self) -> None:
+        cur = _FakeCursor(None)
+        self.assertEqual(db.migrate_cp_schema(cur), db.SCHEMA_VERSION)
+        self.assertEqual(cur.version, db.SCHEMA_VERSION)
+        joined = " ".join(cur.ddl())
+        self.assertIn("token_generation", joined)
+        self.assertIn("last_login", joined)
+
+    def test_database_at_current_version_runs_no_ddl(self) -> None:
+        cur = _FakeCursor(db.SCHEMA_VERSION)
+        self.assertEqual(db.migrate_cp_schema(cur), db.SCHEMA_VERSION)
+        self.assertEqual(cur.ddl(), [])
+
+    def test_upgrade_from_baseline_adds_only_the_new_columns(self) -> None:
+        cur = _FakeCursor(db.BASELINE_SCHEMA_VERSION)
+        self.assertEqual(db.migrate_cp_schema(cur), db.SCHEMA_VERSION)
+        self.assertEqual(
+            cur.ddl(),
+            [
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS token_generation"
+                " INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ",
+            ],
+        )
+
+    def test_each_migration_runs_once_even_if_applied_twice(self) -> None:
+        cur = _FakeCursor(None)
+        db.migrate_cp_schema(cur)
+        db.migrate_cp_schema(cur)
+        alters = [s for s in cur.ddl() if s.startswith("ALTER TABLE")]
+        self.assertEqual(len(alters), 2)  # both columns, not each twice
+
+    def test_a_newer_database_than_the_control_plane_is_tolerated(self) -> None:
+        """A/B rollback must not brick the appliance."""
+        ahead = db.SCHEMA_VERSION + 1
+        cur = _FakeCursor(ahead)
+        self.assertEqual(db.migrate_cp_schema(cur), ahead)
+        self.assertEqual(cur.ddl(), [])
+        self.assertEqual(cur.version, ahead)
+
+    def test_migrations_cover_the_declared_version(self) -> None:
+        versions = [m.version for m in db.MIGRATIONS]
+        self.assertEqual(versions, sorted(set(versions)))
+        self.assertEqual(
+            versions,
+            list(range(db.BASELINE_SCHEMA_VERSION + 1, db.SCHEMA_VERSION + 1)),
+        )
+
+    def test_only_additive_migration_sql(self) -> None:
+        """Additive-only DDL, so an older slot can still read a newer database."""
+        banned = ("DROP", "RENAME", "ALTER COLUMN", "TRUNCATE", "DELETE", "UPDATE ")
+        for migration in db.MIGRATIONS:
+            cur = _FakeCursor(None)
+            migration.apply(cur)
+            statements = cur.ddl()
+            self.assertTrue(statements, f"v{migration.version} produced no DDL")
+            for sql in statements:
+                head = sql.upper()
+                # Every step must be re-runnable, because the version stamp is
+                # written after the DDL and a crash in between is expected.
+                if head.startswith("ALTER TABLE"):
+                    self.assertIn("ADD COLUMN IF NOT EXISTS", head, sql)
+                else:
+                    self.assertIn("IF NOT EXISTS", head, sql)
+                for word in banned:
+                    self.assertNotIn(word, head, sql)
+
+    @mock.patch.object(db, "_create_cp_tables")
+    def test_apply_cp_schema_reports_migrated_version(self, create: mock.Mock) -> None:
+        cur = _FakeCursor(db.BASELINE_SCHEMA_VERSION)
+        conn = mock.MagicMock()
+        conn.cursor.return_value = cur
+        self.assertEqual(db._apply_cp_schema(conn), db.SCHEMA_VERSION)
+        create.assert_called_once_with(conn)
 
 
 class OwuiConfigResetTests(unittest.TestCase):
@@ -165,10 +291,10 @@ class DataSuperviseTests(unittest.TestCase):
         with mock.patch.object(data_services, "_docker") as m_docker:
             data_services._supervise_one(
                 data_services.POSTGRES_CONTAINER,
-                data_services.POSTGRES_IMAGE,
+                data_services.POSTGRES_IMAGE_KEY,
                 "postgres",
                 5432,
-                ["run"],
+                lambda _ref: ["run"],
             )
         m_docker.assert_not_called()
         self.assertEqual(
@@ -184,10 +310,10 @@ class DataSuperviseTests(unittest.TestCase):
         with mock.patch.object(data_services, "_docker") as m_docker:
             data_services._supervise_one(
                 data_services.POSTGRES_CONTAINER,
-                data_services.POSTGRES_IMAGE,
+                data_services.POSTGRES_IMAGE_KEY,
                 "postgres",
                 5432,
-                ["run"],
+                lambda _ref: ["run"],
             )
         m_docker.assert_not_called()
         self.assertEqual(
@@ -204,10 +330,10 @@ class DataSuperviseTests(unittest.TestCase):
             with mock.patch.object(data_services, "_docker") as m_docker:
                 data_services._supervise_one(
                     data_services.POSTGRES_CONTAINER,
-                    data_services.POSTGRES_IMAGE,
+                    data_services.POSTGRES_IMAGE_KEY,
                     "postgres",
                     5432,
-                    ["run"],
+                    lambda _ref: ["run"],
                 )
         # rm -f for the recreate, then the start path re-runs it.
         self.assertTrue(
@@ -225,10 +351,10 @@ class DataSuperviseTests(unittest.TestCase):
         with mock.patch.object(data_services, "_start_container") as m_start:
             data_services._supervise_one(
                 data_services.POSTGRES_CONTAINER,
-                data_services.POSTGRES_IMAGE,
+                data_services.POSTGRES_IMAGE_KEY,
                 "postgres",
                 5432,
-                ["run"],
+                lambda _ref: ["run"],
             )
         m_start.assert_called_once()
         self.assertEqual(
@@ -243,10 +369,10 @@ class DataSuperviseTests(unittest.TestCase):
             m_docker.return_value = mock.Mock(returncode=0)
             data_services._supervise_one(
                 data_services.POSTGRES_CONTAINER,
-                data_services.POSTGRES_IMAGE,
+                data_services.POSTGRES_IMAGE_KEY,
                 "postgres",
                 5432,
-                ["run"],
+                lambda _ref: ["run"],
             )
         self.assertTrue(
             any(
@@ -270,9 +396,9 @@ class DataSuperviseTests(unittest.TestCase):
             m_docker.return_value = mock.Mock(returncode=0)
             data_services._start_container(
                 data_services.POSTGRES_CONTAINER,
-                data_services.POSTGRES_IMAGE,
+                data_services.POSTGRES_IMAGE_KEY,
                 "postgres",
-                ["run"],
+                lambda _ref: ["run"],
             )
         state = data_services._containers[data_services.POSTGRES_CONTAINER]
         self.assertEqual(state["state"], "waiting")
@@ -283,7 +409,7 @@ class DataSuperviseTests(unittest.TestCase):
     def test_pull_reports_registry_unreachable(self, _net: mock.Mock, _present: mock.Mock) -> None:
         probe = mock.Mock(returncode=1, stdout="", stderr="Error: no such host")
         with mock.patch.object(data_services, "_docker", return_value=probe) as m_docker:
-            ok, detail = data_services._pull_image(data_services.POSTGRES_IMAGE, "postgres")
+            ok, detail = data_services._pull_image(data_services.POSTGRES_IMAGE_KEY, "postgres")
         self.assertFalse(ok)
         self.assertIn("registry", detail)
         m_docker.assert_called_once()  # one diagnostic probe, no real pull
@@ -291,10 +417,111 @@ class DataSuperviseTests(unittest.TestCase):
     @mock.patch.object(data_services, "_image_present", return_value=True)
     def test_pull_skips_docker_when_image_present(self, _present: mock.Mock) -> None:
         with mock.patch.object(data_services, "_docker") as m_docker:
-            ok, detail = data_services._pull_image(data_services.POSTGRES_IMAGE, "postgres")
+            ok, detail = data_services._pull_image(data_services.POSTGRES_IMAGE_KEY, "postgres")
         self.assertTrue(ok)
         self.assertEqual(detail, "present")
         m_docker.assert_not_called()
+
+    # -- M6.6 S5.1: digest is what we run; the tag is display + fallback -----
+
+    def test_run_ref_prefers_the_pinned_digest(self) -> None:
+        with mock.patch.object(data_services, "_image_present", return_value=True):
+            self.assertEqual(
+                data_services._resolve_ref(data_services.POSTGRES_IMAGE_KEY),
+                digest_ref(data_services.POSTGRES_IMAGE_KEY),
+            )
+
+    def test_run_ref_falls_back_to_tag_when_digest_absent(self) -> None:
+        """QEMU's pullImage tarballs carry RepoTags but no RepoDigests."""
+
+        def present(ref: str) -> bool:
+            return "@" not in ref
+
+        with mock.patch.object(data_services, "_image_present", side_effect=present):
+            self.assertEqual(
+                data_services._resolve_ref(data_services.POSTGRES_IMAGE_KEY),
+                tag_ref(data_services.POSTGRES_IMAGE_KEY),
+            )
+
+    def test_run_ref_is_digest_when_nothing_is_local(self) -> None:
+        with mock.patch.object(data_services, "_image_present", return_value=False):
+            self.assertEqual(
+                data_services._resolve_ref(data_services.VALKEY_IMAGE_KEY),
+                digest_ref(data_services.VALKEY_IMAGE_KEY),
+            )
+
+    @mock.patch.object(data_services, "_image_present", return_value=True)
+    def test_run_args_end_with_the_resolved_ref(self, _present: mock.Mock) -> None:
+        ref = digest_ref(data_services.POSTGRES_IMAGE_KEY)
+        self.assertEqual(data_services._postgres_run_args(ref)[-1], ref)
+        ref = digest_ref(data_services.VALKEY_IMAGE_KEY)
+        self.assertIn(ref, data_services._valkey_run_args(ref))
+
+    def test_tag_only_local_image_is_not_repulled(self) -> None:
+        def present(ref: str) -> bool:
+            return "@" not in ref
+
+        with (
+            mock.patch.object(data_services, "_image_present", side_effect=present),
+            mock.patch.object(data_services, "_docker") as m_docker,
+        ):
+            ok, detail = data_services._pull_image(data_services.POSTGRES_IMAGE_KEY, "postgres")
+        self.assertTrue(ok)
+        self.assertEqual(detail, "present:tag")
+        m_docker.assert_not_called()
+
+    def test_pull_falls_back_to_tag_when_digest_unavailable(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_docker(args: list[str], **_kw: object) -> mock.Mock:
+            calls.append(args)
+            ok = "@" not in args[-1]
+            return mock.Mock(returncode=0 if ok else 1, stdout="", stderr="no such manifest")
+
+        with (
+            mock.patch.object(data_services, "_image_present", return_value=False),
+            mock.patch.object(data_services, "_network_reachable", return_value=True),
+            mock.patch.object(data_services, "_docker", side_effect=fake_docker),
+        ):
+            ok, detail = data_services._pull_image(data_services.POSTGRES_IMAGE_KEY, "postgres")
+        self.assertTrue(ok)
+        self.assertEqual(detail, "pulled:tag_fallback")
+        self.assertIn("@sha256:", calls[0][-1])
+        self.assertNotIn("@", calls[1][-1])
+
+    def test_start_container_flags_image_drift_on_tag_fallback(self) -> None:
+        data_services._containers = {data_services.VALKEY_CONTAINER: {"state": "starting"}}
+        with (
+            mock.patch.object(data_services, "_container_exists", return_value=False),
+            mock.patch.object(data_services, "_ensure_lemon_network", return_value=True),
+            mock.patch.object(data_services, "_pull_image", return_value=(True, "pulled:tag_fallback")),
+            mock.patch.object(data_services, "_resolve_ref", return_value="valkey/valkey:8-alpine"),
+            mock.patch.object(data_services, "_docker") as m_docker,
+        ):
+            m_docker.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            data_services._start_container(
+                data_services.VALKEY_CONTAINER,
+                data_services.VALKEY_IMAGE_KEY,
+                "valkey",
+                lambda ref: ["run", ref],
+            )
+        state = data_services._containers[data_services.VALKEY_CONTAINER]
+        self.assertTrue(state["image_drift"])
+        self.assertEqual(state["image"], "valkey/valkey:8-alpine")
+
+    def test_pull_budget_is_per_image(self) -> None:
+        """A blanket 600s cap was the slow-link hazard; budget by transfer size."""
+        self.assertEqual(data_services.PULL_TIMEOUT_SEC["valkey"], 300)
+        self.assertEqual(data_services.PULL_TIMEOUT_SEC["postgres"], 900)
+        result = mock.Mock(returncode=0, stdout="", stderr="")
+        for key, budget in data_services.PULL_TIMEOUT_SEC.items():
+            with (
+                mock.patch.object(data_services, "_image_present", return_value=False),
+                mock.patch.object(data_services, "_network_reachable", return_value=True),
+                mock.patch.object(data_services, "_docker", return_value=result) as m_docker,
+            ):
+                data_services._pull_image(key, key)
+            self.assertEqual(m_docker.call_args.kwargs["timeout"], budget)
 
     @mock.patch.object(data_services, "_supervise_one")
     def test_supervise_once_covers_both_containers(self, m_one: mock.Mock) -> None:

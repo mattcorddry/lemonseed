@@ -114,7 +114,7 @@ def _free_bytes(models_dir: Path) -> tuple[int, int]:
 
 
 def _disk_space(
-    models_dir: Path, client: Optional[LemonadeClient]
+    models_dir: Path, client: Optional[LemondClient]
 ) -> tuple[int, int]:
     """(total, free) for the model cache, preferring lemond's system-info.
 
@@ -153,7 +153,7 @@ def _catalog_id_for_dir(name: str) -> Optional[str]:
 
 
 def _model_size(
-    name: str, path: Path, client: Optional[LemonadeClient]
+    name: str, path: Path, client: Optional[LemondClient]
 ) -> int:
     """On-disk size of a model, preferring lemond's file listing.
 
@@ -176,7 +176,7 @@ def _model_size(
     return _dir_size(path)
 
 
-def _lemond_reachable(client: Optional[LemonadeClient]) -> bool:
+def _lemond_reachable(client: Optional[LemondClient]) -> bool:
     """True when lemond is up and answering (system-info round-trip)."""
     if client is None:
         return False
@@ -184,7 +184,7 @@ def _lemond_reachable(client: Optional[LemonadeClient]) -> bool:
 
 
 def _delete_model(
-    name: str, path: Path, client: Optional[LemonadeClient]
+    name: str, path: Path, client: Optional[LemondClient]
 ) -> bool:
     """Delete a model, preferring lemond's API (unloads first if loaded).
 
@@ -222,7 +222,7 @@ def ensure_model_space(
     needed_bytes: int,
     target_name: Optional[str] = None,
     protect_name: Optional[str] = None,
-    client: Optional[LemonadeClient] = None,
+    client: Optional[LemondClient] = None,
 ) -> dict[str, Any]:
     """Ensure room on the model cache for a download of `needed_bytes`.
 

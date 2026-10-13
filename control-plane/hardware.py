@@ -9,7 +9,6 @@ import subprocess
 import threading
 from pathlib import Path
 from typing import Any, Optional
-
 from urllib.request import Request, urlopen
 
 LEMOND_ENV_FILE = Path("/var/lib/lemonseed/lemonade/lemond.env")

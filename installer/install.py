@@ -12,14 +12,13 @@ import json
 import os
 import shutil
 import subprocess
+import syslog
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-
-import syslog
 
 from disks import list_candidate_disks
 from preflight import require_host_ready

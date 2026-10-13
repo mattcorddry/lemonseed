@@ -1,0 +1,17 @@
+{
+  "open_webui": {
+    "name": "ghcr.io/open-webui/open-webui",
+    "tag": "v0.11.0",
+    "digest": "sha256:72c0ba641ba75e7aa52655cb242570906ececd09b1140fb736483038a22b3228"
+  },
+  "postgres": {
+    "name": "pgvector/pgvector",
+    "tag": "pg16",
+    "digest": "sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b"
+  },
+  "valkey": {
+    "name": "valkey/valkey",
+    "tag": "8-alpine",
+    "digest": "sha256:e0eb7c480958d32bdc4357a74bdd70653ae15f2f9b4c93c4a5a9fad1dc471c84"
+  }
+}

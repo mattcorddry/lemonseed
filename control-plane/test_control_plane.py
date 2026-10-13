@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -14,9 +15,10 @@ import time
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from typing import Optional
 from unittest import mock
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 CP = Path(__file__).resolve().parent
 sys.path.insert(0, str(CP))
@@ -37,6 +39,7 @@ import catalog  # noqa: E402
 import chat_ready  # noqa: E402
 import hardware  # noqa: E402
 import model_store  # noqa: E402
+import sessions  # noqa: E402
 import stub  # noqa: E402
 
 
@@ -1741,6 +1744,27 @@ class StubHttpTests(unittest.TestCase):
         self.assertEqual(data["role"], "control-plane")
         self.assertEqual(data["status"], "ok")
 
+    @mock.patch.object(stub, "boot_snapshot")
+    @mock.patch.object(stub.sessions, "store_status", return_value="unavailable")
+    def test_api_status_reports_the_session_store(self, store: mock.Mock, boot: mock.Mock) -> None:
+        """M6.6 S5.6: sessions fail closed, so their health has to be visible.
+
+        Before this, ping() had no caller at all and "nobody can sign in because
+        Valkey is down" was invisible from the outside.
+        """
+        boot.return_value = {
+            "version": "test",
+            "startup_ready": False,
+            "lemond": {"state": "starting"},
+            "docker": {"state": "ready"},
+            "units": {},
+        }
+        code, body = self._get("/api/status")
+        self.assertEqual(code, 200)
+        data = json.loads(body.decode())
+        self.assertEqual(data["session_store"], "unavailable")
+        store.assert_called_once()
+
     @mock.patch.object(stub.data_services, "ensure_data_worker")
     @mock.patch.object(stub.data_services, "ensure_provision_worker")
     @mock.patch.object(stub.data_services, "data_snapshot")
@@ -1794,6 +1818,195 @@ OWUI_EXPORT_FIXTURE = {
     "web.search.enable": True,
     "vector_db.chunks_per_collection": {"docs": 10},
 }
+
+
+class _NoRedirects(HTTPRedirectHandler):
+    """Login and logout answer 302; these assertions need that response, not its target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class SessionGateHttpTests(unittest.TestCase):
+    """The gate's status contract over real HTTP (M6.6).
+
+    **401 and 503 must stay distinguishable.** One means "sign in again", the
+    other "the appliance cannot check". Collapsing them would turn a Valkey
+    outage into a household-wide sign-out, and pre-M6.6 there was no second
+    state at all because nothing but the token was consulted.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server = ThreadingHTTPServer((stub.HOST, stub.PORT), stub.Handler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.opener = build_opener(_NoRedirects())
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+
+    def _call(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[dict] = None,
+        headers: Optional[dict] = None,
+    ) -> tuple[int, dict, bytes]:
+        body = json.dumps(payload).encode() if payload is not None else None
+        req = Request(
+            f"http://{stub.HOST}:{stub.PORT}{path}",
+            data=body,
+            headers={"Content-Type": "application/json", **(headers or {})},
+            method=method,
+        )
+        try:
+            with self.opener.open(req, timeout=5) as resp:
+                return resp.status, dict(resp.headers), resp.read()
+        except HTTPError as exc:
+            try:
+                return exc.code, dict(exc.headers), exc.read()
+            finally:
+                exc.close()
+
+    def _verify(self, cookie: Optional[str] = "some-token") -> tuple[int, dict, bytes]:
+        headers = {}
+        if cookie is not None:
+            headers["Cookie"] = f"{auth.SESSION_COOKIE}={cookie}"
+        return self._call("GET", "/_lemonseed/session-verify", headers=headers)
+
+    def test_missing_cookie_is_401(self) -> None:
+        code, _headers, _body = self._verify(cookie=None)
+        self.assertEqual(code, 401)
+
+    def test_malformed_cookie_is_401(self) -> None:
+        code, _headers, _body = self._verify(cookie="not-a-signed-token")
+        self.assertEqual(code, 401)
+
+    def test_dead_session_is_401(self) -> None:
+        with mock.patch.object(auth, "verify_session", return_value=None):
+            code, _headers, _body = self._verify()
+        self.assertEqual(code, 401)
+
+    def test_gate_no_longer_trusts_the_token_alone(self) -> None:
+        """The regression that motivated M6.6: verify_session owns the decision."""
+        with mock.patch.object(auth, "verify_token") as verify_token:
+            with mock.patch.object(auth, "verify_session", return_value=None):
+                code, _headers, _body = self._verify()
+        self.assertEqual(code, 401)
+        verify_token.assert_not_called()
+
+    def test_live_session_returns_identity_headers(self) -> None:
+        record = {
+            "u": "matt",
+            "e": "matt@localhost",
+            "g": ["admin", "users"],
+            "n": "Matt Corddry",
+            "gen": 3,
+            "iat": 1,
+        }
+        with mock.patch.object(auth, "verify_session", return_value=record):
+            code, headers, _body = self._verify()
+        self.assertEqual(code, 200)
+        self.assertEqual(headers["X-Forwarded-User"], "matt")
+        self.assertEqual(headers["X-Forwarded-Email"], "matt@localhost")
+        self.assertEqual(headers["X-Forwarded-Groups"], "admin,users")
+        self.assertEqual(headers["X-Forwarded-Name"], "Matt Corddry")
+        self.assertEqual(headers["X-Forwarded-Role"], "admin")
+
+    def test_unreachable_session_store_is_503_not_401(self) -> None:
+        with mock.patch.object(
+            auth, "verify_session", side_effect=sessions.SessionStoreUnavailable("down")
+        ):
+            code, headers, body = self._verify()
+        self.assertEqual(code, 503)
+        self.assertIn("application/json", headers.get("Content-Type", ""))
+        self.assertTrue(json.loads(body.decode())["detail"])
+
+    def test_login_fails_closed_when_the_store_is_unreachable(self) -> None:
+        user = {"username": "matt", "email": "", "groups": ["admin"], "display_name": ""}
+        with mock.patch.object(auth, "verify_credentials", return_value=user):
+            with mock.patch.object(
+                auth, "create_session", side_effect=sessions.SessionStoreUnavailable("down")
+            ):
+                code, headers, body = self._call(
+                    "POST", "/login", {"username": "matt", "password": "pw"}
+                )
+        self.assertEqual(code, 503)
+        self.assertIn("detail", json.loads(body.decode()))
+        self.assertNotIn("Set-Cookie", headers)
+
+    def test_login_rejects_an_account_that_vanished_mid_signin(self) -> None:
+        user = {"username": "matt", "email": "", "groups": [], "display_name": ""}
+        with mock.patch.object(auth, "verify_credentials", return_value=user):
+            with mock.patch.object(auth, "create_session", side_effect=ValueError("disabled")):
+                code, headers, _body = self._call(
+                    "POST", "/login", {"username": "matt", "password": "pw"}
+                )
+        self.assertEqual(code, 401)
+        self.assertNotIn("Set-Cookie", headers)
+
+    def test_login_success_sets_the_session_cookie(self) -> None:
+        user = {"username": "matt", "email": "", "groups": ["admin"], "display_name": ""}
+        with mock.patch.object(auth, "verify_credentials", return_value=user):
+            with mock.patch.object(auth, "create_session", return_value="signed-token"):
+                code, headers, _body = self._call(
+                    "POST", "/login", {"username": "matt", "password": "pw"}
+                )
+        self.assertEqual(code, 302)
+        cookie = headers.get("Set-Cookie", "")
+        self.assertIn("lemonseed_session=signed-token", cookie)
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Lax", cookie)
+
+    def test_logout_succeeds_even_when_the_store_is_unreachable(self) -> None:
+        """A broken data plane must not trap someone in a signed-in shell."""
+        with mock.patch.object(sessions, "drop_quietly", return_value=False):
+            code, headers, _body = self._call(
+                "POST", "/logout", headers={"Cookie": f"{auth.SESSION_COOKIE}=t"}
+            )
+        self.assertEqual(code, 302)
+        cookie = headers.get("Set-Cookie", "")
+        self.assertIn("lemonseed_session=;", cookie)
+        self.assertIn("Max-Age=0", cookie)
+
+
+class PackagingTests(unittest.TestCase):
+    """Every first-party CP module must appear in the image's install list.
+
+    ``nixos/modules/control-plane.nix`` copies CP sources **by name** (no glob),
+    so a new module that is not added there imports happily in ``make test`` and
+    dies with ``ModuleNotFoundError`` on the appliance at boot. M6.6's
+    ``sessions.py`` is exactly that shape of mistake, so the list gets a test.
+    """
+
+    NIX = CP.parent / "nixos" / "modules" / "control-plane.nix"
+
+    def test_all_first_party_modules_are_installed(self) -> None:
+        text = self.NIX.read_text(encoding="utf-8")
+        installed = set(re.findall(r"\$\{cpSrc\}/([\w.-]+)", text))
+        first_party = {
+            path.name
+            for path in CP.glob("*.py")
+            if not path.name.startswith(("test_", "conftest"))
+        }
+        missing = first_party - installed
+        self.assertEqual(
+            missing,
+            set(),
+            f"add {sorted(missing)} to the cp install list in {self.NIX}",
+        )
+
+    def test_install_list_has_no_stale_entries(self) -> None:
+        """A deleted module left in the list breaks the build, so catch it here."""
+        text = self.NIX.read_text(encoding="utf-8")
+        installed = set(re.findall(r"\$\{cpSrc\}/([\w.-]+)", text))
+        on_disk = {path.name for path in CP.iterdir() if path.is_file()}
+        missing = {name for name in installed if "." in name} - on_disk
+        self.assertEqual(missing, set(), f"stale entries in {self.NIX}: {sorted(missing)}")
 
 
 class OwuiConfigViewTests(unittest.TestCase):

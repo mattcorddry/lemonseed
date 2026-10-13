@@ -4,6 +4,35 @@
 
 let
   brandAssets = ../../control-plane/static/brand;
+  cpStatic = ../../control-plane/static;
+
+  # M6.6 S5.5 — how long nginx is willing to wait for the CP before opening
+  # :80 anyway. A boot where the CP comes up normally never shows the not-ready
+  # page; a boot where it does not shows that page instead of a raw gateway
+  # error. Two numbers only, because a hang must not become a boot stall.
+  gatewayWaitSeconds = 20;
+
+  # A real script file, not an inline snippet: systemd expands `$VAR` in an
+  # ExecStart line, so arithmetic like $(date +%s) belongs somewhere the shell
+  # — not the unit parser — reads it.
+  gatewayWait = pkgs.writeShellApplication {
+    name = "lemonseed-gateway-wait";
+    runtimeInputs = with pkgs; [ coreutils curl ];
+    text = ''
+      deadline=$(( $(date +%s) + ${toString gatewayWaitSeconds} ))
+      while :; do
+        if curl -fsS -o /dev/null --max-time 2 http://127.0.0.1:8080/healthz; then
+          echo "lemonseed-gateway: control plane is serving; opening :80"
+          exit 0
+        fi
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+          echo "lemonseed-gateway: control plane not serving after ${toString gatewayWaitSeconds}s; opening :80 anyway" >&2
+          exit 0
+        fi
+        sleep 0.5
+      done
+    '';
+  };
 
   identity = pkgs.writeShellApplication {
     name = "lemonseed-apply-identity";
@@ -313,6 +342,18 @@ in
         "empty:1"    http://lemonseed_owui;
         "document:1" http://lemonseed_owui;
       }
+
+      # Same split, one level down: which not-ready page answers when / fails.
+      # A document request's upstream is the CP, so only the static page can
+      # render; an embed request's upstream is OWUI, so the CP shell can.
+      map "$http_sec_fetch_dest:$arg_embed" $lemonseed_error_target {
+        default      /_lemonseed/cp-down;
+        "iframe:"    /_lemonseed/interstitial;
+        "iframe:1"   /_lemonseed/interstitial;
+        ":1"         /_lemonseed/interstitial;
+        "empty:1"    /_lemonseed/interstitial;
+        "document:1" /_lemonseed/interstitial;
+      }
     '';
     virtualHosts."lemonseed" = {
       default = true;
@@ -324,30 +365,49 @@ in
       ];
 
       # Unauthenticated requests on gated locations land here (the CP login
-      # page handles ?rd= for the post-login redirect). When OWUI is
-      # not yet running, 502/503/504 from the dead upstream are rewritten to
-      # the CP shell (which shows a "Getting Ready" interstitial and
-      # auto-loads OWUI once it is healthy).
+      # page handles ?rd= for the post-login redirect).
       #
-      # The CP shell itself is also the "rebooting" interstitial: when the
-      # amdgpu-kernel-params service reboots the box, the browser's in-flight
-      # requests die mid-flight. The shell's 5s poll keeps retrying, but the
-      # browser only re-displays the page if it actually received a response
-      # after the box came back. To guarantee the user sees the "Rebooting…"
-      # page (rather than ERR_CONNECTION_REFUSED), we also serve the CP shell
-      # on 502/503/504 from the CP upstream — the shell's JS then shows the
-      # rebooting state (chat.state == "rebooting") and keeps polling until
-      # the box is back and the model is ready.
+      # M6.6 S5.4 — the error contract, measured against nginx 1.30 rather than
+      # assumed. Three findings shaped it:
+      #
+      # 1. `alias` is rejected inside a named location, so the static page is
+      #    pinned with try_files under an explicit root.
+      # 2. nginx does not run error_page inside a location it reached *through*
+      #    error_page (it blocks error-page recursion). So the previous pattern
+      #    — error_page 502 → @cp_interstitial → proxy_pass to the CP — could
+      #    never render a friendly page when the CP was the thing that was
+      #    down: the second proxy just failed again and the browser got nginx's
+      #    stock page. That is the raw "502"/"500" the user saw on boot, and no
+      #    amount of nesting fixes it: the fallback has to be chosen by the
+      #    originating location.
+      # 3. proxy_intercept_errors is off (and stays off), so a 500 produced *by
+      #    the CP* passes through untouched. Only errors nginx generates itself
+      #    — connect refused, timeout, no live upstreams — get the friendly
+      #    page. A real CP bug therefore stays visible instead of being masked
+      #    as "still starting".
+      #
+      # `=503` keeps the status honest while the body renders. cp-down.html's
+      # only subresource is the brand mark, which nginx serves straight from
+      # SquashFS, so it cannot fail the same way twice.
       extraConfig = ''
         ${authVarDecls}
         location @auth_unauthorized {
           return 302 /login?rd=$request_uri;
         }
-        location @cp_interstitial {
-          # Named location: proxy_pass may not carry a URI part. Forward the
-          # original request URI — the CP routes /, /login, /settings/, and
-          # /api/* natively, so the interstitial shows the right page.
-          proxy_pass http://127.0.0.1:8080;
+        location /_lemonseed/cp-down {
+          internal;
+          root ${cpStatic};
+          try_files /cp-down.html =503;
+          default_type text/html;
+          add_header Cache-Control "no-store" always;
+        }
+        # CP-shell interstitial: used where the *failing* upstream is not the
+        # CP (the OWUI iframe, and the root for embed requests), so proxying to
+        # the CP still has something useful to say. Reached by internal
+        # redirect, which rewrites $uri, hence $request_uri in proxy_pass.
+        location /_lemonseed/interstitial {
+          internal;
+          proxy_pass http://127.0.0.1:8080$request_uri;
           proxy_http_version 1.1;
           proxy_set_header Host $host;
           proxy_set_header X-Real-IP $remote_addr;
@@ -355,6 +415,10 @@ in
           proxy_set_header X-Forwarded-Proto $scheme;
           ${identityHeaders}
         }
+        # Server-level fallback for locations with no error_page of their own
+        # (a gated location always has one, because auth-gate.conf contributes
+        # the 401 clause and any error_page at that level replaces this one).
+        error_page 500 502 503 504 =503 /_lemonseed/cp-down;
         location @owui_loading {
           proxy_pass http://127.0.0.1:8080;
           proxy_http_version 1.1;
@@ -367,28 +431,33 @@ in
       '';
 
       # Exact root: shell for browsers, OWUI for the app iframe. [gated]
+      #
+      # The error target is a map for the same reason the upstream is one: for a
+      # document request the upstream *is* the CP (so a failure needs the static
+      # page), while for an embed request it is OWUI (so the CP can still
+      # explain what is happening).
       locations."= /" = {
         extraConfig = ''
           ${authGate}
-          error_page 502 503 504 = @owui_loading;
+          error_page 500 502 503 504 =503 $lemonseed_error_target;
           proxy_pass $lemonseed_root_upstream;
           ${rootProxy}
         '';
       };
       locations."= /index.html" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${authGate}\n${cpProxy}";
+        extraConfig = "${authGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
 
       # Edge auth (CP-native, M6.2): the login page is open (it IS the sign-in
       # form); logout is gated (only a signed-in user can log out).
       locations."= /login" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+        extraConfig = "${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
       locations."= /logout" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${authGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+        extraConfig = "${authGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
       # Internal auth_request target (never LAN-facing). The CP verifies the
       # signed session cookie and returns 200 + X-Forwarded-* headers (read via
@@ -412,7 +481,7 @@ in
       # First-boot setup + health probes stay open (pre-admin trust window).
       locations."= /setup" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+        extraConfig = "${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
       locations."= /healthz" = {
         proxyPass = "http://127.0.0.1:8080";
@@ -425,7 +494,7 @@ in
       locations."/settings/" = {
         proxyPass = "http://127.0.0.1:8080";
         # Gated + admin group required (M6.2).
-        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
       locations."= /settings" = {
         return = "302 /settings/";
@@ -440,15 +509,15 @@ in
       };
       locations."= /api/status" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+        extraConfig = "${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
       locations."= /api/hardware" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${authGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+        extraConfig = "${authGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
       locations."= /api/plan" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${authGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+        extraConfig = "${authGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
       # Model picker (M6.5): GET reads families + best-fit; POST records the
       # user's choice and is admin-gated in the CP (like /settings/).
@@ -458,14 +527,14 @@ in
       # to win and silently returned the CP's picker payload to OWUI.
       locations."= /_lemonseed/api/models" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
       # Open WebUI config ownership view (M6.3b 4A). Exact match so OWUI still
       # owns every other path; admin-gated here *and* in the CP, because the
       # payload merges Open WebUI's (unredacted) config export.
       locations."= /_lemonseed/api/owui/config" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
       # Phase 4B admin actions (M6.3b): re-apply Lemonseed's intent now, and the
       # config reset window. Same double gating as the ownership view. The reset
@@ -473,38 +542,38 @@ in
       # there is no long-held connection to time out here.
       locations."= /_lemonseed/api/owui/reconcile" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
       locations."= /_lemonseed/api/owui/reset-config" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
       # GC e2e test endpoints (admin-gated): disk filler + cached-model list.
       # Used by scripts/qemu-api-smoke-test.sh (QEMU_E2E_GC=1) to exercise the
       # LRU model-eviction path; fill writes a large file to /var/tmp only.
       locations."= /_lemonseed/api/gc-test/fill" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
       locations."= /_lemonseed/api/gc-test/fill/remove" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
       locations."= /_lemonseed/api/gc-test/models" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
       locations."= /api/data" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${authGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+        extraConfig = "${authGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
       locations."= /api/modules" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${authGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+        extraConfig = "${authGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
       locations."= /api/chat" = {
         proxyPass = "http://127.0.0.1:8080";
-        extraConfig = "${authGate}\n${cpProxy}\nerror_page 502 503 504 = @cp_interstitial;";
+        extraConfig = "${authGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
 
       # Brand icons (shell / setup / favicon) — must not fall through to OWUI.
@@ -578,12 +647,27 @@ in
     };
   };
 
+  # M6.6 S5.5 — open :80 in the right order without *depending* on the CP.
+  #
+  # A hard after=appliance-control-plane.service would be the wrong edge: the CP
+  # is what starts Docker containers, so the dependency would be circular in the
+  # limit, and a hung CP would then mean no web UI ever. Instead nginx waits a
+  # bounded time for the CP to serve its health endpoint, which removes the
+  # error page from the common boot, and opens :80 anyway on timeout, which
+  # keeps a slow or broken CP from taking the gateway down with it.
+  #
+  # The gate is "the CP answers HTTP", not "the appliance is fully ready": the
+  # CP renders its own progress UI for anything still starting, so waiting for
+  # more here would only delay a page that already tells the truth.
+  services.nginx.preStart = "${gatewayWait}/bin/lemonseed-gateway-wait";
+
   systemd.services.nginx = {
     # Do NOT depend on appliance-control-plane: nginx must open :80 as soon as
     # the network is up, even while the CP (and lemond/docker) are still
-    # starting. A dead CP upstream is handled by error_page 502 → the CP shell
-    # interstitial, so the browser always gets a response instead of
-    # ERR_CONNECTION_REFUSED during the boot window.
+    # starting. The bounded preStart poll above covers the normal case, and
+    # /_lemonseed/cp-down (error_page 500 502 503 504 =503) covers the rest of
+    # the window, so the browser always gets a Lemonseed page instead of
+    # ERR_CONNECTION_REFUSED or nginx's stock error.
     after = [
       "network-online.target"
       "lemonseed-owui-upstream-seed.service"
@@ -594,6 +678,8 @@ in
       "lemonseed-owui-upstream-seed.service"
       "lemonseed-auth-gate-seed.service"
     ];
+    # Restart is already "always"/RestartSec=10s from the nginx module, which is
+    # strictly stronger than the on-failure we asked for, so nothing to set.
   };
 
   # No on-disk nginx access/error logs — nothing for logrotate to manage.

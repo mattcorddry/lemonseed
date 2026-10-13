@@ -17,7 +17,124 @@ CP = Path(__file__).resolve().parent
 sys.path.insert(0, str(CP))
 
 import auth  # noqa: E402
+import image_pins  # noqa: E402
 import modules  # noqa: E402
+
+
+class StaleContainerReapTests(unittest.TestCase):
+    """M6.6 S5.6: stopped containers from an earlier boot must not pile up."""
+
+    @staticmethod
+    def _fake_docker(table: dict[str, str], rm_ok: bool = True) -> mock.Mock:
+        def fake(args: list[str], **_kw: object) -> mock.Mock:
+            if args[:2] == ["ps", "-a"]:
+                out = "\n".join(f"{name}\t{state}" for name, state in table.items())
+                return mock.Mock(returncode=0, stdout=out + "\n", stderr="")
+            if args[:2] == ["rm", "-f"]:
+                return mock.Mock(returncode=0 if rm_ok else 1, stdout="", stderr="")
+            raise AssertionError(f"unexpected docker call: {args}")
+
+        return mock.Mock(side_effect=fake)
+
+    def test_removes_stopped_and_keeps_running(self) -> None:
+        table = {
+            "lemonseed-owui-18080": "exited",
+            "lemonseed-owui-18081": "running",
+        }
+        fake = self._fake_docker(table)
+        with mock.patch.object(modules, "_docker", fake):
+            removed = modules.reap_stale_containers()
+        self.assertEqual(removed, ["lemonseed-owui-18080"])
+
+    def test_ignores_foreign_names(self) -> None:
+        """The docker name filter is a substring match; a neighbour is not ours."""
+        table = {"open-webui": "exited", "my-lemonseed-owui-old": "exited"}
+        fake = self._fake_docker(table)
+        with mock.patch.object(modules, "_docker", fake):
+            removed = modules.reap_stale_containers()
+        self.assertEqual(removed, [])
+
+    def test_docker_failure_is_not_fatal(self) -> None:
+        with mock.patch.object(
+            modules, "_docker", return_value=mock.Mock(returncode=1, stdout="", stderr="boom")
+        ):
+            self.assertEqual(modules.reap_stale_containers(), [])
+
+    def test_failed_rm_is_not_reported_as_removed(self) -> None:
+        fake = self._fake_docker({"lemonseed-owui-18080": "created"}, rm_ok=False)
+        with mock.patch.object(modules, "_docker", fake):
+            self.assertEqual(modules.reap_stale_containers(), [])
+
+    def test_worker_reaps_before_the_first_tick(self) -> None:
+        """The reap must land once, ahead of the first tick, and never race it."""
+
+        class _StopLoop(RuntimeError):
+            pass
+
+        order: list[str] = []
+
+        def reap() -> list[str]:
+            order.append("reap")
+            return []
+
+        def tick() -> None:
+            order.append("tick")
+
+        with (
+            mock.patch.object(modules, "reap_stale_containers", reap),
+            mock.patch.object(modules, "supervise_modules_once", tick),
+            mock.patch.object(modules.time, "sleep", side_effect=_StopLoop("stop")),
+        ):
+            with self.assertRaises(_StopLoop):
+                modules._supervise_forever()
+        self.assertEqual(order, ["reap", "tick"])
+
+    def test_reap_failure_does_not_stop_the_worker(self) -> None:
+        """A broken `docker ps` must not cost us the supervisor."""
+
+        class _StopLoop(RuntimeError):
+            pass
+
+        ticks: list[str] = []
+        with (
+            mock.patch.object(
+                modules, "reap_stale_containers", side_effect=OSError("docker is angry")
+            ),
+            mock.patch.object(modules, "supervise_modules_once", side_effect=lambda: ticks.append("t")),
+            mock.patch.object(modules.time, "sleep", side_effect=_StopLoop("stop")),
+        ):
+            with self.assertRaises(_StopLoop):
+                modules._supervise_forever()
+        self.assertEqual(ticks, ["t"])
+
+
+class ProgressCopyTests(unittest.TestCase):
+    """M6.6 S5.7: the interstitial must not blame the chat app for the data plane."""
+
+    def test_pull_gets_its_own_words(self) -> None:
+        workflow, task = modules._owui_progress_copy("pulling", "v0.11.0", {})
+        self.assertEqual(workflow, "Configuring chat")
+        self.assertIn("Pulling", task)
+
+    def test_data_plane_wait_says_storage(self) -> None:
+        workflow, task = modules._owui_progress_copy(
+            "waiting", "v0.11.0", {"reason": "data plane not provisioned", "provisioning": "starting"}
+        )
+        self.assertEqual(workflow, "Preparing storage")
+        self.assertNotIn("chat", task.lower())
+
+    def test_missing_database_url_says_storage(self) -> None:
+        workflow, _task = modules._owui_progress_copy(
+            "waiting", "v0.11.0", {"reason": "open-webui DATABASE_URL missing"}
+        )
+        self.assertEqual(workflow, "Preparing storage")
+
+    def test_unrelated_wait_stays_chat(self) -> None:
+        workflow, task = modules._owui_progress_copy(
+            "waiting", "v0.11.0", {"reason": "Rebuilding the index"}
+        )
+        self.assertEqual(workflow, "Configuring chat")
+        self.assertEqual(task, "Rebuilding the index")
 
 
 class ModulesTests(unittest.TestCase):
@@ -60,6 +177,23 @@ class ModulesTests(unittest.TestCase):
         self.assertNotIn(":main", image)
         # Default runtime pin matches the documented default unless overridden.
         self.assertEqual(modules.OWUI_IMAGE, modules.OWUI_IMAGE_DEFAULT)
+
+    def test_owui_run_ref_is_the_pinned_digest(self) -> None:
+        """Run/pull uses the digest; the status `image` field stays the tag.
+
+        T5-H: a sha256 must never reach user-facing copy, and modules.py derives
+        the version label by splitting `image` on ':'. Both invariants are
+        enforced here so neither can silently regress.
+        """
+        digest = image_pins.digest_ref(modules.OWUI_IMAGE_KEY)
+        with mock.patch.object(modules, "_image_present", return_value=True):
+            self.assertEqual(modules._owui_run_ref(), digest)
+        with mock.patch.object(modules, "_image_present", return_value=False):
+            self.assertEqual(modules._owui_run_ref(), modules.OWUI_IMAGE)
+        self.assertNotIn("@", modules.OWUI_IMAGE)
+        self.assertEqual(
+            modules.OWUI_IMAGE, image_pins.tag_ref(modules.OWUI_IMAGE_KEY)
+        )
 
     def test_network_reachable_caches_outcome(self) -> None:
         with (
@@ -546,8 +680,62 @@ class ModulesTests(unittest.TestCase):
                 ok, detail = modules._pull_image()
         self.assertFalse(ok)
         self.assertIn("waiting", detail)
-        docker.assert_called_once()
-        self.assertEqual(docker.call_args.args[0][:2], ["image", "inspect"])
+        # digest + tag presence probes only — no pull attempt while waiting.
+        self.assertEqual(docker.call_count, 2)
+        for call in docker.call_args_list:
+            self.assertEqual(call.args[0][:2], ["image", "inspect"])
+
+    def test_pull_reports_tag_only_image_as_present(self) -> None:
+        """A tag-only local image (QEMU tarball) must not trigger a pull."""
+        seen: list[str] = []
+
+        def present(ref: str) -> bool:
+            seen.append(ref)
+            return not ref.startswith("sha256:") and "@" not in ref
+
+        with (
+            mock.patch.object(modules, "_image_present", side_effect=present),
+            mock.patch.object(modules, "_docker") as docker,
+        ):
+            ok, detail = modules._pull_image()
+        self.assertTrue(ok)
+        self.assertEqual(detail, "present:tag")
+        docker.assert_not_called()
+        self.assertIn(image_pins.digest_ref(modules.OWUI_IMAGE_KEY), seen)
+
+    def test_pull_falls_back_to_tag_when_digest_unavailable(self) -> None:
+        """A GC'd pin must degrade loudly, not refuse to start the chat app."""
+        calls: list[list[str]] = []
+
+        def fake_docker(args: list[str], **_kw: object) -> mock.Mock:
+            calls.append(args)
+            # digest pull fails, tag pull succeeds
+            ok = "@" not in args[-1]
+            return mock.Mock(returncode=0 if ok else 1, stdout="", stderr="no such manifest")
+
+        with (
+            mock.patch.object(modules, "_image_present", return_value=False),
+            mock.patch.object(modules, "_network_reachable", return_value=True),
+            mock.patch.object(modules, "_docker", side_effect=fake_docker),
+        ):
+            ok, detail = modules._pull_image()
+        self.assertTrue(ok)
+        self.assertEqual(detail, "pulled:tag_fallback")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("@sha256:", calls[0][-1])
+        self.assertNotIn("@", calls[1][-1])
+
+    def test_pull_timeout_covers_owui_image_size(self) -> None:
+        """Open WebUI is ~1.7 GB compressed; a 600s cap fails slow links."""
+        self.assertGreaterEqual(modules.OWUI_PULL_TIMEOUT_SEC, 1800)
+        result = mock.Mock(returncode=0, stdout="", stderr="")
+        with (
+            mock.patch.object(modules, "_image_present", return_value=False),
+            mock.patch.object(modules, "_network_reachable", return_value=True),
+            mock.patch.object(modules, "_docker", return_value=result) as m_docker,
+        ):
+            modules._pull_image()
+        self.assertEqual(m_docker.call_args.kwargs["timeout"], modules.OWUI_PULL_TIMEOUT_SEC)
 
     # -- M6.3b: CP service identity in Open WebUI --------------------------
 

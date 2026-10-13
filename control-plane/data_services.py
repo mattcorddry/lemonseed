@@ -16,9 +16,10 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from db import pg_isready, provision_data_plane
+from image_pins import digest_ref, tag_ref
 
 _provision_lock = threading.Lock()
 _provision_state: Optional[dict[str, Any]] = None
@@ -26,19 +27,33 @@ _provision_worker: Optional[threading.Thread] = None
 
 # Intent: the exact docker run args the data plane wants. Must match
 # nixos/modules/data-services.nix so containers created here are compatible
-# with the boot-time start scripts (and vice versa).
+# with the boot-time start scripts (and vice versa). Both read the same
+# container-images.json, so "must match" is now enforced by construction
+# rather than by this comment (M6.6 S5.1).
 DATA_ROOT = Path("/var/lib/lemonseed/data")
 POSTGRES_ENV = DATA_ROOT / "secrets" / "postgres.env"
 LEMON_NETWORK = "lemon"
-POSTGRES_IMAGE = "pgvector/pgvector:pg16"
-VALKEY_IMAGE = "valkey/valkey:8-alpine"
+POSTGRES_IMAGE_KEY = "postgres"
+VALKEY_IMAGE_KEY = "valkey"
+POSTGRES_IMAGE = tag_ref(POSTGRES_IMAGE_KEY)   # display / human-facing reference
+VALKEY_IMAGE = tag_ref(VALKEY_IMAGE_KEY)
 POSTGRES_CONTAINER = "lemonseed-postgres"
 VALKEY_CONTAINER = "lemonseed-valkey"
+
+# Pull budget per image, off the boot path (M6.6 S5.3). A 600s blanket cap was
+# tuned for nothing in particular: valkey's transfer is ~17 MB and finishes in
+# seconds, while pgvector is ~160 MB and needs ~270 KB/s sustained to fit —
+# below that the attempt fails and restarts from the last completed layer.
+# Generous is free here: these pulls run in the supervisor thread, not in boot.
+PULL_TIMEOUT_SEC = {"valkey": 300, "postgres": 900}
+PULL_TIMEOUT_DEFAULT_SEC = 600
 
 # One shared registry-reachability gate for all data-plane pulls, using the
 # same cached DNS + TCP 443 probe pattern as modules.py. Probes the image's
 # own registry prefix when scoped (e.g. ghcr.io), else Docker Hub's registry.
-_registry_host = POSTGRES_IMAGE.split("/")[0] if "/" in POSTGRES_IMAGE else "registry-1.docker.io"
+_registry_host = (
+    POSTGRES_IMAGE.split("/")[0] if "/" in POSTGRES_IMAGE else "registry-1.docker.io"
+)
 _PULL_FAIL_COOLDOWN_SEC = 60
 _net_check_at = 0.0
 _net_ok = False
@@ -166,6 +181,7 @@ def _docker(args: list[str], timeout: float = 120) -> subprocess.CompletedProces
     try:
         return subprocess.run(
             ["docker", *args],
+            check=False,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -216,11 +232,35 @@ def _network_reachable() -> bool:
     return _net_ok
 
 
-def _pull_image(image: str, label: str) -> tuple[bool, str]:
-    if _image_present(image):
+def _resolve_ref(key: str) -> str:
+    """The reference to pull/run for a pin key: pinned digest, else the tag.
+
+    Digest first, because that is the immutable one we tested. The tag fallback
+    is not a convenience — a ``docker pull name@digest`` does **not** create
+    ``name:tag`` locally, and the QEMU profile's images arrive as
+    ``dockerTools.pullImage`` tarballs, which carry ``RepoTags`` but no
+    ``RepoDigests`` at all. Without this fallback the offline profile cannot
+    start its own data plane.
+    """
+    digest = digest_ref(key)
+    if _image_present(digest):
+        return digest
+    tag = tag_ref(key)
+    if _image_present(tag):
+        return tag
+    # Nothing local: the caller must pull first, and the digest is what we want.
+    return digest
+
+
+def _pull_image(key: str, label: str) -> tuple[bool, str]:
+    tag = tag_ref(key)
+    digest = digest_ref(key)
+    if _image_present(digest):
         return True, "present"
+    if _image_present(tag):
+        return True, "present:tag"
     if not _network_reachable():
-        probe = _docker(["pull", image], timeout=30)
+        probe = _docker(["pull", digest], timeout=30)
         if probe.returncode != 0:
             detail = (probe.stderr or probe.stdout or "").strip().splitlines()
             print(
@@ -233,10 +273,22 @@ def _pull_image(image: str, label: str) -> tuple[bool, str]:
             "Cannot reach the container registry — check this appliance's internet connection. "
             "Retrying automatically.",
         )
-    result = _docker(["pull", image], timeout=600)
+    result = _docker(["pull", digest], timeout=PULL_TIMEOUT_SEC.get(key, PULL_TIMEOUT_DEFAULT_SEC))
+    if result.returncode == 0:
+        return True, "pulled"
+    # The pin no longer resolves (registries do garbage-collect untagged
+    # manifests). Refusing to start the database would brick the appliance, so
+    # fall back to the tag — loudly, because we have just accepted drift.
+    print(
+        f"data pull: WARNING {label}: pinned image {digest} is unavailable "
+        f"({(result.stderr or result.stdout or '').strip()[:200]}); "
+        f"falling back to {tag}, which may differ from what CI validated",
+        flush=True,
+    )
+    result = _docker(["pull", tag], timeout=PULL_TIMEOUT_SEC.get(key, PULL_TIMEOUT_DEFAULT_SEC))
     if result.returncode != 0:
         return False, (result.stderr or result.stdout or "docker pull failed").strip()
-    return True, "pulled"
+    return True, "pulled:tag_fallback"
 
 
 def _ensure_lemon_network() -> bool:
@@ -248,7 +300,7 @@ def _ensure_lemon_network() -> bool:
     return created.returncode == 0
 
 
-def _postgres_run_args() -> list[str]:
+def _postgres_run_args(ref: str) -> list[str]:
     args = [
         "run",
         "-d",
@@ -266,11 +318,11 @@ def _postgres_run_args() -> list[str]:
     # Env file is written by lemonseed-data-init before the containers start.
     if POSTGRES_ENV.is_file():
         args += ["--env-file", str(POSTGRES_ENV)]
-    args.append(POSTGRES_IMAGE)
+    args.append(ref)
     return args
 
 
-def _valkey_run_args() -> list[str]:
+def _valkey_run_args(ref: str) -> list[str]:
     return [
         "run",
         "-d",
@@ -284,7 +336,7 @@ def _valkey_run_args() -> list[str]:
         "127.0.0.1:6379:6379",
         "-v",
         f"{DATA_ROOT}/valkey:/data",
-        VALKEY_IMAGE,
+        ref,
         "valkey-server",
         "--save",
         "60",
@@ -294,7 +346,9 @@ def _valkey_run_args() -> list[str]:
     ]
 
 
-def _start_container(name: str, image: str, label: str, run_args: list[str]) -> None:
+def _start_container(
+    name: str, image_key: str, label: str, run_args: Callable[[str], list[str]]
+) -> None:
     state = _containers[name]
     # Reuse a stopped container exactly as the boot start scripts do.
     if _container_exists(name):
@@ -308,17 +362,20 @@ def _start_container(name: str, image: str, label: str, run_args: list[str]) -> 
         state["state"] = "error"
         state["error"] = "Docker network 'lemon' unavailable"
         return
-    ok, detail = _pull_image(image, label)
+    ok, detail = _pull_image(image_key, label)
     if not ok:
         state["state"] = "waiting"
         state["error"] = detail
         return
-    result = _docker(run_args, timeout=180)
+    if detail == "pulled:tag_fallback":
+        state["image_drift"] = True
+    ref = _resolve_ref(image_key)
+    result = _docker(run_args(ref), timeout=180)
     if result.returncode != 0:
         err = (result.stderr or result.stdout or "docker run failed").strip()
         if "already in use" in err.lower():
             _docker(["rm", "-f", name], timeout=60)
-            result = _docker(run_args, timeout=180)
+            result = _docker(run_args(ref), timeout=180)
             if result.returncode != 0:
                 err = (result.stderr or result.stdout or err).strip()
         state["state"] = "error"
@@ -327,10 +384,13 @@ def _start_container(name: str, image: str, label: str, run_args: list[str]) -> 
     state["state"] = "starting"
     state["since"] = time.monotonic()
     state.pop("error", None)
+    state["image"] = ref
     print(f"data supervise: {label} container started", flush=True)
 
 
-def _supervise_one(name: str, image: str, label: str, port: int, run_args: list[str]) -> None:
+def _supervise_one(
+    name: str, image_key: str, label: str, port: int, run_args: Callable[[str], list[str]]
+) -> None:
     state = _containers[name]
     running = _container_running(name)
     if running and _port_open("127.0.0.1", port, timeout=2.0):
@@ -346,21 +406,21 @@ def _supervise_one(name: str, image: str, label: str, port: int, run_args: list[
         print(f"data supervise: {label} not serving after grace; recreating", flush=True)
         _docker(["rm", "-f", name], timeout=60)
     if not _container_exists(name):
-        _start_container(name, image, label, run_args)
+        _start_container(name, image_key, label, run_args)
     else:
         # Stopped or exited container: start it again.
         if _docker(["start", name], timeout=120).returncode != 0:
             _docker(["rm", "-f", name], timeout=60)
-            _start_container(name, image, label, run_args)
+            _start_container(name, image_key, label, run_args)
 
 
 def supervise_data_once() -> None:
     """One reconciliation tick: keep postgres + valkey running and serving."""
     _supervise_one(
-        POSTGRES_CONTAINER, POSTGRES_IMAGE, "postgres", 5432, _postgres_run_args()
+        POSTGRES_CONTAINER, POSTGRES_IMAGE_KEY, "postgres", 5432, _postgres_run_args
     )
     _supervise_one(
-        VALKEY_CONTAINER, VALKEY_IMAGE, "valkey", 6379, _valkey_run_args()
+        VALKEY_CONTAINER, VALKEY_IMAGE_KEY, "valkey", 6379, _valkey_run_args
     )
 
 

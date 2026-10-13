@@ -6,6 +6,8 @@ import json
 import os
 import secrets
 import subprocess
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -13,7 +15,12 @@ POSTGRES_ENV = Path("/var/lib/lemonseed/data/secrets/postgres.env")
 SECRETS_MODULES = Path("/var/lib/lemonseed/data/secrets/modules")
 CP_DB_NAME = "lemonseed_cp"
 CP_ROLE = "lemonseed_cp"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+# Shape created by ``_create_cp_tables`` (all `CREATE TABLE IF NOT EXISTS`).
+# A database with no recorded version is assumed to be at this shape, because
+# that is what the table creation immediately preceding the migration run leaves
+# behind — on a fresh box *and* on a box upgraded from a pre-migration build.
+BASELINE_SCHEMA_VERSION = 3
 
 RESERVED_MODULES = (
     {
@@ -76,6 +83,7 @@ def pg_isready() -> bool:
                 "-U",
                 "postgres",
             ],
+            check=False,
             capture_output=True,
             text=True,
             timeout=3,
@@ -136,7 +144,18 @@ def _ensure_role_and_db(conn, db_name: str, role_name: str, module_id: str) -> s
     return password
 
 
-def _apply_cp_schema(conn) -> None:
+def _apply_cp_schema(conn) -> int:
+    """Create the CP tables, then bring the schema up to ``SCHEMA_VERSION``.
+
+    Returns the version the database is actually at, which is not necessarily
+    ``SCHEMA_VERSION`` (see ``migrate_cp_schema`` on a rolled-back appliance).
+    """
+    _create_cp_tables(conn)
+    with conn.cursor() as cur:
+        return migrate_cp_schema(cur)
+
+
+def _create_cp_tables(conn) -> None:
     with conn.cursor() as cur:
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
         cur.execute(
@@ -201,15 +220,104 @@ def _apply_cp_schema(conn) -> None:
             )
             """
         )
-        cur.execute(
-            """
-            INSERT INTO cp_meta (key, value)
-            VALUES ('schema_version', %s::jsonb)
-            ON CONFLICT (key) DO UPDATE
-              SET value = EXCLUDED.value, updated_at = NOW()
-            """,
-            (json.dumps(SCHEMA_VERSION),),
-        )
+
+
+@dataclass(frozen=True)
+class Migration:
+    """One step forward in the CP schema.
+
+    Migrations are **additive only** — `CREATE ... IF NOT EXISTS`, `ADD COLUMN
+    IF NOT EXISTS`, never a drop, rename, or type change. Two reasons, both about
+    A/B updates: a slot rolled back to an older control plane must still be able
+    to open a database written by a newer one, and every statement is re-run
+    safely if the version stamp and the schema ever disagree. A destructive
+    migration needs a two-release sequence (stop writing the old shape first);
+    `test_only_additive_migration_sql` is the guard for that rule.
+    """
+
+    version: int
+    description: str
+    apply: Callable[[Any], None]
+
+
+def _migrate_v4(cur) -> None:
+    """M6.6 D1/D3 — per-user session revocation and last-seen login.
+
+    ``token_generation`` is embedded in the auth token and compared on every
+    verify, so bumping it revokes exactly one account (disable, demote, delete,
+    logout-everywhere) on its next request. ``last_login`` backs the My Profile
+    view. Both have defaults, so existing rows and older control planes are
+    unaffected.
+    """
+    cur.execute(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS token_generation"
+        " INTEGER NOT NULL DEFAULT 0"
+    )
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ")
+
+
+# Append-only, ascending. Bumping SCHEMA_VERSION without registering the step is
+# caught by test_migrations_cover_the_declared_version.
+MIGRATIONS: tuple[Migration, ...] = (
+    Migration(4, "users: token_generation + last_login", _migrate_v4),
+)
+
+
+def _read_schema_version(cur) -> int:
+    cur.execute("SELECT value FROM cp_meta WHERE key = 'schema_version'")
+    row = cur.fetchone()
+    if row is None or row[0] is None:
+        return 0
+    raw = row[0]
+    if isinstance(raw, str):
+        # jsonb normally comes back as an int; a TEXT-era box returns a string.
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _write_schema_version(cur, version: int) -> None:
+    cur.execute(
+        """
+        INSERT INTO cp_meta (key, value)
+        VALUES ('schema_version', %s::jsonb)
+        ON CONFLICT (key) DO UPDATE
+          SET value = EXCLUDED.value, updated_at = NOW()
+        """,
+        (json.dumps(version),),
+    )
+
+
+def migrate_cp_schema(cur) -> int:
+    """Apply pending migrations on an open CP cursor; return the resulting version.
+
+    The stamp is written *after* each step, so a step that raises leaves the
+    version behind and gets retried on the next provisioning tick — which is why
+    every statement above is idempotent.
+
+    A database *newer* than this control plane is tolerated rather than raised
+    on: additive-only migrations keep it readable, and refusing to start would
+    turn an A/B rollback into a bricked appliance. Nothing is applied in that
+    case, and the recorded version is reported as-is.
+    """
+    version = _read_schema_version(cur)
+    if version == 0:
+        version = BASELINE_SCHEMA_VERSION
+        _write_schema_version(cur, version)
+    if version > SCHEMA_VERSION:
+        return version
+    for migration in MIGRATIONS:
+        if migration.version <= version:
+            continue
+        migration.apply(cur)
+        version = migration.version
+        _write_schema_version(cur, version)
+    return version
 
 
 def provision_data_plane() -> dict[str, Any]:
@@ -253,7 +361,7 @@ def provision_data_plane() -> dict[str, Any]:
         admin.close()
 
         cp_conn = _connect(CP_DB_NAME)
-        _apply_cp_schema(cp_conn)
+        schema_version = _apply_cp_schema(cp_conn)
         with cp_conn.cursor() as cur:
             for spec in RESERVED_MODULES:
                 cur.execute(
@@ -270,7 +378,7 @@ def provision_data_plane() -> dict[str, Any]:
         return {
             "state": "ready",
             "cp_database": CP_DB_NAME,
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": schema_version,
             "modules": modules,
         }
     except Exception as exc:  # noqa: BLE001

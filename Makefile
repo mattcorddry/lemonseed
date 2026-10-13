@@ -6,8 +6,10 @@
 #   make build-installer     # EFI/USB installer ISO → out/latest-installer
 #   make run-qemu            # build-qemu if missing, then boot serial console
 #   make qemu-clean          # remove QEMU user-data disk image
-#   make repart-generate     # partitions.yaml → out/repart.d/*.conf
-#   make disk-repart DISK=…  # apply (or --dry-run) systemd-repart to a disk
+#   make repart-generate     partitions.yaml → out/repart.d/*.conf
+#   make disk-repart DISK=…  apply (or --dry-run) systemd-repart to a disk
+#   make refresh-image-pins  rebase container image pins (KEYS=… to limit)
+#   make check-image-pins    report pins whose upstream digest has moved
 #   make clean
 #   make keys
 #
@@ -24,7 +26,8 @@ DISK ?=
 
 .PHONY: help build-production build-qemu build-installer run-qemu qemu-clean clean keys \
 	repart-generate disk-repart grub-cfg repart-test update-test test test-qemu \
-	test-update-unit check-untracked nix-gc
+	test-update-unit check-untracked nix-gc lint refresh-image-pins check-image-pins \
+	test-gateway
 
 help:
 	@echo "Lemonseed image build pipeline"
@@ -45,8 +48,13 @@ help:
 	@echo "  make repart-test       Loopback systemd-repart smoke test (sudo)"
 	@echo "  make update-test       Loopback A/B updater smoke test (sudo)"
 	@echo "  make test              Unit tests (no root / no hypervisor)"
+	@echo "  make lint              Ruff over control-plane/ scripts/ installer/"
 	@echo "  make test-qemu         QEMU boot + HTTP API smoke (needs build-qemu)"
+	@echo "  make test-gateway      Live 5xx error contract against a real nginx"
 	@echo "  make test-update-unit  Alias for update unit tests only"
+	@echo "  make refresh-image-pins  Rebase container image pins to current digests"
+	@echo "                         (KEYS=valkey to limit; asks the registry, no pull)"
+	@echo "  make check-image-pins    Report pins whose upstream digest has moved"
 	@echo "  make check-untracked   Fail if untracked (non-ignored) files exist"
 	@echo "  make nix-gc            Soft Nix GC (drop stale build roots; no -d)"
 	@echo "  make clean             Remove out/"
@@ -55,6 +63,7 @@ help:
 	@echo ""
 	@echo "Variables:"
 	@echo "  VERSION   Override version (default: UTC date + .build-counter)"
+	@echo "  KEYS      Pin keys for refresh-image-pins (default: all)"
 	@echo "  SIGN=1    Write detached signatures (requires keys/; see make keys)"
 	@echo "  DISK      Target block device for disk-repart"
 	@echo "  NIX_GC_THRESHOLD=80  Pre-build GC if / or /nix is at least this % full"
@@ -118,14 +127,37 @@ update-test:
 test:
 	"$(ROOT)/scripts/run-unit-tests.sh"
 
+# Ruff comes from nixpkgs, not from the appliance: the control-plane interpreter
+# on the box stays stdlib + psycopg2/bcrypt/requests/lemonade-sdk. Rules live in
+# ruff.toml. Deliberately *not* wired into `make test`, which must stay offline
+# and hypervisor-free.
+lint:
+	nix run nixpkgs#ruff -- check --config "$(ROOT)/ruff.toml" control-plane scripts installer
+
 test-qemu:
 	"$(ROOT)/scripts/qemu-api-smoke-test.sh"
+
+# Live 5xx contract against a real nginx (no root, no hypervisor). Kept out of
+# `make test`, which must stay offline: this needs an nginx from nixpkgs.
+test-gateway:
+	"$(ROOT)/scripts/gateway-error-probe.sh"
 
 test-update-unit:
 	python3 "$(ROOT)/scripts/test_lemonseed_update.py"
 
 check-untracked:
 	"$(ROOT)/scripts/check-untracked.sh"
+
+# control-plane/container-images.json is the only image reference in the tree,
+# and its digest is what a deployed box runs. Tags move (pg16 and 8-alpine both
+# did in 2026-10), so rebase deliberately, right after make test / test-qemu
+# validated the candidate — never implicitly via a pull on a customer's LAN.
+refresh-image-pins:
+	python3 "$(ROOT)/scripts/refresh-image-pins.py" $(KEYS)
+
+# Needs the network, which is why it is not part of make test.
+check-image-pins:
+	python3 "$(ROOT)/scripts/refresh-image-pins.py" --check
 
 nix-gc:
 	"$(ROOT)/scripts/nix-gc.sh"

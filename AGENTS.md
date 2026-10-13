@@ -109,7 +109,8 @@ When coming back to the user, include briefly:
 
 | Doc | Role |
 |-----|------|
-| `DESIGN.md` | Product, milestones, architecture decisions |
+| `DESIGN.md` | Product and architecture decisions **as built**, plus the consolidated backlog |
 | `AGENTS.md` | How agents should work and close sprints |
 | `README.md` | Human-oriented project entry |
-| `Requirements.md` / `Concept.md` | Historical / broader context — defer to DESIGN when unsure |
+| `proposals/M*/` | Milestone design records — the reasoning and phase plans behind each milestone. Historical: `DESIGN.md` wins on current behavior |
+| `Concept.md` / `Requirements.md` | Historical / broader context — defer to DESIGN when unsure |

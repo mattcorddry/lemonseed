@@ -320,9 +320,7 @@ class OwuiClient:
     def _heal_auth(self) -> bool:
         """One recovery attempt for a 401: re-mint the sk- key, else re-sign-in."""
         if self.api_key:
-            if self._identity and self.mint_api_key():
-                return True
-            return False
+            return bool(self._identity) and bool(self.mint_api_key())
         return bool(self._identity) and bool(self.refresh_session().get("ok"))
 
     # -- day-one methods (DESIGN.md table; all via the api map) ---------------

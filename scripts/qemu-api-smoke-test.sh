@@ -131,15 +131,17 @@ if [[ -z "${OWUI_TAR}" ]] && command -v nix >/dev/null 2>&1; then
   OWUI_TAR="$(nix build --no-link --print-out-paths "${ROOT}#qemu-owui-image" 2>/dev/null || true)"
 fi
 if [[ -z "${OWUI_TAR}" ]]; then
-  OWUI_TAR="$(find /nix/store -maxdepth 1 -name '*-docker-image-ghcr.io-open-webui-open-webui-v0.11.0.tar' 2>/dev/null | head -1 || true)"
+  # Fallback for a warm store without a nix CLI. Match any tag: the version
+  # lives in control-plane/container-images.json, not in this script.
+  OWUI_TAR="$(find /nix/store -maxdepth 1 -name '*-docker-image-ghcr.io-open-webui-open-webui-*.tar' 2>/dev/null | head -1 || true)"
 fi
 VIRTFS_ARGS=()
 if [[ -n "${OWUI_TAR}" && -f "${OWUI_TAR}" ]]; then
   mkdir -p "${VIRTFS_DIR}"
-  rm -f "${VIRTFS_DIR}/open-webui-v0.11.0.tar"
+  rm -f "${VIRTFS_DIR}/open-webui-v0.11.0.tar" "${VIRTFS_DIR}/open-webui.tar"
   # Prefer a real inode in the share — guest 9p cannot follow host symlinks
   # that point outside the exported tree.
-  if ln "${OWUI_TAR}" "${VIRTFS_DIR}/open-webui-v0.11.0.tar" 2>/dev/null; then
+  if ln "${OWUI_TAR}" "${VIRTFS_DIR}/open-webui.tar" 2>/dev/null; then
     VIRTFS_PATH="${VIRTFS_DIR}"
   else
     VIRTFS_PATH="$(dirname "${OWUI_TAR}")"
@@ -441,11 +443,17 @@ import json, sys
 data = json.load(sys.stdin)
 pg = (data.get("postgres") or {}).get("state")
 vk = (data.get("valkey") or {}).get("state")
-prov = (data.get("provisioning") or {}).get("state")
-print(f"OK: postgres={pg!r} valkey={vk!r} provisioning={prov!r}")
+prov = data.get("provisioning") or {}
+# M6.6 step 1: the schema migration runner must have executed against the real
+# appliance Postgres, not just the fake cursor in test_db.py. Unit tests already
+# pin MIGRATIONS to db.SCHEMA_VERSION, so >= 4 here proves the ALTERs ran.
+schema = prov.get("schema_version")
+state = prov.get("state")
+print(f"OK: postgres={pg!r} valkey={vk!r} provisioning={state!r} schema_version={schema!r}")
 assert pg == "ready", data
 assert vk == "ready", data
-assert prov == "ready", data
+assert state == "ready", data
+assert isinstance(schema, int) and schema >= 4, f"expected cp schema >= 4, got {schema!r}"
 '
 
 echo "==> Checking /api/modules (OWUI lifecycle; wait for http_ready)"
@@ -1585,5 +1593,62 @@ print("OK: GC evicted Gemma E4B (LRU); pinned LFM2.5 8B + new 1.2B present")
     echo "OK: filler removed"
   fi
 fi
+
+echo "==> M6.6 S5: the boot path no longer pulls, and the gateway is not first"
+
+# (a) Both start scripts must report the image reference they are using, on
+# whichever path a real boot takes (dockerd's restart policy usually starts the
+# containers before the unit runs). On this profile the images arrive as
+# dockerTools.pullImage tarballs, which carry RepoTags but no RepoDigests, so
+# the answer must be the *tag* — that is the digest->tag fallback running for
+# real, not just in a unit test. Expected names come from the pins file, never
+# a copy in this script.
+pins_json="${ROOT}/control-plane/container-images.json"
+if [[ ! -f "${pins_json}" ]]; then
+  echo "missing ${pins_json}" >&2
+  exit 1
+fi
+read -r POSTGRES_IMAGE VALKEY_IMAGE <<<"$(python3 -c '
+import json, sys
+pins = json.load(open(sys.argv[1]))
+print(pins["postgres"]["name"], pins["valkey"]["name"])
+' "${pins_json}")" || true
+if [[ -z "${POSTGRES_IMAGE}" || -z "${VALKEY_IMAGE}" ]]; then
+  echo "could not read postgres/valkey image names from ${pins_json}" >&2
+  exit 1
+fi
+for unit in lemonseed-postgres lemonseed-valkey; do
+  case "${unit}" in
+    lemonseed-postgres) image_name="${POSTGRES_IMAGE}" ;;
+    lemonseed-valkey) image_name="${VALKEY_IMAGE}" ;;
+  esac
+  grep -qE "${unit}: image ${image_name}:" "${LOG}" || {
+    echo "serial log has no '${unit}: image ${image_name}:<tag>' line" >&2
+    echo "  (expected the tag form: the QEMU images are loaded from pullImage tarballs)" >&2
+    exit 1
+  }
+  if grep -qE "${unit}: image ${image_name}@sha256:" "${LOG}"; then
+    echo "serial log shows ${unit} using ${image_name} by digest on a profile that only has tags" >&2
+    exit 1
+  fi
+  echo "  ok: ${unit} is on a local tag reference"
+done
+
+# (b) nginx must have waited (bounded) for the control plane before opening :80.
+grep -qE 'lemonseed-gateway: control plane (is serving|not serving after)' "${LOG}" || {
+  echo "serial log has no lemonseed-gateway wait line — nginx started without polling the CP" >&2
+  exit 1
+}
+echo "  ok: the gateway polled the control plane before opening :80"
+
+# (c) The fallback must not be fetchable from the LAN. Its 404 also proves the
+# location exists as `internal` rather than being absent.
+cp_down_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+  "http://127.0.0.1:${HOST_PORT}/_lemonseed/cp-down" 2>/dev/null || echo 000)"
+if [[ "${cp_down_code}" != "404" ]]; then
+  echo "GET /_lemonseed/cp-down: expected 404 (internal), got ${cp_down_code}" >&2
+  exit 1
+fi
+echo "OK: 5xx contract in place; the not-ready page is not directly reachable"
 
 echo "==> QEMU API smoke test PASSED"

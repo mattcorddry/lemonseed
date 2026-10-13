@@ -1,10 +1,15 @@
 # M6.3b Phase 4 — Portal ownership view, enforce-mode guards, reset window
 
+> **Milestone design artifact.** Phase plan for M6.3b Phase 4; superseded by
+> `DESIGN.md` for how the appliance behaves today. References below to
+> “`DESIGN.md` §M6.3b” point at the section that now lives in
+> [`OWUI-DURABLE-CONFIG-M63B.md`](./OWUI-DURABLE-CONFIG-M63B.md).
+
 Status: **Approved at the gate of 2026-10-07; 4A building.** Decisions recorded
 in §8 (P4-A through P4-E); §1.1 explains why two guards stay advertise.
-Spec source of truth: `DESIGN.md` §M6.3b (*Portal visualization & write guards*,
-*Implementation* items 6–7, *Testing*). Where this plan and DESIGN.md conflict,
-DESIGN.md wins and this document gets corrected.
+Spec source of truth at the time of writing: the M6.3b section of `DESIGN.md`
+(*Portal visualization & write guards*, *Implementation* items 6–7, *Testing*).
+Where this plan and `DESIGN.md` as built conflict, `DESIGN.md` wins.
 
 After this sprint (user direction 2026-10-07): return to **M6.2b** user/group
 management and **Phase 5** LiteLLM model management/proxy — those two are the

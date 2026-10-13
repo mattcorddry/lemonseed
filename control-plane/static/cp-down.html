@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<!--
+  Lemonseed "not ready yet" page (M6.6 S5.4).
+
+  nginx serves this when the control plane has not bound 127.0.0.1:8080 yet —
+  the window between nginx opening :80 and the CP being able to answer, which a
+  browser otherwise sees as the raw nginx 502 page.
+
+  Deliberately self-contained: the only subresource is the lemon mark, which
+  nginx serves straight out of the read-only SquashFS (location
+  /_lemonseed/brand/), not from the control plane that is currently down. No
+  stylesheet link, no fonts, no scripts — an error page that depends on the
+  failed service to render is not an error page.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Lemonseed is getting ready</title>
+<style>
+  :root {
+    --bg0: #0f1c18;
+    --ink: #f2f7f4;
+    --muted: #a7bfb4;
+    --accent: #c6f27a;
+    --line: rgba(242, 247, 244, 0.14);
+    --font: "Segoe UI", "Helvetica Neue", sans-serif;
+  }
+  html, body {
+    margin: 0; min-height: 100%;
+    background:
+      radial-gradient(1100px 560px at 8% -10%, #2a5a45 0%, transparent 55%),
+      radial-gradient(900px 480px at 100% 0%, #1c3d55 0%, transparent 50%),
+      var(--bg0);
+    color: var(--ink); font-family: var(--font);
+  }
+  .shell { max-width: 34rem; margin: 0 auto; padding: 3rem 1.25rem; }
+  .card {
+    border: 1px solid var(--line); border-radius: 14px;
+    background: rgba(9, 22, 18, 0.55); padding: 1.75rem 1.5rem;
+  }
+  .brand { display: flex; align-items: center; gap: .65rem; margin-bottom: 1.1rem; }
+  .brand img { width: 34px; height: 34px; }
+  .brand span { font-size: 1.05rem; letter-spacing: .04em; color: var(--accent); }
+  h1 { font-size: 1.4rem; margin: 0 0 .6rem; }
+  p { color: var(--muted); line-height: 1.55; margin: 0 0 1rem; }
+  .status { display: flex; align-items: center; gap: .55rem; font-size: .95rem; }
+  .dot { width: .6rem; height: .6rem; border-radius: 50%; background: #ffe2a8;
+         animation: pulse 1.6s ease-in-out infinite; }
+  .dot.ready { background: #9be67c; animation: none; }
+  @keyframes pulse { 0%,100% { opacity: .35 } 50% { opacity: 1 } }
+  button {
+    margin-top: 1.35rem; padding: .5rem 1rem; border-radius: 9px;
+    border: 1px solid var(--line); background: transparent; color: var(--ink);
+    font: inherit; font-size: .9rem; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  .hint { margin: 1.25rem 0 0; font-size: .8rem; color: var(--muted); }
+</style>
+</head>
+<body>
+<main class="shell">
+  <div class="card">
+    <div class="brand">
+      <img src="/_lemonseed/brand/lemon-64.png" alt="">
+      <span>Lemonseed</span>
+    </div>
+    <h1>Lemonseed is getting ready</h1>
+    <p>This part of the appliance has not finished starting yet. This page
+      checks on its own and will load Lemonseed as soon as it answers.</p>
+    <div class="status">
+      <span class="dot" id="dot"></span>
+      <span id="text">Waiting for Lemonseed to start…</span>
+    </div>
+    <button type="button" id="retry">Retry now</button>
+    <p class="hint">If this stays on screen for several minutes, check the
+      appliance's power and network connection.</p>
+  </div>
+</main>
+<script>
+  // Probes the control plane through the same gateway the user came in on, so
+  // "ready" means ready the way the user will experience it. Any well-formed
+  // JSON answer is enough to hand control back: the control-plane shell owns
+  // the finer "still starting" states, so we must not wait for every subsystem
+  // here or we would sit out the shell's own progress UI.
+  "use strict";
+  var dot = document.getElementById("dot");
+  var text = document.getElementById("text");
+  var timer = null;
+
+  function load() {
+    dot.className = "dot ready";
+    text.textContent = "Ready — loading Lemonseed…";
+    try {
+      window.top.location.reload();
+    } catch (err) {
+      window.location.reload();
+    }
+  }
+
+  function check() {
+    fetch("/api/status", { cache: "no-store", headers: { Accept: "application/json" } })
+      .then(function (resp) { return resp.ok ? resp.json() : null; })
+      .then(function (data) {
+        if (data && data.status === "ok") {
+          if (timer) { clearTimeout(timer); timer = null; }
+          load();
+          return;
+        }
+        schedule();
+      })
+      .catch(function () { schedule(); });
+  }
+
+  // 4s +/-25% so a few tabs open on the LAN do not poll in lockstep.
+  function schedule() {
+    if (timer) { return; }
+    timer = setTimeout(function () { timer = null; check(); }, 4000 + Math.random() * 2000 - 1000);
+  }
+
+  document.getElementById("retry").addEventListener("click", function () {
+    if (timer) { clearTimeout(timer); timer = null; }
+    text.textContent = "Checking…";
+    check();
+  });
+
+  schedule();
+</script>
+</body>
+</html>

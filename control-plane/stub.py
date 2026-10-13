@@ -33,8 +33,8 @@ import hardware
 import modules
 import owui_policy
 import owui_portal
+import sessions
 from catalog import plan_model
-
 
 HOST = os.environ.get("APPLIANCE_CP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("APPLIANCE_CP_PORT", "8080"))
@@ -105,7 +105,7 @@ def load_setup() -> dict[str, Any]:
 def run_best_effort(cmd: list[str]) -> None:
     """Apply a system change, logging failures to the journal rather than hiding them."""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        result = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.TimeoutExpired) as exc:
         print(f"{cmd[0]}: {exc}", flush=True)
         return
@@ -116,7 +116,7 @@ def run_best_effort(cmd: list[str]) -> None:
 def run_required(cmd: list[str], action: str) -> None:
     """Run an identity-critical command or fail setup with a useful message."""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        result = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ValueError(f"Could not {action}: {exc}") from exc
     if result.returncode != 0:
@@ -627,7 +627,7 @@ def page_setup(
     )
     admin_fields = ""
     if auth_admin_required:
-        admin_fields = f"""
+        admin_fields = """
 <label for="admin_username">Admin username</label>
 <input id="admin_username" name="admin_username" maxlength="64" autocomplete="off" value="admin" required/>
 <label for="admin_password">Admin password</label>
@@ -1928,7 +1928,11 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_session_verify(self) -> None:
         """nginx auth_request target: verify the session cookie.
 
-        Returns 200 + X-Forwarded-* headers on success, 401 on failure.
+        Returns 200 + X-Forwarded-* headers on success, 401 to sign in again, and
+        **503** when the session store is unreachable (M6.6 D2, fail closed).
+        The 503 matters: without it a Valkey outage would answer 401 and silently
+        sign the whole household out, and nginx turns a non-401/403 subrequest
+        failure into a gateway error page instead of a login redirect.
         """
         token = self._parse_cookie(auth.SESSION_COOKIE)
         if not token:
@@ -1936,18 +1940,22 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        data = auth.verify_token(token)
-        if data is None:
+        try:
+            record = auth.verify_session(token)
+        except sessions.SessionStoreUnavailable:
+            self._json(503, {"detail": "session store unavailable", "state": "unavailable"})
+            return
+        if record is None:
             self.send_response(401)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
         self.send_response(200)
-        self.send_header("X-Forwarded-User", data.get("u", ""))
-        self.send_header("X-Forwarded-Email", data.get("e", ""))
-        self.send_header("X-Forwarded-Groups", ",".join(data.get("g", [])))
-        self.send_header("X-Forwarded-Name", data.get("n", "") or data.get("u", ""))
-        self.send_header("X-Forwarded-Role", auth.role(data.get("g", [])))
+        self.send_header("X-Forwarded-User", record.get("u", ""))
+        self.send_header("X-Forwarded-Email", record.get("e", ""))
+        self.send_header("X-Forwarded-Groups", ",".join(record.get("g", [])))
+        self.send_header("X-Forwarded-Name", record.get("n", "") or record.get("u", ""))
+        self.send_header("X-Forwarded-Role", auth.role(record.get("g", [])))
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -1992,12 +2000,20 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         auth.rate_limit_reset(ip)
-        token = auth.issue_token(
-            user["username"],
-            user.get("email", ""),
-            user.get("groups", []),
-            user.get("display_name", ""),
-        )
+        try:
+            token = auth.create_session(user)
+        except sessions.SessionStoreUnavailable:
+            # Fail closed: a cookie we cannot validate later is access we cannot
+            # expire or revoke. Login is the one place to say so out loud.
+            self._json(
+                503,
+                {"detail": "Sign-in is unavailable: the session store is not reachable."},
+            )
+            return
+        except ValueError:
+            # Account vanished or was disabled between check and issue.
+            self._send(401, b"invalid username or password\n", "text/plain; charset=utf-8")
+            return
 
         # Sanitize the redirect target: must be a same-origin relative path.
         if not rd.startswith("/") or rd.startswith("//"):
@@ -2011,7 +2027,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _handle_logout(self) -> None:
-        """POST /logout — clear the session cookie."""
+        """POST /logout — drop the session record and clear the cookie.
+
+        The store is touched best-effort: an unreachable Valkey must not trap a
+        user in a signed-in shell, and the cleared cookie plus the idle TTL bounds
+        any orphaned record.
+        """
+        token = self._parse_cookie(auth.SESSION_COOKIE)
+        if token:
+            auth.drop_session(token)
         self.send_response(302)
         self.send_header("Location", "/login")
         self.send_header("Set-Cookie", f"{auth.SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
@@ -2047,11 +2071,9 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(model_id, str):
             model_id = model_id.strip() or None
             if model_id is not None and family != "auto":
+                entries = [m for m in (catalog_.get("models") or []) if isinstance(m, dict)]
                 if not any(
-                    isinstance(m, dict)
-                    and m.get("id") == model_id
-                    and m.get("family") == family
-                    for m in (catalog_.get("models") or [])
+                    m.get("id") == model_id and m.get("family") == family for m in entries
                 ):
                     self._json(400, {"error": f"unknown model: {model_id}"})
                     return
@@ -2297,6 +2319,11 @@ class Handler(BaseHTTPRequestHandler):
                     "data": data_services.data_snapshot(),
                     "modules": modules.modules_snapshot(),
                     "auth": auth.auth_status(),
+                    # The session store is what makes a session revocable, so an
+                    # admin troubleshooting "nobody can sign in" needs to see it
+                    # here. Sessions fail closed when it is down, which is why
+                    # this is a status dot and not a fallback path.
+                    "session_store": sessions.store_status(),
                     "telemetry": telemetry_snapshot(),
                     "portal_url": f"http://{primary_mdns_slug()}.local/",
                 },
@@ -2465,8 +2492,8 @@ class Handler(BaseHTTPRequestHandler):
             self.log_message("error handling %s", self.path)
             traceback.print_exc(file=sys.stderr)
 
-    def log_message(self, fmt: str, *args: Any) -> None:
-        print("%s - %s" % (self.address_string(), fmt % args), flush=True)
+    def log_message(self, format: str, *args: Any) -> None:
+        print("%s - %s" % (self.address_string(), format % args), flush=True)
 
 
 def _safe_refresh_gpus() -> None:

@@ -16,6 +16,9 @@ PYTHONPATH="${ROOT}/installer" python3 -m unittest discover -s "${ROOT}/installe
 echo "==> gen-repart"
 python3 "${ROOT}/scripts/test_gen_repart.py"
 
+echo "==> image pins"
+python3 "${ROOT}/scripts/test_refresh_image_pins.py"
+
 echo "==> control-plane"
 PYTHONPATH="${ROOT}/control-plane" python3 -m unittest discover -s "${ROOT}/control-plane" -p 'test_*.py' -v
 

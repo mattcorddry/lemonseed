@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import calendar
 import hashlib
+import json
 import os
 import secrets
 import signal
@@ -17,17 +17,26 @@ from typing import Any, Optional
 from urllib.error import URLError
 from urllib.request import urlopen
 
-import owui_client
-import owui_policy
 import auth
 import db
+import image_pins
+import owui_client
+import owui_policy
 from db import SECRETS_MODULES, _module_credentials, _write_module_secret
 from hardware import lemonade_api_key
 
-# Pin a concrete release tag — never :latest / :main in appliance code.
-# Rebase this pin to the newest upstream stable after pull + QEMU/hardware smoke.
-OWUI_IMAGE_DEFAULT = "ghcr.io/open-webui/open-webui:v0.11.0"
+# Pin a concrete release tag — never :latest / :main in appliance code. The tag
+# (and its digest) come from container-images.json, which Nix reads at eval time
+# too, so the appliance, the QEMU profile and this module cannot drift apart.
+# Rebase via `make refresh-image-pins` after pull + QEMU/hardware smoke.
+OWUI_IMAGE_KEY = "open_webui"
+OWUI_IMAGE_DEFAULT = image_pins.tag_ref(OWUI_IMAGE_KEY)
 OWUI_IMAGE = os.environ.get("LEMONSEED_OWUI_IMAGE", OWUI_IMAGE_DEFAULT)
+# OWUI_IMAGE stays the *tag* reference on purpose: it is what the settings
+# readout shows ("Open WebUI v0.11.0") and what `_owui_progress_copy` shortens.
+# A digest would leak a sha256 into user-facing copy that nobody can act on.
+# The digest is used only to pull and run (see _owui_run_ref).
+OWUI_PULL_TIMEOUT_SEC = 1800
 MODULE_ID = "open-webui"
 UPSTREAM_FILE = Path("/run/lemonseed/owui-upstream.conf")
 # nginx serves the Lemonseed shell (not the OWUI upstream) for document requests
@@ -86,6 +95,7 @@ def _docker(args: list[str], timeout: float = 120) -> subprocess.CompletedProces
     try:
         return subprocess.run(
             ["docker", *args],
+            check=False,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -143,7 +153,7 @@ def reload_nginx() -> bool:
         ["systemctl", "reload", "nginx"],
     ):
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
             if result.returncode == 0:
                 return True
             detail = (result.stderr or result.stdout or "").strip()[:200]
@@ -155,6 +165,7 @@ def reload_nginx() -> bool:
     try:
         result = subprocess.run(
             ["systemctl", "show", "-p", "MainPID", "--value", "nginx.service"],
+            check=False,
             capture_output=True,
             text=True,
             timeout=10,
@@ -171,6 +182,7 @@ def reload_nginx() -> bool:
     try:
         result = subprocess.run(
             ["nginx", "-s", "reload"],
+            check=False,
             capture_output=True,
             text=True,
             timeout=15,
@@ -388,10 +400,10 @@ def _bootstrap_env_drift(name: str, desired: dict[str, str]) -> Optional[str]:
     current = _container_env_map(name)
     if not current:
         return "no env map (docker inspect empty?)"
-    for key in desired:
-        if current.get(key) != desired[key]:
+    for key, want in desired.items():
+        if current.get(key) != want:
             return (f"{key} differs: container={current.get(key)!r} "
-                    f"want={desired[key]!r}")
+                    f"want={want!r}")
     return None
 
 
@@ -864,6 +876,51 @@ def _stop_container(name: str) -> None:
     _docker(["rm", "-f", name], timeout=60)
 
 
+def reap_stale_containers() -> list[str]:
+    """Delete not-running OWUI containers left by an earlier boot.
+
+    Containers run with ``--restart no`` (the supervisor owns lifecycle), so
+    every reboot — and every blue/green or reset that stopped one — leaves an
+    exited container in ``docker ps -a`` that nothing will ever start again.
+    It does no harm to the running system, but it makes ``docker ps`` a lie for
+    an admin who is troubleshooting, and after a ``lemonseed-update`` it keeps
+    the previous release's container around forever.
+
+    Only non-running containers are touched: a *running* container on the other
+    slot is a legitimate blue/green survivor.
+    """
+    listing = _docker(
+        [
+            "ps",
+            "-a",
+            "--filter",
+            f"name={CONTAINER_PREFIX}-",
+            "--format",
+            "{{.Names}}\t{{.State}}",
+        ],
+        timeout=60,
+    )
+    if listing.returncode != 0:
+        return []
+    removed: list[str] = []
+    for line in (listing.stdout or "").splitlines():
+        name, _, state = line.partition("\t")
+        name = name.strip()
+        if not name.startswith(f"{CONTAINER_PREFIX}-"):
+            continue  # the name filter is a substring match, not a prefix one
+        if state.strip().lower().startswith("running"):
+            continue
+        if _docker(["rm", "-f", name], timeout=60).returncode == 0:
+            removed.append(name)
+    if removed:
+        print(
+            f"owui supervise: removed {len(removed)} stopped container(s): "
+            f"{', '.join(sorted(removed))}",
+            flush=True,
+        )
+    return removed
+
+
 def ensure_lemon_network() -> tuple[bool, str]:
     inspect = _docker(["network", "inspect", LEMON_NETWORK], timeout=30)
     if inspect.returncode == 0:
@@ -1169,7 +1226,7 @@ def _run_container(port: int, env_path: Path) -> tuple[bool, str]:
         f"127.0.0.1:{port}:8080",
         "--env-file",
         str(env_path),
-        OWUI_IMAGE,
+        _owui_run_ref(),
     ]
     result = _docker(run_args, timeout=180)
     if result.returncode != 0:
@@ -1185,8 +1242,23 @@ def _run_container(port: int, env_path: Path) -> tuple[bool, str]:
     return True, name
 
 
-def _image_present() -> bool:
-    return _docker(["image", "inspect", OWUI_IMAGE], timeout=30).returncode == 0
+def _image_present(ref: Optional[str] = None) -> bool:
+    return _docker(["image", "inspect", ref or OWUI_IMAGE], timeout=30).returncode == 0
+
+
+def _owui_run_ref() -> str:
+    """Pinned digest when it is local, else the tag.
+
+    A ``docker pull name@digest`` does not create ``name:tag``, so after a
+    pinned pull only the digest reference resolves. Conversely the QEMU profile
+    loads images from ``dockerTools.pullImage`` tarballs, which carry RepoTags
+    but no RepoDigests, so only the tag resolves there. Both branches are live
+    code paths, not hypotheticals (verified 2026-10-12 against the registry).
+    """
+    digest = image_pins.digest_ref(OWUI_IMAGE_KEY)
+    if _image_present(digest):
+        return digest
+    return OWUI_IMAGE
 
 
 # Registry reachability preflight. network-online.target can be reached while
@@ -1226,8 +1298,14 @@ def _network_reachable() -> bool:
 
 def _pull_image() -> tuple[bool, str]:
     global _pull_fail_at
-    if _image_present():
+    tag = OWUI_IMAGE
+    digest = image_pins.digest_ref(OWUI_IMAGE_KEY)
+    if _image_present(digest):
         return True, "present"
+    if _image_present(tag):
+        # Loaded from an appliance-local tarball (QEMU profile) or left by an
+        # older build. Running it beats a pull that can only add drift.
+        return True, "present:tag"
     # QEMU smoke preloads OWUI via virtio-fs. Prefer waiting over a doomed DNS pull.
     wait_s = int(os.environ.get("LEMONSEED_OWUI_WAIT_LOCAL_SECONDS", "0") or "0")
     if wait_s > 0:
@@ -1237,7 +1315,7 @@ def _pull_image() -> tuple[bool, str]:
         if now - _pull_fail_at >= _PULL_FAIL_COOLDOWN_SEC:
             _pull_fail_at = now
             # One diagnostic probe so the journal shows the underlying error.
-            probe = _docker(["pull", OWUI_IMAGE], timeout=30)
+            probe = _docker(["pull", digest], timeout=30)
             if probe.returncode != 0:
                 detail = (probe.stderr or probe.stdout or "").strip().splitlines()
                 print(
@@ -1250,10 +1328,22 @@ def _pull_image() -> tuple[bool, str]:
             "Cannot reach the container registry — check this appliance's internet connection. "
             "Retrying automatically.",
         )
-    result = _docker(["pull", OWUI_IMAGE], timeout=600)
+    result = _docker(["pull", digest], timeout=OWUI_PULL_TIMEOUT_SEC)
+    if result.returncode == 0:
+        return True, "pulled"
+    # Registries do garbage-collect untagged manifests. Refusing to start the
+    # chat interface would be worse than accepting drift, so fall back to the
+    # tag — loudly, because we have just left the tested pin.
+    print(
+        f"owui pull: WARNING pinned image {digest} is unavailable "
+        f"({(result.stderr or result.stdout or '').strip()[:200]}); "
+        f"falling back to {tag}, which may differ from what CI validated",
+        flush=True,
+    )
+    result = _docker(["pull", tag], timeout=OWUI_PULL_TIMEOUT_SEC)
     if result.returncode != 0:
         return False, (result.stderr or result.stdout or "docker pull failed").strip()
-    return True, "pulled"
+    return True, "pulled:tag_fallback"
 
 
 def ensure_open_webui(*, force_update: bool = False) -> dict[str, Any]:
@@ -1515,21 +1605,33 @@ def supervise_modules_once() -> dict[str, Any]:
     return ensure_open_webui(force_update=True)
 
 
+def _supervise_forever() -> None:
+    """Worker body: reap once, then reconcile forever.
+
+    Its own function (rather than a closure) so the ordering is testable without
+    starting a thread.
+    """
+    # Once, before the first tick: reaping here rather than every tick avoids
+    # racing a container that `docker run -d` has created but not started yet.
+    try:
+        reap_stale_containers()
+    except Exception as exc:  # noqa: BLE001 — never kill the supervisor
+        print(f"owui supervise: stale container reap failed: {str(exc)[:200]}", flush=True)
+    while True:
+        try:
+            supervise_modules_once()
+        except Exception as exc:  # noqa: BLE001 — never kill the supervisor
+            print(f"owui supervise: {exc}", flush=True)
+        time.sleep(SUPERVISE_INTERVAL_SEC)
+
+
 def ensure_module_worker() -> None:
     """Long-lived supervisor: keep OWUI up after boot and after crashes."""
     global _worker
     if _worker is not None and _worker.is_alive():
         return
 
-    def _run() -> None:
-        while True:
-            try:
-                supervise_modules_once()
-            except Exception as exc:  # noqa: BLE001 — never kill the supervisor
-                print(f"owui supervise: {exc}", flush=True)
-            time.sleep(SUPERVISE_INTERVAL_SEC)
-
-    _worker = threading.Thread(target=_run, name="lemonseed-owui", daemon=True)
+    _worker = threading.Thread(target=_supervise_forever, name="lemonseed-owui", daemon=True)
     _worker.start()
 
 
@@ -1598,6 +1700,14 @@ def modules_snapshot() -> dict[str, Any]:
     return {"open_webui": owui}
 
 
+def _is_storage_wait(reason: str, snap: dict[str, Any]) -> bool:
+    """Whether a "waiting" OWUI state is really the data plane holding it up."""
+    if snap.get("provisioning"):
+        return True
+    lowered = reason.lower()
+    return "data plane" in lowered or "database_url" in lowered or "api key" in lowered
+
+
 def _owui_progress_copy(state: str, tag: str, snap: dict[str, Any]) -> tuple[str, str]:
     if state == "resetting":
         return "Configuring chat", "Rebuilding the chat interface settings"
@@ -1607,6 +1717,12 @@ def _owui_progress_copy(state: str, tag: str, snap: dict[str, Any]) -> tuple[str
         return "Configuring chat", f"Starting Open WebUI ({tag})"
     if state == "waiting":
         reason = str(snap.get("reason") or "Waiting for storage services")
+        # The chat module *reports* this, but it is not the thing that is slow:
+        # OWUI cannot start until the data plane is provisioned, and telling
+        # people "configuring chat" while Postgres pulls sends them looking in
+        # the wrong place (M6.6 S5.7).
+        if _is_storage_wait(reason, snap):
+            return "Preparing storage", "Waiting for the database and cache to start"
         return "Configuring chat", reason
     if state == "error":
         return "Configuring chat", str(snap.get("error") or "Chat interface failed")
