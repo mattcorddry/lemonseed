@@ -252,29 +252,30 @@
       "own_by": "id",
       "own_ids": ["lemonseed-ai", "lemonseed-ai-filtered"],
       "reserved_name_regex": "^Lemonseed.*$",
+      "ensure_public": true,
       "definitions": {},
-      "reason": "Lemonseed owns ids lemonseed-ai* and the Lemonseed name space; other models are never touched. Definitions arrive with Phase 5 (LiteLLM)."
+      "reason": "Lemonseed owns ids lemonseed-ai* and the Lemonseed name space; other models are never touched except for one thing: every model entry on the box is public (one wildcard read grant), because model choice is a global, admin-managed setting and the OWUI model editor defaults new entries to owner-only access. Definitions arrive with Phase 5 (LiteLLM)."
     },
     "users": {
       "mode": "full_management",
       "source": "cp.users",
-      "scope": ["membership", "is_admin"],
+      "scope": ["membership", "is_admin", "name"],
       "never_touch": ["%SERVICE_ACCOUNT_ID%"],
-      "reason": "Household accounts live in Lemonseed: membership and admin flag mirror the CP list (trusted headers at sign-in, plus this loop at boot). The loop creates, promotes and demotes, but never deletes accounts."
+      "reason": "Household accounts live in Lemonseed: membership, admin flag and display name mirror the CP list (trusted headers at sign-in, plus this loop at boot). The loop creates, promotes, demotes and renames, but never deletes accounts."
     }
   },
   "guards": [
     {
       "path": "POST /api/v1/auths/add",
-      "mode": "advertise",
+      "mode": "enforce",
       "hint": "Household accounts are created in Lemonseed.",
-      "reason": "Household accounts are created in Lemonseed. Advisory until M6.2b gives Lemonseed its own account management; enforcing this before then would leave no way to create a user."
+      "reason": "Household accounts are created in Lemonseed. Enforced now that the portal's People panel creates them: an account made here would have no Lemonseed row, no SRP credential and nothing to sign in with, which is exactly the drift the mirror exists to prevent."
     },
     {
       "path": "DELETE /api/v1/users/.*",
-      "mode": "advertise",
+      "mode": "enforce",
       "hint": "Household accounts are removed in Lemonseed.",
-      "reason": "Household accounts are removed in Lemonseed. Advisory until M6.2b replaces it with user-list mirroring, which is the safe version of this rule."
+      "reason": "Household accounts are removed in Lemonseed. Enforced now that user-list mirroring exists: an account Open WebUI deleted on its own orphans the Lemonseed row, and a later account could inherit it."
     },
     {
       "path": "POST /api/v1/configs/connections",
@@ -295,10 +296,10 @@
       "reason": "There is no Ollama on the appliance; ollama.enable stays off and is re-asserted at boot."
     },
     {
-      "path": "POST /api/v1/users/%CP_OWUI_ID%/update",
+      "path": "POST /api/v1/users/[^/]+/update",
       "mode": "enforce",
-      "hint": "The Lemonseed Control Plane account is not editable here.",
-      "reason": "The Lemonseed Control Plane account is not editable from Open WebUI."
+      "hint": "Household accounts are managed in Lemonseed.",
+      "reason": "Household accounts are managed in Lemonseed. This is the only route that can change an e-mail, a role or a password, so one rule closes all three edits in Open WebUI's user panel. The id segment is matched with [^/]+ on purpose: the greedy form would also swallow /users/user/settings/update and the other self-service routes, which Open WebUI owns."
     },
     {
       "path": "DELETE /api/v1/users/%CP_OWUI_ID%",
@@ -316,6 +317,7 @@
     "models.list": "GET /api/v1/models/list",
     "models.create": "POST /api/v1/models/create",
     "models.update": "POST /api/v1/models/model/update",
+    "models.access_update": "POST /api/v1/models/model/access/update",
     "models.delete": "POST /api/v1/models/model/delete",
     "models.sync": "POST /api/v1/models/sync",
     "users.all": "GET /api/v1/users/all",
@@ -324,12 +326,6 @@
     "users.create": "POST /api/v1/auths/add",
     "apikey.create": "POST /api/v1/auths/api_key",
     "apikey.revoke": "DELETE /api/v1/auths/api_key",
-    "apikey.get": "GET /api/v1/auths/api_key",
-    "groups.list": "GET /api/v1/groups/",
-    "groups.create": "POST /api/v1/groups/create",
-    "groups.update": "POST /api/v1/groups/id/{group_id}/update",
-    "groups.users_add": "POST /api/v1/groups/id/{group_id}/users/add",
-    "groups.users_remove": "POST /api/v1/groups/id/{group_id}/users/remove",
-    "groups.delete": "DELETE /api/v1/groups/id/{group_id}/delete"
+    "apikey.get": "GET /api/v1/auths/api_key"
   }
 }

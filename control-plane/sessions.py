@@ -104,6 +104,24 @@ def _forget_client() -> None:
         _client = None
 
 
+def client() -> Any:
+    """The shared Valkey client, for callers that need keys of their own.
+
+    Today that is only the login rate limiter in ``auth.py``. Note the different
+    contract: session reads here raise ``SessionStoreUnavailable`` because the
+    gate must fail closed, whereas a *policy* counter that cannot be reached
+    should not lock a whole household out of an appliance. Callers own that
+    decision; this function just hands out the connection and lets lazy import
+    keep ``redis`` off the unit-test path.
+    """
+    return _get_client()
+
+
+def forget_client() -> None:
+    """Public mirror of :func:`_forget_client` for best-effort callers."""
+    _forget_client()
+
+
 def key(sid: str) -> str:
     return f"{SESSION_KEY_PREFIX}:{_boot_namespace()}:{sid}"
 

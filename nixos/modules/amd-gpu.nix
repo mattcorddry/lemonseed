@@ -63,6 +63,17 @@ in
     # leaving Vulkan with only the llvmpipe CPU fallback.
     hardware.firmware = [ pkgs.linux-firmware ];
 
+    # Only load GPU modules when the hardware is present (bare-metal review:
+    # the Strix Halo box booted without amdgpu and spent boot probing NVIDIA
+    # instead). udev's built-in modalias coldplug missed the device on an
+    # updated image (simple-framebuffer kept the display, Vulkan fell back to
+    # llvmpipe) — a manual `modprobe amdgpu` bound the device instantly, so the
+    # module and params are fine and only the trigger was missing. Fire the
+    # load explicitly: PCI class 03 (display/3D) with vendor 1002 = AMD.
+    services.udev.extraRules = ''
+      ACTION=="add", SUBSYSTEM=="pci", ENV{MODALIAS}=="pci:v00001002d*bc03sc*i*", RUN+="${pkgs.kmod}/bin/modprobe amdgpu"
+    '';
+
     # APU iGPU shared memory split: the amdgpu-kernel-params service reads
     # physical memory from DMI (via lshw), calculates ttm.pages_limit /
     # page_pool_size, and writes them to the ESP (/grub/kernel-params).

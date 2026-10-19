@@ -974,15 +974,81 @@ def _slot_client(port: int) -> owui_client.OwuiClient:
     )
 
 
+def owui_admin_client() -> Optional[owui_client.OwuiClient]:
+    """A signed-in OWUI client for the portal's account primitives (M7 P3).
+
+    The reconcile loop built this client inside every run, so nothing outside it
+    had a keyed one until ``usermgmt`` needed ``users.delete``. Same recipe: api
+    map from the manifest, the persisted CP key (minted here if absent), and one
+    service sign-in that both re-asserts the service role and gives the client an
+    identity to heal a 401 with.
+
+    ``None`` means Open WebUI is not running or its service identity is not
+    provisioned yet. Callers must read that as "the Open WebUI half did not
+    happen" and report it, never as success: a CP account with no OWUI account is
+    a real and recoverable state (USERS-AND-GROUPS.md D-18), and claiming
+    otherwise is how someone ends up unable to sign in to a module nobody
+    mentioned.
+    """
+    port = _active_port_from_upstream()
+    if not port or not _service_identity_ready:
+        return None
+    try:
+        manifest = owui_policy.load_manifest()
+    except owui_policy.ManifestError as exc:
+        print(f"owui admin client: no manifest: {exc}", flush=True)
+        return None
+    client = owui_client.OwuiClient(
+        f"http://127.0.0.1:{port}",
+        email_header=OWUI_TRUSTED_EMAIL_HEADER,
+        name_header=OWUI_TRUSTED_NAME_HEADER,
+        groups_header=OWUI_TRUSTED_GROUPS_HEADER,
+        role_header=OWUI_TRUSTED_ROLE_HEADER,
+        api_map=manifest.api,
+        api_key=_load_owui_cp_key(),
+        on_remint=_persist_owui_cp_key,
+    )
+    sign = client.sign_in_trusted(
+        OWUI_SERVICE_EMAIL, name=OWUI_SERVICE_NAME, role=OWUI_SERVICE_ROLE
+    )
+    if not sign.get("ok"):
+        print(f"owui admin client: sign-in failed: {sign.get('error')}", flush=True)
+        return None
+    if not client.api_key:
+        # Not fatal: ``call`` falls back to the JWT when there is no sk- key. A
+        # box with auth.enable_api_keys off is a supported configuration.
+        client.mint_api_key()
+    return client
+
+
+def in_flight_work() -> Optional[str]:
+    """Work that a reboot would leave half-done, in a sentence, else ``None``.
+
+    The power controls ask this before shutting the box down. Each of these
+    windows holds its lock for its whole duration by design (that is what stops
+    the supervisor's heal from interleaving), so ``locked()`` is an honest
+    signal here, and reading it can never block the handler that asks.
+    """
+    reset_state = str(owui_reset_state().get("state") or "idle")
+    if reset_state not in ("idle", "ready", "error"):
+        return "the chat interface settings are being rebuilt"
+    if _reconcile_request_lock.locked() or owui_policy.reconcile_in_flight():
+        return "Lemonseed settings are being applied to the chat interface"
+    if _lock.locked():
+        return "the chat interface is being installed, updated or restarted"
+    return None
+
+
 def request_policy_reconcile(
     triggers: Optional[frozenset[str]] = None,
 ) -> dict[str, Any]:
     """Run a write reconcile now, on behalf of an admin (T4-E).
 
-    This is the seam M6.2b will also use, so it is public rather than a one-off
-    for the portal button. Refusals are values, not exceptions: ``not ready``
-    (nothing to write to yet) and ``in flight`` (non-blocking lock, the same
-    pattern as the CP's other background work).
+    This is the seam the account primitives call after they change a mirror
+    (`usermgmt` fires it on create, group change and delete), so it is public
+    rather than a one-off for the portal button. Refusals are values, not
+    exceptions: ``not ready`` (nothing to write to yet) and ``in flight``
+    (non-blocking lock, the same pattern as the CP's other background work).
     """
     global _policy_slot_done, _policy_audit_at
     if not _service_identity_ready:

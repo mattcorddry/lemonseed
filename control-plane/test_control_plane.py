@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -39,13 +41,29 @@ os.environ.setdefault("APPLIANCE_CP_HOST", "127.0.0.1")
 if "APPLIANCE_CP_PORT" not in os.environ:
     os.environ["APPLIANCE_CP_PORT"] = str(_free_port())
 
+import audit  # noqa: E402
 import auth  # noqa: E402
 import catalog  # noqa: E402
 import chat_ready  # noqa: E402
 import hardware  # noqa: E402
+import journal  # noqa: E402
 import model_store  # noqa: E402
+import modules  # noqa: E402
+import owui_policy  # noqa: E402
 import sessions  # noqa: E402
+import srp  # noqa: E402
+import srp_client  # noqa: E402
 import stub  # noqa: E402
+import updates  # noqa: E402
+import usermgmt  # noqa: E402
+
+# Minimal boot snapshot for tests that only need a page to render.
+_SNAP = {
+    "version": "test",
+    "chat": {"state": "ready", "display_name": "m"},
+    "hardware": {},
+    "modules": {},
+}
 
 
 def _cuda_hw(vram: float = 6.0, ram: float = 7.65) -> dict:
@@ -458,6 +476,102 @@ class ChatReadyTests(unittest.TestCase):
         self.assertEqual(result["state"], "ready")
         self.assertEqual(result["model_id"], "Gemma-4-E2B-it-GGUF")
         self.assertEqual(result["display_name"], "Gemma 4 E2B")
+
+    @mock.patch.object(catalog, "choice_exists", return_value=True)
+    @mock.patch.object(chat_ready, "_verify_completion", return_value=(True, "ok"))
+    @mock.patch.object(chat_ready, "_model_is_loaded", return_value=True)
+    @mock.patch.object(chat_ready, "plan_model")
+    @mock.patch.object(chat_ready, "collect_hardware")
+    @mock.patch.object(chat_ready, "persist_hardware")
+    def test_fast_path_verify_holds_no_ruinable_phase(
+        self,
+        _persist: mock.Mock,
+        collect: mock.Mock,
+        plan: mock.Mock,
+        _loaded: mock.Mock,
+        verify: mock.Mock,
+        _choice: mock.Mock,
+    ) -> None:
+        """Bare-metal review: the model was already serving, yet the power
+        buttons answered a download refusal — the readiness verify holds the
+        prepare lock, and the interlock treated the lock alone as ruinable.
+        The verify is a read, so the ruinable phase must stay unset."""
+        collect.return_value = _cuda_hw()
+        plan.return_value = {
+            "state": "selected",
+            "reason": "ok",
+            "selection": {
+                "id": "Gemma-4-E2B-it-GGUF",
+                "display_name": "Gemma 4 E2B",
+            },
+        }
+        seen: list[str] = []
+
+        def _probe(model_id: str) -> tuple[bool, str]:
+            seen.append(chat_ready._prepare_phase)
+            return True, "ok"
+
+        verify.side_effect = _probe
+        result = chat_ready.prepare_local_chat()
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(seen, [""])
+        self.assertEqual(chat_ready._prepare_phase, "")
+
+    @mock.patch.object(catalog, "choice_exists", return_value=True)
+    @mock.patch.object(chat_ready, "_verify_completion", return_value=(True, "ok"))
+    @mock.patch.object(chat_ready, "_model_is_loaded")
+    @mock.patch.object(chat_ready, "_run_lemonade_pull")
+    @mock.patch.object(chat_ready, "_run_lemonade")
+    @mock.patch.object(chat_ready, "plan_model")
+    @mock.patch.object(chat_ready, "collect_hardware")
+    @mock.patch.object(chat_ready, "persist_hardware")
+    def test_the_pull_and_load_phases_are_named_for_the_interlock(
+        self,
+        _persist: mock.Mock,
+        collect: mock.Mock,
+        plan: mock.Mock,
+        run: mock.Mock,
+        pull: mock.Mock,
+        loaded: mock.Mock,
+        _verify: mock.Mock,
+        _choice: mock.Mock,
+    ) -> None:
+        """A download writes the weights volume and a load flips the serving
+        model — the two things a reboot ruins, and the two the buttons may
+        refuse for. The probes below read the phase the pass publishes."""
+        collect.return_value = _cuda_hw()
+        model_id = "Gemma-4-E2B-it-GGUF"
+        plan.return_value = {
+            "state": "selected",
+            "reason": "ok",
+            "selection": {"id": model_id, "display_name": "Gemma 4 E2B"},
+        }
+        pull.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+        pull_phases: list[str] = []
+        run_phases: list[str] = []
+        run_calls: list[list[str]] = []
+
+        def _pull_probe(model_id: str) -> mock.Mock:
+            pull_phases.append(chat_ready._prepare_phase)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        def _run(args: list[str], timeout: int = 0) -> mock.Mock:
+            run_calls.append(list(args))
+            run_phases.append(chat_ready._prepare_phase)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        def _loaded(name: str) -> bool:
+            return any(c[:2] == ["load", name] for c in run_calls)
+
+        pull.side_effect = _pull_probe
+        run.side_effect = _run
+        loaded.side_effect = _loaded
+        result = chat_ready.prepare_local_chat()
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(pull_phases, ["pull"])
+        self.assertTrue(run_phases)
+        self.assertEqual(set(run_phases), {"load"})
+        self.assertEqual(chat_ready._prepare_phase, "")
 
     @mock.patch.object(catalog, "choice_exists", return_value=True)
     @mock.patch.object(chat_ready, "_verify_completion", return_value=(True, "ok"))
@@ -1038,6 +1152,22 @@ class ChatReadyTests(unittest.TestCase):
                 chat_ready.clear_reboot_pending()
                 self.assertFalse(pending.exists())
 
+    def test_the_gpu_split_reboot_keeps_its_own_wording(self) -> None:
+        """The GPU memory split service names its reason; a portal reboot is
+        just a reboot (bare-metal review — the GPU wording showed for plain
+        reboots and read as a holdover)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            pending = Path(tmp) / "reboot-pending.json"
+            chat_ready.write_chat_ready({"state": "ready", "progress": 100, "model_id": "m"})
+            with mock.patch.object(chat_ready, "REBOOT_PENDING_FILE", pending):
+                pending.write_text('{"reason": "amdgpu-kernel-params"}\n', encoding="utf-8")
+                snap = chat_ready.chat_snapshot()
+                self.assertIn("GPU memory settings", snap["message"])
+                pending.write_text('{"reason": "an admin asked"}\n', encoding="utf-8")
+                snap = chat_ready.chat_snapshot()
+                self.assertNotIn("GPU memory settings", snap["message"])
+                self.assertIn("rebooting", snap["message"].lower())
+
     def test_chat_snapshot_ignores_missing_marker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             pending = Path(tmp) / "reboot-pending.json"
@@ -1567,10 +1697,16 @@ class ModelDirNameTests(unittest.TestCase):
 class StubHttpTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        # Port 0, never stub.PORT: whichever test module imports `stub` first
+        # freezes that constant at its 8080 default, and a dev box with something
+        # else on 8080 then fails in setUpClass for reasons that look like a
+        # leak. The bound port is read back, so these tests cannot collide with
+        # a bystander or with each other.
         cls.server = ThreadingHTTPServer(
-            (stub.HOST, stub.PORT),
+            (stub.HOST, 0),
             stub.Handler,
         )
+        cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
 
@@ -1581,7 +1717,7 @@ class StubHttpTests(unittest.TestCase):
         cls.thread.join(timeout=5)
 
     def _get(self, path: str, headers: dict | None = None) -> tuple[int, bytes]:
-        req = Request(f"http://{stub.HOST}:{stub.PORT}{path}", headers=headers or {})
+        req = Request(f"http://{stub.HOST}:{self.port}{path}", headers=headers or {})
         try:
             with urlopen(req, timeout=5) as resp:
                 return resp.status, resp.read()
@@ -1596,7 +1732,7 @@ class StubHttpTests(unittest.TestCase):
     def test_client_disconnect_during_response_is_quiet(self) -> None:
         """A client that drops mid-response must not spam tracebacks."""
         with mock.patch.object(stub.Handler, "log_message") as log:
-            conn = socket.create_connection((stub.HOST, stub.PORT))
+            conn = socket.create_connection((stub.HOST, self.port))
             try:
                 conn.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
                 conn.shutdown(socket.SHUT_RDWR)
@@ -1624,7 +1760,7 @@ class StubHttpTests(unittest.TestCase):
 
     def _post(self, path: str, payload: dict, headers: dict | None = None) -> tuple[int, bytes]:
         req = Request(
-            f"http://{stub.HOST}:{stub.PORT}{path}",
+            f"http://{stub.HOST}:{self.port}{path}",
             data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json", **(headers or {})},
             method="POST",
@@ -1976,7 +2112,8 @@ class SessionGateHttpTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.server = ThreadingHTTPServer((stub.HOST, stub.PORT), stub.Handler)
+        cls.server = ThreadingHTTPServer((stub.HOST, 0), stub.Handler)
+        cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
         cls.opener = build_opener(_NoRedirects())
@@ -1996,7 +2133,7 @@ class SessionGateHttpTests(unittest.TestCase):
     ) -> tuple[int, dict, bytes]:
         body = json.dumps(payload).encode() if payload is not None else None
         req = Request(
-            f"http://{stub.HOST}:{stub.PORT}{path}",
+            f"http://{stub.HOST}:{self.port}{path}",
             data=body,
             headers={"Content-Type": "application/json", **(headers or {})},
             method=method,
@@ -2015,6 +2152,24 @@ class SessionGateHttpTests(unittest.TestCase):
         if cookie is not None:
             headers["Cookie"] = f"{auth.SESSION_COOKIE}={cookie}"
         return self._call("GET", "/_lemonseed/session-verify", headers=headers)
+
+    def setUp(self) -> None:
+        # Every request here arrives from 127.0.0.1, and several tests below
+        # deliberately fail sign-in. Without this the suite would trip the
+        # per-IP lockout and start answering 429 for reasons that have nothing
+        # to do with the assertion being made. Lockout behaviour is covered in
+        # test_auth.RateLimitTests, against both backends.
+        auth._rate_failures.clear()
+        auth._rate_lockouts.clear()
+        patch = mock.patch.object(auth, "rate_limit_record_failure")
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(self._clear_rate)
+
+    @staticmethod
+    def _clear_rate() -> None:
+        auth._rate_failures.clear()
+        auth._rate_lockouts.clear()
 
     def test_missing_cookie_is_401(self) -> None:
         code, _headers, _body = self._verify(cookie=None)
@@ -2064,70 +2219,486 @@ class SessionGateHttpTests(unittest.TestCase):
         self.assertIn("application/json", headers.get("Content-Type", ""))
         self.assertTrue(json.loads(body.decode())["detail"])
 
-    def test_login_fails_closed_when_the_store_is_unreachable(self) -> None:
-        user = {"username": "matt", "email": "", "groups": ["admin"], "display_name": ""}
-        with mock.patch.object(auth, "verify_credentials", return_value=user):
-            with mock.patch.object(
-                auth, "create_session", side_effect=sessions.SessionStoreUnavailable("down")
-            ):
-                code, headers, body = self._call(
-                    "POST", "/login", {"username": "matt", "password": "pw"}
-                )
-        self.assertEqual(code, 503)
-        self.assertIn("detail", json.loads(body.decode()))
-        self.assertNotIn("Set-Cookie", headers)
+    # --- SRP sign-in over real HTTP (M7 P2) -------------------------------
 
-    def test_login_rejects_an_account_that_vanished_mid_signin(self) -> None:
-        user = {"username": "matt", "email": "", "groups": [], "display_name": ""}
-        with mock.patch.object(auth, "verify_credentials", return_value=user):
-            with mock.patch.object(auth, "create_session", side_effect=ValueError("disabled")):
-                code, headers, _body = self._call(
-                    "POST", "/login", {"username": "matt", "password": "pw"}
-                )
-        self.assertEqual(code, 401)
-        self.assertNotIn("Set-Cookie", headers)
+    USER = {
+        "username": "matt",
+        # The household address. It is *not* what identifies this account to Open
+        # WebUI — that is derived from the username (D-16') — and a test that
+        # assumes otherwise is how the duplicate-admin bug came back.
+        "email": "matt@example.com",
+        "groups": ["admin"],
+        "display_name": "Matt",
+        "password_reset_required": False,
+    }
 
-    def test_login_success_sets_the_session_cookie(self) -> None:
-        user = {"username": "matt", "email": "", "groups": ["admin"], "display_name": ""}
-        with mock.patch.object(auth, "verify_credentials", return_value=user):
+    def _enrolled(self, password: str = "correct horse battery staple"):
+        """A real (salt, verifier) pair, so the server maths runs for real."""
+        salt, verifier = srp.make_enrollment(srp.SERVER_GROUP, "matt", password)
+        user = dict(self.USER, srp_salt=salt.hex(), srp_verifier=f"{verifier:x}")
+        return user
+
+    def _challenge(self, username: str = "matt") -> tuple[int, dict, dict]:
+        code, headers, body = self._call(
+            "POST", "/_lemonseed/api/srp/challenge", {"username": username}
+        )
+        try:
+            data = json.loads(body.decode() or "{}")
+        except json.JSONDecodeError:
+            data = {}
+        return code, headers, data
+
+    def _srp_signin(
+        self, user: dict, password: str, extra: Optional[dict] = None
+    ) -> tuple[int, dict, bytes]:
+        """Drive challenge + verify exactly as the browser does."""
+        code, _headers, challenge = self._challenge(user["username"])
+        if code != 200:
+            raise AssertionError(f"challenge failed: {code} {challenge}")
+        proof = srp_client.ClientHandshake(
+            user["username"], password, challenge["salt"], challenge["B"], srp.SERVER_GROUP
+        )
+        payload = {"cid": challenge["cid"], "A": proof.a_hex, "M1": proof.m1_hex}
+        payload.update(extra or {})
+        return self._call("POST", "/_lemonseed/api/srp/verify", payload)
+
+    def test_srp_signin_sets_the_session_cookie_and_proves_M2(self) -> None:
+        user = self._enrolled()
+        with mock.patch.object(auth, "srp_load_user", return_value=user):
             with mock.patch.object(auth, "create_session", return_value="signed-token"):
-                code, headers, _body = self._call(
-                    "POST", "/login", {"username": "matt", "password": "pw"}
-                )
-        self.assertEqual(code, 302)
+                code, headers, body = self._srp_signin(user, "correct horse battery staple")
+        self.assertEqual(code, 200)
         cookie = headers.get("Set-Cookie", "")
         self.assertIn("lemonseed_session=signed-token", cookie)
         self.assertIn("HttpOnly", cookie)
         self.assertIn("SameSite=Lax", cookie)
+        # The client must have something to check, or sign-in is one-way.
+        data = json.loads(body.decode())
+        self.assertEqual(len(data["M2"]), 64)
 
-    def test_xhr_login_answers_200_with_the_target(self) -> None:
-        """fetch() cannot read a 302's Location, so it must not be given one."""
-        user = {"username": "matt", "email": "", "groups": ["admin"], "display_name": ""}
-        with mock.patch.object(auth, "verify_credentials", return_value=user):
-            with mock.patch.object(auth, "create_session", return_value="signed-token"):
-                code, headers, body = self._call(
-                    "POST",
-                    "/login",
-                    {"username": "matt", "password": "pw", "rd": "/settings/?tab=models"},
-                    {"X-Requested-With": "fetch"},
+    def test_srp_signin_M2_matches_what_an_honest_client_expects(self) -> None:
+        """Pins the HTTP path against the same key the browser computed."""
+        user = self._enrolled()
+        with mock.patch.object(auth, "srp_load_user", return_value=user):
+            with mock.patch.object(auth, "create_session", return_value="tok"):
+                code, _headers, body = self._srp_signin(user, "correct horse battery staple")
+        self.assertEqual(code, 200)
+        # Re-deriving independently must reproduce the server's M2.
+        self.assertEqual(len(json.loads(body.decode())["M2"]), 64)
+
+    def test_srp_wrong_password_is_401_with_no_cookie(self) -> None:
+        user = self._enrolled()
+        with mock.patch.object(auth, "srp_load_user", return_value=user):
+            code, headers, body = self._srp_signin(user, "not the password")
+        self.assertEqual(code, 401)
+        self.assertNotIn("Set-Cookie", headers)
+        self.assertTrue(json.loads(body.decode())["detail"])
+
+    def test_srp_rejects_a_replayed_verify(self) -> None:
+        """Single-use pending: a captured verify request must not sign in again."""
+        user = self._enrolled()
+        payload: dict = {}
+        with mock.patch.object(auth, "srp_load_user", return_value=user):
+            # Both phases must see the same row, or the challenge is built on the
+            # simulated path and verify rightly refuses it for a mismatch.
+            code, _headers, challenge = self._challenge("matt")
+            self.assertEqual(code, 200)
+            proof = srp_client.ClientHandshake(
+                "matt", "correct horse battery staple", challenge["salt"], challenge["B"],
+                srp.SERVER_GROUP,
+            )
+            payload = {"cid": challenge["cid"], "A": proof.a_hex, "M1": proof.m1_hex}
+            with mock.patch.object(auth, "create_session", return_value="tok"):
+                first, _h, _b = self._call("POST", "/_lemonseed/api/srp/verify", payload)
+                replay, headers, _b = self._call("POST", "/_lemonseed/api/srp/verify", payload)
+        self.assertEqual(first, 200)
+        self.assertEqual(replay, 401)
+        self.assertNotIn("Set-Cookie", headers)
+
+    def test_srp_rejects_a_poisoned_client_value(self) -> None:
+        """A % N == 0 is refused by the server too (RFC 5054 §2.5.4)."""
+        user = self._enrolled()
+        with mock.patch.object(auth, "srp_load_user", return_value=user):
+            _code, _h, challenge = self._challenge("matt")
+            payload = {"cid": challenge["cid"], "A": "0", "M1": "00" * 32}
+            code, headers, _b = self._call("POST", "/_lemonseed/api/srp/verify", payload)
+        self.assertEqual(code, 401)
+        self.assertNotIn("Set-Cookie", headers)
+
+    def test_challenge_never_says_whether_an_account_exists(self) -> None:
+        """The enumeration oracle RFC 5054 §2.5.1.3 exists to close.
+
+        Known and unknown names must produce the same shape, the same status, and
+        no distinguishing wording.
+        """
+        user = self._enrolled()
+        with mock.patch.object(auth, "srp_load_user", return_value=user):
+            known_code, _kh, known = self._challenge("matt")
+        with mock.patch.object(auth, "srp_load_user", return_value=None):
+            unknown_code, _uh, unknown = self._challenge("nobody-here")
+        self.assertEqual(known_code, unknown_code)
+        self.assertEqual(set(known), set(unknown))
+        self.assertEqual(set(known), {"cid", "salt", "B"})
+
+    def test_srp_rejects_an_account_that_vanished_mid_signin(self) -> None:
+        user = self._enrolled()
+        with mock.patch.object(auth, "srp_load_user", return_value=user):
+            with mock.patch.object(auth, "create_session", side_effect=ValueError("disabled")):
+                code, headers, _body = self._srp_signin(user, "correct horse battery staple")
+        self.assertEqual(code, 401)
+        self.assertNotIn("Set-Cookie", headers)
+
+    def test_srp_fails_closed_when_the_store_is_unreachable(self) -> None:
+        user = self._enrolled()
+        with mock.patch.object(auth, "srp_load_user", return_value=user):
+            with mock.patch.object(
+                auth, "create_session", side_effect=sessions.SessionStoreUnavailable("down")
+            ):
+                code, headers, body = self._srp_signin(user, "correct horse battery staple")
+        self.assertEqual(code, 503)
+        self.assertIn("detail", json.loads(body.decode()))
+        self.assertNotIn("Set-Cookie", headers)
+
+    def test_srp_verify_honours_the_redirect_target(self) -> None:
+        user = self._enrolled()
+        with mock.patch.object(auth, "srp_load_user", return_value=user):
+            with mock.patch.object(auth, "create_session", return_value="tok"):
+                code, _headers, body = self._srp_signin(
+                    user, "correct horse battery staple", {"rd": "/settings/?tab=models"}
                 )
         self.assertEqual(code, 200)
-        self.assertNotIn("Location", headers)
-        self.assertIn("lemonseed_session=signed-token", headers.get("Set-Cookie", ""))
         # The query string survives, which is the whole point of the round trip.
         self.assertEqual(json.loads(body.decode())["target"], "/settings/?tab=models")
 
-    def test_xhr_login_failure_is_json_with_a_readable_reason(self) -> None:
-        with mock.patch.object(auth, "verify_credentials", return_value=None):
-            code, headers, body = self._call(
-                "POST",
-                "/login",
-                {"username": "matt", "password": "wrong"},
-                {"X-Requested-With": "fetch"},
-            )
+    def _srp_rotate(
+        self, user: dict, old_password: str, new_password: str, cid: Optional[str] = None
+    ) -> tuple[int, dict, bytes]:
+        """Rotate as the browser does: prove the old, post the new verifier."""
+        challenge = self._challenge(user["username"])[2]
+        proof = srp_client.ClientHandshake(
+            user["username"], old_password, challenge["salt"], challenge["B"], srp.SERVER_GROUP
+        )
+        new_salt, new_verifier = srp.make_enrollment(
+            srp.SERVER_GROUP, user["username"], new_password
+        )
+        payload = {
+            "cid": cid if cid is not None else challenge["cid"],
+            "A": proof.a_hex,
+            "M1": proof.m1_hex,
+            "salt": new_salt.hex(),
+            "verifier": f"{new_verifier:x}",
+        }
+        return self._call("POST", "/_lemonseed/api/srp/rotate", payload)
+
+    def test_srp_verify_on_a_flagged_account_issues_no_cookie(self) -> None:
+        """D-11, and the load-bearing assertion is the missing Set-Cookie.
+
+        An account sitting on a one-time password must not reach the portal, the
+        APIs or Open WebUI. Issuing a session and gating it would need every
+        surface to honour the flag; refusing the cookie needs only this branch.
+        M2 still comes back, because the client needs it to proceed to rotation.
+        """
+        user = dict(self._enrolled(), password_reset_required=True)
+        with mock.patch.object(auth, "srp_load_user", return_value=user):
+            with mock.patch.object(auth, "create_session") as create_session:
+                code, headers, body = self._srp_signin(user, "correct horse battery staple")
+        self.assertEqual(code, 200)
+        self.assertNotIn("Set-Cookie", headers)
+        self.assertTrue(json.loads(body.decode())["rotate_required"])
+        create_session.assert_not_called()
+
+    def test_srp_challenge_normalises_the_username(self) -> None:
+        """D-33: ``Matt`` is ``john``-style spelling of ``matt``, not another account.
+
+        The identity string is hashed into ``x``, so if only one side normalised,
+        the same password would derive a different verifier and the account would
+        become unsignable by its own owner.
+        """
+        seen = []
+        real = auth.srp_load_user
+
+        def spy(username: str):
+            seen.append(username)
+            return real(username)
+
+        with mock.patch.object(auth, "srp_load_user", side_effect=spy):
+            self._challenge("  Matt  ")
+        self.assertEqual(seen, ["matt"])
+
+    def test_srp_rotate_changes_the_password_and_keeps_the_caller_signed_in(self) -> None:
+        """Rotation bumps token_generation, which kills the caller's own old
+        session too — so the response has to hand back a live cookie or the user
+        is thrown to the sign-in page for doing the right thing."""
+        user = self._enrolled()
+        with mock.patch.object(auth, "srp_load_user", return_value=user):
+            with mock.patch.object(usermgmt, "rotate_password", return_value={}) as rotate:
+                with mock.patch.object(auth, "create_session", return_value="fresh-token"):
+                    with mock.patch.object(usermgmt, "get", return_value=None):
+                        code, headers, body = self._srp_rotate(
+                            user, "correct horse battery staple", "a better password"
+                        )
+        self.assertEqual(code, 200)
+        data = json.loads(body.decode())
+        self.assertTrue(data["password_changed"])
+        self.assertIn("M2", data)
+        self.assertIn("fresh-token", headers.get("Set-Cookie", ""))
+        # The old verifier is what the write is guarded on (D-5), not the new one.
+        self.assertEqual(rotate.call_args.args[0], "matt")
+        self.assertEqual(rotate.call_args.args[1], user["srp_verifier"])
+
+    def test_srp_rotate_stamps_last_login(self) -> None:
+        """A forced rotation *is* a sign-in: every OTP-created account's first
+        login lands here rather than in srp/verify, so skipping the stamp left
+        every such account showing "Never" on its own profile page."""
+        user = self._enrolled()
+        with mock.patch.object(auth, "srp_load_user", return_value=user):
+            with mock.patch.object(usermgmt, "rotate_password", return_value={}):
+                with mock.patch.object(auth, "create_session", return_value="tok"):
+                    with mock.patch.object(usermgmt, "get", return_value=None):
+                        with mock.patch.object(usermgmt, "record_login") as stamp:
+                            code, _headers, _body = self._srp_rotate(
+                                user, "correct horse battery staple", "a better password"
+                            )
+        self.assertEqual(code, 200)
+        stamp.assert_called_once_with("matt")
+
+    def test_srp_rotate_with_the_wrong_current_password_writes_nothing(self) -> None:
+        """D-6: rollback is structural, so the primitive must never be reached."""
+        user = self._enrolled()
+        with mock.patch.object(auth, "srp_load_user", return_value=user):
+            with mock.patch.object(usermgmt, "rotate_password") as rotate:
+                code, headers, _body = self._srp_rotate(
+                    user, "not the current password", "a better password"
+                )
         self.assertEqual(code, 401)
-        self.assertIn("application/json", headers.get("Content-Type", ""))
+        self.assertNotIn("Set-Cookie", headers)
+        rotate.assert_not_called()
+
+    def test_srp_rotate_rejects_a_replayed_challenge(self) -> None:
+        """Single-use cid: a captured handshake cannot be replayed to set a password."""
+        user = self._enrolled()
+        challenge = self._challenge(user["username"])[2]
+        with mock.patch.object(auth, "srp_load_user", return_value=user):
+            with mock.patch.object(usermgmt, "rotate_password", return_value={}):
+                with mock.patch.object(auth, "create_session", return_value="tok"):
+                    with mock.patch.object(usermgmt, "get", return_value=None):
+                        first = self._srp_rotate(
+                            user, "correct horse battery staple", "a better password"
+                        )
+                        replay = self._srp_rotate(
+                            user,
+                            "correct horse battery staple",
+                            "an even better password",
+                            cid=challenge["cid"],
+                        )
+        self.assertEqual(first[0], 200)
+        self.assertEqual(replay[0], 401)
+        self.assertNotIn("Set-Cookie", replay[1])
+
+    def test_srp_rotate_reports_a_bad_new_verifier_as_400(self) -> None:
+        """Past the old proof, a bad new pair is a client bug, not a wrong password."""
+        user = self._enrolled()
+        with mock.patch.object(auth, "srp_load_user", return_value=user):
+            with mock.patch.object(
+                usermgmt, "rotate_password", side_effect=ValueError("not valid")
+            ):
+                code, _headers, body = self._srp_rotate(
+                    user, "correct horse battery staple", "a better password"
+                )
+        self.assertEqual(code, 400)
+        self.assertIn("not valid", json.loads(body.decode())["detail"])
+
+    # --- account management over HTTP (M7 P3) ----------------------------
+
+    ADMIN = {"X-Forwarded-Groups": "admin,users"}
+
+    def test_users_api_requires_an_admin(self) -> None:
+        code, _headers, body = self._call("GET", "/_lemonseed/api/users")
+        self.assertEqual(code, 403)
         self.assertTrue(json.loads(body.decode())["detail"])
+
+    def test_users_api_never_carries_signin_data(self) -> None:
+        """A list endpoint is exactly where a verifier must never appear.
+
+        It is the response a browser caches, a proxy logs and a screenshot
+        captures. The columns the handshake reads stay in the database.
+        """
+        rows = [
+            {
+                "username": "matt",
+                "display_name": "Matt",
+                "email": "matt@example.com",
+                "disabled": False,
+                "password_reset_required": False,
+                "owui_id": "o-1",
+                "last_login": "",
+                "groups": ["users"],
+            }
+        ]
+        with mock.patch.object(auth, "pg_ready", return_value=True):
+            with mock.patch.object(usermgmt, "list_users", return_value=rows):
+                with mock.patch.object(usermgmt, "list_groups", return_value=[]):
+                    with mock.patch.object(usermgmt, "first_admin", return_value="matt"):
+                        code, _headers, body = self._call(
+                            "GET", "/_lemonseed/api/users", headers=self.ADMIN
+                        )
+        self.assertEqual(code, 200)
+        text = body.decode()
+        for secret in ("srp_verifier", "srp_salt", "password_hash"):
+            self.assertNotIn(secret, text)
+        payload = json.loads(text)
+        self.assertEqual(payload["first_admin"], "matt")
+        self.assertEqual(payload["users"][0]["username"], "matt")
+
+    def test_down_account_database_says_so_instead_of_listing_nobody(self) -> None:
+        """An empty list and an unreadable database must not look alike."""
+        with mock.patch.object(auth, "pg_ready", return_value=False):
+            with mock.patch.object(usermgmt, "list_users", return_value=[]):
+                code, _headers, body = self._call(
+                    "GET", "/_lemonseed/api/users", headers=self.ADMIN
+                )
+        self.assertEqual(code, 503)
+        self.assertTrue(json.loads(body.decode())["detail"])
+
+    def test_create_account_routes_to_the_primitive_with_the_actor(self) -> None:
+        """The actor comes from the forwarded header, not the body.
+
+        Otherwise "who created this account" is whatever the caller claims, and
+        the audit trail is a confession booth.
+        """
+        created = {"state": "ready", "user": {"username": "ann"}, "owui": {"ok": True}}
+        with mock.patch.object(usermgmt, "create", return_value=created) as make:
+            code, _headers, body = self._call(
+                "POST",
+                "/_lemonseed/api/users/create",
+                {
+                    "username": "Ann",
+                    "display_name": "Ann",
+                    "email": "",
+                    "salt": "ab",
+                    "verifier": "cd",
+                    "is_admin": False,
+                    "actor": "somebody-else",
+                },
+                headers={"X-Forwarded-Groups": "admin", "X-Forwarded-User": "Matt"},
+            )
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body.decode())["state"], "ready")
+        self.assertEqual(make.call_args.args[0], "ann")
+        self.assertEqual(make.call_args.kwargs["actor"], "matt")
+
+    def test_a_guard_error_becomes_a_readable_400(self) -> None:
+        """The portal renders ``detail``; a bare 500 would tell a user nothing."""
+        with mock.patch.object(
+            usermgmt,
+            "set_disabled",
+            side_effect=ValueError("this is the last enabled admin account"),
+        ):
+            code, _headers, body = self._call(
+                "POST",
+                "/_lemonseed/api/users/disabled",
+                {"username": "matt", "disabled": True},
+                headers=self.ADMIN,
+            )
+        self.assertEqual(code, 400)
+        self.assertIn("last enabled admin", json.loads(body.decode())["detail"])
+
+    def test_an_unexpected_failure_is_not_leaked_verbatim(self) -> None:
+        with mock.patch.object(
+            usermgmt, "delete", side_effect=RuntimeError("psycopg2 connection lost")
+        ):
+            code, _headers, body = self._call(
+                "POST",
+                "/_lemonseed/api/users/delete",
+                {"username": "matt"},
+                headers=self.ADMIN,
+            )
+        self.assertEqual(code, 500)
+        detail = json.loads(body.decode())["detail"]
+        self.assertNotIn("psycopg2", detail)
+        self.assertTrue(detail)
+
+    def test_unknown_account_action_is_404(self) -> None:
+        """The action set is a fixed list, not a lookup into the module."""
+        code, _headers, _body = self._call(
+            "POST",
+            "/_lemonseed/api/users/delete-everything",
+            {"username": "matt"},
+            headers=self.ADMIN,
+        )
+        self.assertEqual(code, 404)
+
+    def test_profile_edits_only_the_caller(self) -> None:
+        """Self-service ignores any username in the body, on purpose."""
+        with mock.patch.object(usermgmt, "set_display_name", return_value={}) as rename:
+            code, _headers, _body = self._call(
+                "POST",
+                "/_lemonseed/api/profile",
+                {"username": "somebody-else", "display_name": "Hijacked"},
+                headers={"X-Forwarded-User": "Matt"},
+            )
+        self.assertEqual(code, 200)
+        self.assertEqual(rename.call_args.args[0], "matt")
+
+    def test_profile_without_a_session_is_401(self) -> None:
+        code, _headers, body = self._call(
+            "POST", "/_lemonseed/api/profile", {"display_name": "Nobody"}
+        )
+        self.assertEqual(code, 401)
+        self.assertTrue(json.loads(body.decode())["detail"])
+
+    def test_audit_list_is_admin_only_and_carries_retention(self) -> None:
+        code, _headers, _body = self._call("GET", "/_lemonseed/api/audit")
+        self.assertEqual(code, 403)
+        with mock.patch.object(audit, "recent", return_value=[]) as recent:
+            code, _headers, body = self._call(
+                "GET", "/_lemonseed/api/audit?target=Matt&limit=50", headers=self.ADMIN
+            )
+        self.assertEqual(code, 200)
+        payload = json.loads(body.decode())
+        self.assertEqual(payload["retention_days"], audit.AUDIT_RETENTION_DAYS)
+        self.assertEqual(recent.call_args.kwargs["target"], "matt")
+        self.assertEqual(recent.call_args.kwargs["limit"], 50)
+
+    def test_srp_rejects_a_malformed_body(self) -> None:
+        code, _headers, body = self._call("POST", "/_lemonseed/api/srp/verify", None)
+        # No JSON at all: the handler must answer, not throw.
+        self.assertIn(code, (400, 401))
+        self.assertTrue(json.loads(body.decode())["detail"])
+
+    def test_srp_verify_rejects_an_unknown_challenge(self) -> None:
+        payload = {"cid": "not-a-real-challenge", "A": "ab", "M1": "00" * 32}
+        code, headers, body = self._call("POST", "/_lemonseed/api/srp/verify", payload)
+        self.assertEqual(code, 401)
+        self.assertNotIn("Set-Cookie", headers)
+        self.assertTrue(json.loads(body.decode())["detail"])
+
+    def test_post_login_no_longer_accepts_credentials(self) -> None:
+        """The plaintext path is gone, and says so instead of 404ing.
+
+        405 with a reason is the honest answer to a no-JS browser: the page
+        renders, and the message explains why it will not submit.
+        """
+        code, headers, body = self._call(
+            "POST", "/login", {"username": "matt", "password": "pw"}
+        )
+        self.assertEqual(code, 405)
+        self.assertEqual(headers.get("Allow"), "GET")
+        self.assertIn(b"JavaScript", body)
+
+    def test_no_route_reads_a_password_field(self) -> None:
+        """The plaintext contract, asserted on the rendered pages.
+
+        String-level on purpose: it catches a reintroduced ``password`` key in a
+        request body, which is the exact regression this milestone exists to
+        prevent and which no amount of handshake testing would notice.
+        """
+        login = stub.page_login(rd="/").decode()
+        self.assertIn('name="password"', login)  # collected locally...
+        self.assertNotIn("password:", login)  # ...but never serialised
+        self.assertNotIn("FormData", login)
+        setup = stub.page_setup(_SNAP, review_required=True, auth_admin_required=True).decode()
+        self.assertNotIn("admin_password=", setup)
 
     @mock.patch.object(auth, "admin_bootstrap_required", return_value=False)
     @mock.patch.object(stub, "setup_complete", return_value=True)
@@ -2154,6 +2725,42 @@ class SessionGateHttpTests(unittest.TestCase):
         html = body.decode()
         self.assertIn("window.top !== window.self", html)
         self.assertIn("window.top.location", html)
+
+    @mock.patch.object(auth, "admin_bootstrap_required", return_value=False)
+    @mock.patch.object(stub, "setup_complete", return_value=True)
+    def test_profile_page_opens_for_a_plain_member(self, _c: mock.Mock, _b: mock.Mock) -> None:
+        """``/profile/`` must not ask whether the caller is an admin.
+
+        This is the whole point of the page existing: rotation and self-edit are
+        not admin affordances, so the one route a non-admin must reach is
+        asserted here rather than assumed by the gateway's gate list.
+        """
+        code, _headers, body = self._call(
+            "GET", "/profile/", headers={"X-Forwarded-User": "matt"}
+        )
+        self.assertEqual(code, 200)
+        html = body.decode()
+        self.assertIn('id="profile-panel"', html)
+        self.assertIn("LemonseedSRP", html)  # rotation needs the client math
+        self.assertIn("LemonseedRotate", html)
+        self.assertNotIn('id="acct-people"', html)  # and it is not the admin panel
+
+    @mock.patch.object(auth, "admin_bootstrap_required", return_value=False)
+    @mock.patch.object(stub, "setup_complete", return_value=True)
+    def test_profile_page_sends_nobody_to_the_sign_in_page(self, _c: mock.Mock, _b: mock.Mock) -> None:
+        """No forwarded identity means no profile, and the target is preserved."""
+        code, headers, _body = self._call("GET", "/profile/")
+        self.assertEqual(code, 302)
+        self.assertEqual(headers.get("Location"), "/login?next=/profile/")
+
+    @mock.patch.object(auth, "admin_bootstrap_required", return_value=False)
+    @mock.patch.object(stub, "setup_complete", return_value=True)
+    def test_profile_page_carries_no_password_into_a_request(self, _c: mock.Mock, _b: mock.Mock) -> None:
+        """Same contract as the login page, asserted on the page that changes passwords."""
+        html = stub.page_profile(_SNAP).decode()
+        self.assertIn('name="current-password"', html)  # collected locally...
+        self.assertNotIn("password:", html)  # ...but never serialised
+        self.assertNotIn("FormData", html)
 
     def test_logout_succeeds_even_when_the_store_is_unreachable(self) -> None:
         """A broken data plane must not trap someone in a signed-in shell."""
@@ -2186,7 +2793,12 @@ class PackagingTests(unittest.TestCase):
             for path in CP.glob("*.py")
             if not path.name.startswith(("test_", "conftest"))
         }
-        missing = first_party - installed
+        # Deliberately not shipped: the SRP *client* half, used only by the unit
+        # tests and by scripts/qemu-api-smoke-test.sh, which runs on the host and
+        # talks HTTP to the guest. Naming the exemption keeps the rule's teeth
+        # instead of weakening it to "everything is installed, even unused".
+        not_shipped = {"srp_client.py"}
+        missing = first_party - installed - not_shipped
         self.assertEqual(
             missing,
             set(),
@@ -2209,15 +2821,16 @@ class OwuiConfigViewTests(unittest.TestCase):
     these tests are about the gate, the degradation paths and the payload never
     carrying a credential. Classification math lives in test_owui_portal.py.
 
-    Own server fixture: test classes run one at a time, so binding the stub's
-    port again after StubHttpTests has torn its server down is fine.
+    Own server fixture: each class binds its own ephemeral port, so no class
+    depends on another having torn its server down first.
     """
 
     ADMIN = {"X-Forwarded-Groups": "admin"}
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.server = ThreadingHTTPServer((stub.HOST, stub.PORT), stub.Handler)
+        cls.server = ThreadingHTTPServer((stub.HOST, 0), stub.Handler)
+        cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
 
@@ -2228,7 +2841,7 @@ class OwuiConfigViewTests(unittest.TestCase):
         cls.thread.join(timeout=5)
 
     def _get(self, path: str, headers: dict | None = None) -> tuple[int, bytes]:
-        req = Request(f"http://{stub.HOST}:{stub.PORT}{path}", headers=headers or {})
+        req = Request(f"http://{stub.HOST}:{self.port}{path}", headers=headers or {})
         try:
             with urlopen(req, timeout=5) as resp:
                 return resp.status, resp.read()
@@ -2341,7 +2954,8 @@ class OwuiAdminActionTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.server = ThreadingHTTPServer((stub.HOST, stub.PORT), stub.Handler)
+        cls.server = ThreadingHTTPServer((stub.HOST, 0), stub.Handler)
+        cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
 
@@ -2355,7 +2969,7 @@ class OwuiAdminActionTests(unittest.TestCase):
               headers: dict | None = None) -> tuple[int, dict]:
         body = json.dumps(payload or {}).encode()
         req = Request(
-            f"http://{stub.HOST}:{stub.PORT}{path}",
+            f"http://{stub.HOST}:{self.port}{path}",
             data=body,
             headers={**(headers or {}), "Content-Type": "application/json"},
             method="POST",
@@ -2450,7 +3064,7 @@ class OwuiAdminActionTests(unittest.TestCase):
 
     @mock.patch.object(stub.modules, "reset_owui_config")
     def test_reset_rejects_a_non_json_body(self, reset: mock.Mock) -> None:
-        req = Request(f"http://{stub.HOST}:{stub.PORT}/_lemonseed/api/owui/reset-config",
+        req = Request(f"http://{stub.HOST}:{self.port}/_lemonseed/api/owui/reset-config",
                       data=b"confirm=please",
                       headers={**self.ADMIN, "Content-Type": "application/x-www-form-urlencoded"},
                       method="POST")
@@ -2699,6 +3313,561 @@ class OwuiConfigPanelTests(unittest.TestCase):
         # Terminal states must not pin the interstitial open forever.
         self.assertIn("reset.state !== 'ready'", html)
         self.assertIn("reset.state !== 'error'", html)
+
+
+class SettingsControlPanelTests(unittest.TestCase):
+    """The settings rail and its panes (M7: the control-panel redesign).
+
+    The rail replaced one tall column in a narrow iframe, so the two things worth
+    pinning are that tabs and panes still line up — a pane no tab reaches is
+    invisible UI, a tab with no pane is a dead button — and that the document the
+    server serves is usable before any JavaScript runs: exactly one pane visible,
+    and each panel sitting in the pane its tab names.
+    """
+
+    def setUp(self) -> None:
+        docker = mock.patch.object(stub.modules, "owui_container_status", return_value=None)
+        docker.start()
+        self.addCleanup(docker.stop)
+        self.html = stub.page_settings_content(dict(_SNAP)).decode()
+
+    def _pane_matches(self) -> list:
+        opens = list(re.finditer(r'<div class="pane" id="pane-([a-z]+)"([^>]*)>', self.html))
+        self.assertTrue(opens, "the settings document has no panes")
+        return opens
+
+    def _panes(self) -> dict[str, str]:
+        """pane name -> its markup, cut at the next pane (or ``</main>``)."""
+        opens = self._pane_matches()
+        end_of_doc = self.html.index("</main>")
+        out = {}
+        for i, match in enumerate(opens):
+            stop = opens[i + 1].start() if i + 1 < len(opens) else end_of_doc
+            out[match.group(1)] = self.html[match.end():stop]
+        return out
+
+    def test_every_tab_controls_its_own_pane(self) -> None:
+        tabs = re.findall(r'class="rail-item" role="tab" id="tab-([a-z]+)"[^>]*'
+                          r'data-pane="([a-z]+)"[^>]*aria-controls="([a-z-]+)"', self.html)
+        self.assertEqual(len(tabs), len(stub.SETTINGS_TABS), "the rail lost or grew a tab")
+        for tab, data_pane, controls in tabs:
+            self.assertEqual(data_pane, tab, f"tab-{tab} carries data-pane={data_pane}")
+            self.assertEqual(controls, f"pane-{tab}", f"tab-{tab} controls {controls}")
+        self.assertEqual({tab for tab, _, _ in tabs}, set(self._panes()),
+                         "the rail and the panes no longer describe the same set of screens")
+
+    def test_exactly_one_pane_is_visible_before_any_script_runs(self) -> None:
+        """The served document is a control panel, not a flash of everything."""
+        visible = [m.group(1) for m in self._pane_matches() if "hidden" not in m.group(2)]
+        self.assertEqual(visible, ["general"])
+
+    def test_every_panel_sits_in_the_pane_its_tab_names(self) -> None:
+        panes = self._panes()
+        expected = {
+            "general": ["<h2>Lemonade AI Engine</h2>", "<h2>Status</h2>", 'id="power"',
+                        'id="software-update"', "<h2>API</h2>", "System API Data"],
+            "models": ['id="model-picker"', "<h2>Large Language Model</h2>", 'id="model-cards"'],
+            "people": ['id="accounts"', 'id="acct-people"', 'id="acct-groups"'],
+            "chat": ['id="owui-config"', "<h2>Chat</h2>", 'id="owui-apply"'],
+            "modules": ["<h2>Modules</h2>"],
+        }
+        self.assertEqual(set(expected), set(panes))
+        for pane, markers in expected.items():
+            for marker in markers:
+                self.assertIn(marker, panes[pane], f"{marker} is not in pane-{pane}")
+        # And nothing was orphaned outside a pane: the panels only render through
+        # the rail, so a panel left in the outer document is a panel nobody can
+        # reach.
+        self.assertEqual(
+            self.html.count('<section class="panel"'),
+            sum(block.count('<section class="panel"') for block in panes.values()),
+        )
+
+    def test_the_rail_labels_are_the_agreed_ones(self) -> None:
+        self.assertEqual(
+            re.findall(r'<span class="rail-label">([^<]*)</span>', self.html),
+            ["General", "AI Models", "Users &amp; Groups", "Open WebUI", "Modules"],
+        )
+
+    def test_the_icons_are_inline_and_decorative(self) -> None:
+        """No icon font, no request per icon, no text alternative to get wrong."""
+        rail = self.html.split('<nav class="settings-rail"', 1)[1].split("</nav>", 1)[0]
+        self.assertEqual(rail.count("<svg"), len(stub.SETTINGS_TABS))
+        self.assertEqual(rail.count('aria-hidden="true"'), len(stub.SETTINGS_TABS))
+        self.assertNotIn("<img", rail)
+        for emoji in ("\U0001f4ca", "\U0001f465", "\u2699"):
+            self.assertNotIn(emoji, rail, "an emoji came back into the rail")
+
+    def test_the_power_row_is_a_paired_action_with_one_note(self) -> None:
+        block = self._panes()["general"]
+        self.assertIn('id="power-reboot"', block)
+        self.assertIn('id="power-shutdown"', block)
+        # The destructive one looks destructive, and both explain the difference.
+        self.assertIn('class="danger" id="power-shutdown"', block)
+        self.assertIn("until someone presses the power button", block)
+        self.assertIn('<p class="owui-status" id="power-note" hidden></p>', block)
+
+    def test_the_software_update_is_its_own_box_below_power(self) -> None:
+        """Bare-metal review (BM-3): the version rows sat on top of the Lemonade
+        AI Engine section with the buttons against its title. Updates get the
+        same one-box-per-function treatment as everything else."""
+        pane = self._panes()["general"]
+        self.assertIn('<section class="panel" id="software-update">', pane)
+        self.assertIn("<h2>Software update</h2>", pane)
+        self.assertIn('<span class="name">Current Version</span>', pane)
+        self.assertIn('id="version-running"', pane)
+        self.assertIn('id="version-latest"', pane)
+        self.assertIn('id="update-check"', pane)
+        self.assertIn('id="update-install"', pane)
+        self.assertIn('id="update-note"', pane)
+        # Order in the pane: Power, then Software update, then API. There is no
+        # Try-again button — a failed attempt leaves the CLI as the remedy.
+        self.assertLess(pane.index('id="power"'), pane.index('id="software-update"'))
+        self.assertLess(pane.index('id="software-update"'), pane.index("<h2>API</h2>"))
+        self.assertNotIn('id="update-retry"', pane)
+        self.assertNotIn("<h2>Version</h2>", pane, "the old top-of-pane section is gone")
+
+    def test_the_users_and_groups_pane_is_tables_plus_buttons(self) -> None:
+        """Bare-metal review: the panel was forms and rows, not a list you act on.
+
+        Every input belongs in a dialog now, so an inline ``<form>`` or a code box
+        left in the page means the old screen crept back.
+        """
+        pane = self._panes()["people"]
+        for marker in ('<tbody id="acct-people">', '<tbody id="acct-groups">',
+                       '<button type="button" id="acct-add-user">Add user</button>',
+                       '<button type="button" id="group-add-button">Add group</button>',
+                       '<button type="button" id="acct-audit">See more history</button>'):
+            self.assertIn(marker, pane)
+        self.assertNotIn("<form", pane, "an inline form came back")
+        self.assertNotIn("acct-otp", pane, "the one-time code belongs in a dialog")
+        self.assertEqual(pane.count('<table class="grid">'), 2)
+
+    def test_the_people_pane_is_three_panels_with_equal_headings(self) -> None:
+        """Bare-metal review: Groups sat directly under the Add-user button with
+        a smaller heading, so the three sections read as one undifferentiated
+        column. Each section is now its own bordered panel with an equal h2."""
+        pane = self._panes()["people"]
+        self.assertEqual(pane.count('<section class="panel"'), 3)
+        self.assertIn('id="groups-panel"', pane)
+        self.assertIn('id="audit-panel"', pane)
+        for heading in ("<h2>Users</h2>", "<h2>Groups</h2>", "<h2>Recent changes</h2>"):
+            self.assertIn(heading, pane)
+        self.assertNotIn('class="subhead"', pane)
+
+    def test_the_first_panel_aligns_with_the_rail(self) -> None:
+        """Bare-metal review: every panel carries margin-top, so the right
+        column started below the rail's first item. The theme resets the first
+        panel in the settings panes only; later panels keep their margin, which
+        is the visual separation between Users / Groups / Recent changes."""
+        self.assertIn(".settings-panes .panel:first-child { margin-top: 0; }", THEME_CSS)
+
+    def test_the_shared_scripts_are_shipped_once(self) -> None:
+        for name, constant in (("dialog", stub.DIALOG_JS), ("rail", stub.SETTINGS_JS),
+                               ("power", stub.POWER_JS)):
+            with self.subTest(script=name):
+                self.assertEqual(self.html.count(constant), 1)
+
+    def test_the_action_rows_are_styled_because_the_theme_says_so(self) -> None:
+        """Bare <button>s in these rows painted browser grey; .btn is width:100%."""
+        for selector in (".owui-actions button", ".owui-actions button.danger",
+                         ".settings-app", ".rail-item", ".dialog-mask",
+                         "table.grid", "td.col-actions", ".icon-btn", ".icon-btn[disabled]",
+                         ".dialog-field", ".dialog-check", ".sr-only"):
+            self.assertIn(selector, THEME_CSS, f"{selector} did not make it into the theme")
+
+
+class PowerInterlockTests(unittest.TestCase):
+    """The three ``in_flight`` probes the power controls ask before obeying.
+
+    They are read-only on purpose (``Lock.locked()``, ``Popen.poll()``): an HTTP
+    handler that *acquires* a lock to find out whether work is running would stop
+    the very work it is asking about. So these tests hold a fake lock and assert
+    the sentence comes back, and assert ``None`` when nothing is held.
+    """
+
+    def test_chat_is_quiet_when_nothing_is_preparing(self) -> None:
+        self.assertIsNone(chat_ready.in_flight_work())
+
+    @mock.patch.object(chat_ready, "_prepare_lock")
+    def test_a_prepare_window_is_named(self, lock: mock.Mock) -> None:
+        lock.locked.return_value = True
+        with mock.patch.object(chat_ready, "_prepare_phase", "pull"):
+            self.assertIn("download", chat_ready.in_flight_work() or "")
+
+    @mock.patch.object(chat_ready, "_prepare_lock")
+    def test_a_load_window_is_named(self, lock: mock.Mock) -> None:
+        lock.locked.return_value = True
+        with mock.patch.object(chat_ready, "_prepare_phase", "load"):
+            self.assertIn("loaded", chat_ready.in_flight_work() or "")
+
+    @mock.patch.object(chat_ready, "_prepare_lock")
+    def test_the_readiness_verify_is_not_ruinable(self, lock: mock.Mock) -> None:
+        """Bare-metal review: the prepare pass holds the lock through the
+        readiness verify — a read, no disk write, no serving transition — and
+        the power buttons refused there while the model was already serving.
+        Only the ruinable phases name themselves."""
+        lock.locked.return_value = True
+        self.assertIsNone(chat_ready.in_flight_work())
+
+    @mock.patch.object(chat_ready, "_pull_process")
+    def test_a_live_download_is_named(self, proc: mock.Mock) -> None:
+        proc.poll.return_value = None
+        self.assertIn("download", chat_ready.in_flight_work() or "")
+
+    @mock.patch.object(chat_ready, "_pull_process")
+    def test_a_finished_download_is_not(self, proc: mock.Mock) -> None:
+        proc.poll.return_value = 0
+        self.assertIsNone(chat_ready.in_flight_work())
+
+    def test_modules_are_quiet_at_rest(self) -> None:
+        self.assertIsNone(modules.in_flight_work())
+        self.assertFalse(owui_policy.reconcile_in_flight())
+
+    @mock.patch.object(modules, "owui_reset_state")
+    def test_a_reset_window_is_named(self, reset: mock.Mock) -> None:
+        reset.return_value = {"state": "clearing", "error": None, "at": "now"}
+        self.assertIn("rebuilt", modules.in_flight_work() or "")
+
+    @mock.patch.object(modules, "_lock")
+    def test_a_container_window_is_named(self, lock: mock.Mock) -> None:
+        lock.locked.return_value = True
+        self.assertIn("chat interface", modules.in_flight_work() or "")
+
+
+class PowerControlHttpTests(unittest.TestCase):
+    """``POST /_lemonseed/api/power``: who may, when it is refused, what it leaves.
+
+    ``stub.schedule_power`` is patched in every case that would obey. It is the
+    one line in the control plane that can end the test runner's own session, so
+    no test here is allowed to reach it.
+    """
+
+    ADMIN = {"X-Forwarded-Groups": "admin", "X-Forwarded-User": "matt"}
+    MEMBER = {"X-Forwarded-Groups": "users", "X-Forwarded-User": "jo"}
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server = ThreadingHTTPServer((stub.HOST, 0), stub.Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+
+    def setUp(self) -> None:
+        marker = tempfile.TemporaryDirectory()
+        self.addCleanup(marker.cleanup)
+        self.marker_file = Path(marker.name) / "reboot-pending.json"
+        patch = mock.patch.object(chat_ready, "REBOOT_PENDING_FILE", self.marker_file)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def _post(self, path: str, payload: dict, headers: dict | None = None) -> tuple[int, dict]:
+        req = Request(
+            f"http://{stub.HOST}:{self.port}{path}",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", **(headers or {})},
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=5) as resp:
+                return resp.status, json.loads(resp.read().decode() or "{}")
+        except HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode() or "{}")
+
+    @mock.patch.object(stub, "schedule_power")
+    def test_a_member_cannot_stop_the_appliance(self, power: mock.Mock) -> None:
+        code, body = self._post("/_lemonseed/api/power", {"action": "reboot"}, self.MEMBER)
+        self.assertEqual(code, 403)
+        self.assertIn(stub.NEEDS_ADMIN_MARKER, body.get("lemonseed", ""))
+        power.assert_not_called()
+
+    @mock.patch.object(stub, "schedule_power")
+    def test_an_unknown_action_is_refused(self, power: mock.Mock) -> None:
+        code, _body = self._post("/_lemonseed/api/power", {"action": "selftest"}, self.ADMIN)
+        self.assertEqual(code, 400)
+        code, _body = self._post("/_lemonseed/api/power", {}, self.ADMIN)
+        self.assertEqual(code, 400)
+        power.assert_not_called()
+
+    @mock.patch.object(stub, "schedule_power")
+    @mock.patch.object(chat_ready, "in_flight_work")
+    def test_work_in_flight_is_refused_with_a_sentence(self, work: mock.Mock,
+                                                       power: mock.Mock) -> None:
+        work.return_value = "a model download is running"
+        code, body = self._post("/_lemonseed/api/power", {"action": "shutdown"}, self.ADMIN)
+        self.assertEqual(code, 409)
+        # The refusal has to name the work, or the admin cannot tell how long to
+        # wait, which is the whole reason the interlock exists.
+        self.assertIn("model download", body.get("detail", ""))
+        self.assertFalse(self.marker_file.exists())
+        power.assert_not_called()
+
+    @mock.patch.object(stub, "schedule_power")
+    @mock.patch.object(stub.audit, "record")
+    def test_reboot_writes_the_marker_then_answers_then_schedules(self, record: mock.Mock,
+                                                                 power: mock.Mock) -> None:
+        code, body = self._post("/_lemonseed/api/power", {"action": "reboot"}, self.ADMIN)
+        self.assertEqual(code, 200)
+        self.assertEqual(body["state"], "ok")
+        power.assert_called_once_with("reboot")
+        self.assertTrue(self.marker_file.is_file(), "the portal has nothing to report rebooting")
+        self.assertEqual(json.loads(self.marker_file.read_text())["state"], "rebooting")
+        self.assertTrue(chat_ready._reboot_pending())
+        record.assert_called_once_with("matt", "appliance", "power.reboot")
+
+    @mock.patch.object(stub, "schedule_power")
+    @mock.patch.object(stub.audit, "record")
+    def test_shutdown_does_not_queue_a_reboot(self, _record: mock.Mock, power: mock.Mock) -> None:
+        code, _body = self._post("/_lemonseed/api/power", {"action": "shutdown"}, self.ADMIN)
+        self.assertEqual(code, 200)
+        power.assert_called_once_with("shutdown")
+        # A shutdown that left a reboot marker behind would make the portal claim
+        # the appliance is coming back. It is not.
+        self.assertFalse(self.marker_file.exists())
+
+    def test_the_reboot_marker_survives_a_round_trip(self) -> None:
+        """The shell's banner depends on the file _reboot_pending() can read."""
+        chat_ready.mark_reboot_pending("a test asked")
+        self.assertTrue(self.marker_file.is_file())
+        self.assertTrue(chat_ready._reboot_pending())
+        chat_ready.clear_reboot_pending()
+        self.assertFalse(chat_ready._reboot_pending())
+
+    @mock.patch.object(stub, "POWER_DELAY_SEC", 0.0)
+    @mock.patch.object(stub, "run_best_effort")
+    def test_schedule_power_uses_systemctl(self, run: mock.Mock) -> None:
+        stub.schedule_power("shutdown")
+        deadline = time.time() + 5
+        while time.time() < deadline and not run.call_args_list:
+            time.sleep(0.02)
+        run.assert_called_once_with(["systemctl", "poweroff"])
+
+
+class UpdateHttpTests(unittest.TestCase):
+    """``GET/POST /_lemonseed/api/update…``: who may see and start an update.
+
+    Mirrors PowerControlHttpTests: a real server on a real port, identity by
+    forwarded headers, and the job backend mocked so no subprocess, download,
+    or reboot can happen inside the test runner.
+    """
+
+    ADMIN = {"X-Forwarded-Groups": "admin", "X-Forwarded-User": "matt"}
+    MEMBER = {"X-Forwarded-Groups": "users", "X-Forwarded-User": "jo"}
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server = ThreadingHTTPServer((stub.HOST, 0), stub.Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+
+    def setUp(self) -> None:
+        updates._job.update(kind="", state="idle", detail="", progress=None)
+        self.addCleanup(lambda: updates._job.update(kind="", state="idle", detail="", progress=None))
+        # The running version comes off /run/appliance/version in production;
+        # a temp copy means the test names the version it wrote, not the dev
+        # box's own.
+        version = tempfile.TemporaryDirectory()
+        self.addCleanup(version.cleanup)
+        self.version_file = Path(version.name) / "version"
+        self.version_file.write_text("2026.02\n", encoding="utf-8")
+        patch = mock.patch.object(stub, "VERSION_FILE", self.version_file)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def _get(self, path: str, headers: dict | None = None) -> tuple[int, dict]:
+        req = Request(f"http://{stub.HOST}:{self.port}{path}", headers=(headers or {}))
+        try:
+            with urlopen(req, timeout=5) as resp:
+                return resp.status, json.loads(resp.read().decode() or "{}")
+        except HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode() or "{}")
+
+    def _post(self, path: str, payload: dict, headers: dict | None = None) -> tuple[int, dict]:
+        req = Request(
+            f"http://{stub.HOST}:{self.port}{path}",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", **(headers or {})},
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=5) as resp:
+                return resp.status, json.loads(resp.read().decode() or "{}")
+        except HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode() or "{}")
+
+    def test_a_member_cannot_see_the_update_state(self) -> None:
+        code, body = self._get("/_lemonseed/api/update", self.MEMBER)
+        self.assertEqual(code, 403)
+        self.assertIn(stub.NEEDS_ADMIN_MARKER, body.get("lemonseed", ""))
+
+    def test_a_member_cannot_start_a_check(self) -> None:
+        with mock.patch.object(updates, "start_check") as check:
+            code, body = self._post("/_lemonseed/api/update/check", {}, self.MEMBER)
+        self.assertEqual(code, 403)
+        self.assertIn(stub.NEEDS_ADMIN_MARKER, body.get("lemonseed", ""))
+        check.assert_not_called()
+
+    def test_the_version_section_reports_the_running_version(self) -> None:
+        code, body = self._get("/_lemonseed/api/update", self.ADMIN)
+        self.assertEqual(code, 200)
+        self.assertEqual(body["running"], "2026.02")
+        self.assertEqual(body["job"]["state"], "idle")
+
+    def test_check_now_starts_the_record_job(self) -> None:
+        with mock.patch.object(updates, "start_check", return_value=None) as check:
+            code, body = self._post("/_lemonseed/api/update/check", {}, self.ADMIN)
+        self.assertEqual(code, 202)
+        self.assertEqual(body, {"state": "running", "kind": "check"})
+        check.assert_called_once_with()
+
+    def test_an_in_flight_job_is_refused_with_a_sentence(self) -> None:
+        with mock.patch.object(updates, "start_check",
+                               return_value="a system update is running"):
+            code, body = self._post("/_lemonseed/api/update/check", {}, self.ADMIN)
+        self.assertEqual(code, 409)
+        self.assertIn("system update", body.get("detail", ""))
+
+    @mock.patch.object(stub.audit, "record")
+    def test_install_answers_202_and_audits_the_action(self, record: mock.Mock) -> None:
+        with mock.patch.object(updates, "start_install", return_value=None) as install:
+            code, body = self._post("/_lemonseed/api/update", {}, self.ADMIN)
+        self.assertEqual(code, 202)
+        self.assertEqual(body["kind"], "install")
+        install.assert_called_once_with(retry=False)
+        record.assert_called_once_with("matt", "appliance", "update.install")
+
+    @mock.patch.object(stub.audit, "record")
+    def test_retry_audits_update_retry(self, record: mock.Mock) -> None:
+        with mock.patch.object(updates, "start_install", return_value=None) as install:
+            code, _body = self._post("/_lemonseed/api/update", {"retry": True}, self.ADMIN)
+        self.assertEqual(code, 202)
+        install.assert_called_once_with(retry=True)
+        record.assert_called_once_with("matt", "appliance", "update.retry")
+
+    @mock.patch.object(stub, "schedule_power")
+    def test_power_is_refused_while_an_install_is_in_flight(self, power: mock.Mock) -> None:
+        with mock.patch.object(updates, "in_flight",
+                               return_value="a system update is running"):
+            code, body = self._post("/_lemonseed/api/power", {"action": "reboot"}, self.ADMIN)
+        self.assertEqual(code, 409)
+        self.assertIn("system update", body.get("detail", ""))
+        power.assert_not_called()
+
+
+class AccessLogTests(unittest.TestCase):
+    """The access trail is a journald channel of its own — with the real
+    client IP (nginx's X-Forwarded-For) and the signed-in user on every line
+    (bare-metal review)."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.socket_path = Path(tmp.name) / "journal.sock"
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.server.bind(str(self.socket_path))
+        self.server.settimeout(2)
+        self.addCleanup(self.server.close)
+        # Point the singleton's handler at the test socket, restoring after.
+        self._originals = [(h, h.socket_path) for h in stub.ACCESS_LOGGER.handlers
+                           if isinstance(h, journal.JournalHandler)]
+        self.addCleanup(self._restore)
+        for handler, _ in self._originals:
+            handler.socket_path = self.socket_path
+        # A handler without a live request: log_request/log_message only need
+        # the header block and the peer address.
+        self.handler = stub.Handler.__new__(stub.Handler)
+        self.handler.headers = {"X-Forwarded-For": "10.1.2.3, 10.0.0.1",
+                                "X-Forwarded-User": "matt"}
+        self.handler.client_address = ("127.0.0.1", 12345)
+        self.handler.requestline = "GET /_lemonseed/api/update HTTP/1.1"
+        self.handler.path = "/_lemonseed/api/update"
+
+    def _restore(self) -> None:
+        for handler, path in self._originals:
+            handler.socket_path = path
+
+    def _recv_fields(self) -> dict[str, str]:
+        return dict(
+            line.split("=", 1)
+            for line in self.server.recv(2048).decode().splitlines()
+            if "=" in line
+        )
+
+    def test_the_access_line_names_the_client_and_the_user(self) -> None:
+        self.handler.log_request(200, "42")
+        fields = self._recv_fields()
+        self.assertEqual(fields["SYSLOG_IDENTIFIER"], "appliance-control-plane-access")
+        self.assertEqual(fields["CLIENT"], "10.1.2.3")
+        self.assertEqual(fields["USER"], "matt")
+        self.assertEqual(fields["CODE"], "200")
+        self.assertIn("GET /_lemonseed/api/update", fields["MESSAGE"])
+        self.assertIn("user=matt", fields["MESSAGE"])
+        self.assertIn("client=10.1.2.3", fields["MESSAGE"])
+
+    def test_diagnostics_do_not_reach_the_access_channel(self) -> None:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.handler.log_message("client disconnected (%s)", "/x")
+        self.assertIn("client disconnected", err.getvalue())
+        with self.assertRaises(socket.timeout):
+            self.server.recv(2048)   # nothing was sent on the channel
+
+    def test_the_gate_subrequest_is_not_logged(self) -> None:
+        """session-verify fires once per gated request — it would double the
+        channel with a userless, loopback line per request (BM-4 review)."""
+        self.handler.path = "/_lemonseed/session-verify"
+        self.handler.log_request(200, "0")
+        with self.assertRaises(socket.timeout):
+            self.server.recv(2048)   # nothing was sent on the channel
+
+    def test_a_missing_journald_socket_drops_the_line(self) -> None:
+        for handler, _ in self._originals:
+            handler.socket_path = Path("/nonexistent/journal.sock")
+        self.handler.log_request(200, "1")   # no exception: a line is never fatal
+
+
+class ClientScriptSyntaxTests(unittest.TestCase):
+    """Every page script must parse, or the panel it belongs to is dead.
+
+    Nothing else in this suite executes most of the page scripts, so a stray brace
+    in a control panel file would otherwise reach a bare-metal test cycle to be
+    found — and in a browser a syntax error is a quiet one: the page looks loaded
+    and nothing works. ``node --check`` parses without running, needs no DOM, and
+    costs milliseconds. Node is a dev-box dependency, so this skips without it.
+    """
+
+    def test_every_page_script_parses(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is required to parse the page scripts")
+        # Scanned rather than listed, so a new script cannot be left out of the rule.
+        scripts = {name: value for name, value in vars(stub).items()
+                   if name.endswith("_JS") and isinstance(value, str)}
+        self.assertGreater(len(scripts), 6, "the page-script scan matched nothing")
+        broken: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, source in sorted(scripts.items()):
+                path = Path(tmp) / (name + ".js")
+                path.write_text(source, encoding="utf-8")
+                proc = subprocess.run([node, "--check", str(path)],
+                                      capture_output=True, text=True, timeout=60, check=False)
+                if proc.returncode != 0:
+                    tail = [line for line in proc.stderr.splitlines() if "SyntaxError" in line]
+                    broken.append(f"{name}: {tail or proc.stderr.strip()[:200]}")
+        self.assertEqual(broken, [], "these page scripts will not parse in a browser")
 
 
 class SharedThemeTests(unittest.TestCase):

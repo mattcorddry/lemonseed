@@ -342,7 +342,9 @@ class DriftOverlayTests(unittest.TestCase):
         self.assertEqual(models["own_ids"], ["lemonseed-ai", "lemonseed-ai-filtered"])
         self.assertEqual(models["reserved_name_regex"], "^Lemonseed.*$")
         self.assertEqual(entity_named(self.view, "users")["scope"],
-                         ["membership", "is_admin"])
+                         # D-18: a CP-side rename now converges, so name is a
+                         # managed attribute as well as membership and role.
+                         ["membership", "is_admin", "name"])
 
     def test_policy_summary_is_carried_and_zero_filled(self) -> None:
         policy = self.view["policy"]
@@ -405,12 +407,13 @@ class GuardViewTests(unittest.TestCase):
         view = owui_portal.build_view(real_manifest(), status_with([]), EXPORT)
         self.assertTrue(view["guards"])
         enforced = {g["key"] for g in view["guards"] if g["enforced"]}
-        self.assertEqual(len(enforced), 5)
-        self.assertEqual({g["key"] for g in view["guards"] if not g["enforced"]},
-                         {"POST /api/v1/auths/add", "DELETE /api/v1/users/.*"})
+        # D-17b is complete as of M7 P3: create, edit and delete are all refused,
+        # so the Open WebUI user panel is read-only and no guard is advisory.
+        self.assertEqual(len(enforced), 7)
+        self.assertEqual({g["key"] for g in view["guards"] if not g["enforced"]}, set())
         # guard_state=None means "manifest intent is the best answer we have".
         self.assertEqual(view["guard_summary"]["source"], "manifest")
-        self.assertEqual(view["guard_summary"]["enforced"], 5)
+        self.assertEqual(view["guard_summary"]["enforced"], 7)
         self.assertEqual(view["guard_summary"]["total"], 7)
 
     def test_enforce_mode_shows_as_blocked(self) -> None:

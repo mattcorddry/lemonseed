@@ -16,7 +16,11 @@ from typing import Any
 
 ProgressFn = Callable[..., None]
 
-IMAGE_BASE_DEFAULT = "https://lemonseed.ai/releases/stable/"
+# Internal-network channel only. `lemonseed.ai` sits behind Cloudflare, which
+# forbids serving large objects through its proxy, so a ~3 GB root.squashfs
+# cannot be distributed from there; `test.lemonseed.ai` is the origin record.
+# M8 replaces this whole channel with GitHub releases.
+IMAGE_BASE_DEFAULT = "http://test.lemonseed.ai/releases/stable/"
 USER_AGENT = "lemonseed/0.1"
 
 

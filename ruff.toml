@@ -2,7 +2,7 @@
 #
 # Ruff is **not** an appliance dependency: `make lint` runs it from nixpkgs
 # (`nix run nixpkgs#ruff`). The control-plane interpreter on the box stays
-# stdlib + psycopg2/bcrypt/requests/lemonade-sdk; see
+# stdlib + psycopg2/requests/lemonade-sdk; see
 # nixos/modules/control-plane.nix. Nothing in the Nix build reads this file.
 #
 # Rule selection is deliberate. We enforce rules that catch real defects

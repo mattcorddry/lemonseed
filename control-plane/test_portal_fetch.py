@@ -356,12 +356,16 @@ class PortalCallSiteTests(unittest.TestCase):
         # page_setup: pre-auth, and /api/boot is open by design. Sending it
         # through portalFetch would bounce a 401 to /login on the setup page.
         "/api/boot",
-        # page_login: a failed sign-in IS a 401, so portalFetch would reload the
-        # login page forever.
-        "/login",
         # reachability probe: retrying and auth-navigating would hide the very
         # failure it exists to detect.
         "/_app/version.json",
+        # M7 P2 SRP phases, called from page_login's own pre-auth wrapper. A
+        # failed challenge or verify is a 401 by construction, and portalFetch
+        # would bounce the user to /login mid-handshake — discarding the pending
+        # state and looping. `/login` itself is gone from this list: nothing
+        # fetches it now that POST /login is a 405.
+        "/_lemonseed/api/srp/challenge",
+        "/_lemonseed/api/srp/verify",
     }
     # The one call inside portalFetch itself.
     IMPLEMENTATION_CALLS = 1
@@ -382,23 +386,63 @@ class PortalCallSiteTests(unittest.TestCase):
             pages = {
                 "shell": stub.page_shell(dict(snap), view="settings").decode(),
                 "settings": stub.page_settings_content(dict(snap)).decode(),
+                # My Profile is signed-in too, so it owes the same contract.
+                "profile": stub.page_profile(dict(snap)).decode(),
             }
         with (
             mock.patch.object(stub, "brand_head_links", return_value=""),
-            mock.patch.object(stub, "load_setup", return_value={"mdns_name": "lemon-test"}),
             mock.patch.object(stub.auth, "admin_bootstrap_required", return_value=False),
             mock.patch.object(stub.auth, "reset_marker_present", return_value=True),
         ):
             pages["setup"] = stub.page_setup(dict(snap)).decode()
+        with (
+            mock.patch.object(stub, "brand_head_links", return_value=""),
+            mock.patch.object(stub.auth, "admin_bootstrap_required", return_value=False),
+            mock.patch.object(stub.auth, "reset_marker_present", return_value=False),
+        ):
+            # The login page was the one pre-auth surface this test never
+            # rendered, which is how its hand-written password POST stayed
+            # invisible for a whole milestone. It is scanned now.
+            pages["login"] = stub.page_login(rd="/").decode()
         return pages
+
+    # Pages that authenticate, and therefore cannot use portalFetch at all: a
+    # 401 from them is the expected answer, not a session to renew. Each gets its
+    # own raw-fetch wrapper and an exact budget, asserted here so a third call
+    # from a pre-auth page is a decision someone has to defend.
+    PRE_AUTH_PAGES = {
+        # page_setup polls the open boot endpoint; page_login has one `post()`
+        # helper shared by every phase it drives.
+        "setup": {"sites": 1, "endpoints": ("/api/boot",)},
+        "login": {
+            "sites": 1,
+            # The rotate call belongs here too: a forced rotation (D-11) runs
+            # from this page before the signer holds any cookie, so it is
+            # pre-auth by construction and must not go through portalFetch.
+            "endpoints": (
+                "/_lemonseed/api/srp/challenge",
+                "/_lemonseed/api/srp/verify",
+                "/_lemonseed/api/srp/rotate",
+            ),
+        },
+    }
 
     def test_every_other_call_goes_through_portal_fetch(self) -> None:
         offenders: list[str] = []
         for page, html in self._pages().items():
             raw = html.count("await fetch(")
-            if page == "setup":
-                # Pre-auth surface: allowed exactly the one boot poll.
-                self.assertEqual(raw, 1, f"{page}: expected only the /api/boot poll")
+            if page in self.PRE_AUTH_PAGES:
+                budget = self.PRE_AUTH_PAGES[page]
+                if raw != budget["sites"]:
+                    offenders.append(
+                        f"{page}: {raw} raw fetch() sites, expected exactly "
+                        f"{budget['sites']} in its own pre-auth wrapper"
+                    )
+                # Every endpoint a pre-auth page may reach is open by design.
+                for path in budget["endpoints"]:
+                    self.assertIn(path, html, f"{page} lost its call to {path}")
+                for path in ("/api/status", "/api/system", "/api/modules"):
+                    self.assertNotIn(path, html, f"{page} polls a gated endpoint")
                 continue
             allowed = sum(html.count(f"fetch('{path}") for path in self.ALLOWED_RAW_FETCH)
             if raw - self.IMPLEMENTATION_CALLS > allowed:

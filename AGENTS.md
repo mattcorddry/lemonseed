@@ -67,6 +67,8 @@ This is the **Tier A** gate (no root, no hypervisor): update/artifacts tests, ge
 ```bash
 make build-qemu          # if artifacts missing or Nix inputs changed
 QEMU_API_TIMEOUT=1200 make test-qemu
+
+make build-production    # catch build-production breakage before the user does
 ```
 
 Notes:
@@ -75,6 +77,7 @@ Notes:
 - Without `/dev/kvm` access the guest runs under TCG and is slow — raise `QEMU_API_TIMEOUT` (e.g. `1200`) rather than declaring failure early.
 - The **appliance-qemu** profile preloads pinned Postgres and Valkey at boot and loads Open WebUI from a host virtio-fs export during `make test-qemu` (`nixos/modules/qemu-docker-cache.nix`) so smoke tests do not depend on registry pulls inside the VM.
 - If QEMU fails, iterate (fix → rebuild → re-test) until green or escalate with logs (`out/qemu-api-smoke.log`).
+- When you run `make build-production` inform the user so they don't do it again
 
 ### 4. Optional / on request
 

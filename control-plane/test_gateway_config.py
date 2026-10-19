@@ -372,5 +372,107 @@ class ThemeSurfaceTests(unittest.TestCase):
         self.assertIn("must-revalidate", body)
 
 
+class CpRouteExposureTests(unittest.TestCase):
+    """Every route the control plane serves must have a gateway location (M7 P3).
+
+    The gateway's catch-all proxies to Open WebUI, so a CP route with no nginx
+    location does not fail loudly: it answers 404 *from the wrong service*, which
+    reads to whoever is debugging as "the feature is broken" rather than "the
+    route was never exposed". The route list is scraped from ``stub.py`` so this
+    stays honest as routes are added.
+    """
+
+    STUB = CP / "stub.py"
+
+    # (route -> gates it must carry). Empty means it must stay reachable
+    # *before* sign-in, which is true of the SRP handshake and of rotation, so
+    # a forced password change works when the caller has no cookie (D-11).
+    MANAGED = {
+        "/_lemonseed/api/srp/challenge": (),
+        "/_lemonseed/api/srp/verify": (),
+        "/_lemonseed/api/srp/rotate": (),
+        "/_lemonseed/api/profile": ("authGate",),
+        "/_lemonseed/api/users": ("authGate", "adminGate"),
+        "/_lemonseed/api/users/": ("authGate", "adminGate"),
+        "/_lemonseed/api/groups/": ("authGate", "adminGate"),
+        "/_lemonseed/api/audit": ("authGate", "adminGate"),
+        # Stopping the appliance is the most disruptive thing the portal can do,
+        # so it is admin-gated at the edge too rather than only in the CP.
+        "/_lemonseed/api/power": ("authGate", "adminGate"),
+        # The update affordance (P5): the snapshot, *Check now*, and the install
+        # job that reboots the appliance when it finishes (D4).
+        "/_lemonseed/api/update": ("authGate", "adminGate"),
+        "/_lemonseed/api/update/check": ("authGate", "adminGate"),
+        # /profile/ is the one *page* here. Pages are as easy to forget as APIs,
+        # and forgetting this one would strand every non-admin: with no location
+        # the catch-all hands it to Open WebUI, which answers 404.
+        "/profile/": ("authGate",),
+    }
+
+    def setUp(self) -> None:
+        self.text = GATEWAY.read_text(encoding="utf-8")
+        self.locations = [
+            line.strip().split('"')[1]
+            for line in self.text.splitlines()
+            if line.strip().startswith('locations."')
+        ]
+        self.assertGreater(len(self.locations), 20, "location scan matched nothing")
+
+    def _cp_routes(self) -> list[str]:
+        stub = self.STUB.read_text(encoding="utf-8")
+        exact = re.findall(r'path == "(/_lemonseed[^"]+)"', stub)
+        prefix = re.findall(r'path\.startswith\("(/_lemonseed[^"]+)"\)', stub)
+        # Page routes too, or the test proves less than it claims: ``/profile/``
+        # arrived later than the API routes and would otherwise be invisible here.
+        # ``(x, y) in`` is the CP's own membership form, so it is scanned for it.
+        tuples = re.findall(r'path in \(([^)]*"/[^"]+"[^)]*)\)', stub)
+        pages = [p for group in tuples for p in re.findall(r'"(/[^"]+)"', group)]
+        routes = sorted(set(exact + prefix + pages))
+        self.assertTrue(exact and prefix, "route scan matched nothing in stub.py")
+        self.assertIn("/profile/", routes, "the page-route scan stopped matching")
+        return routes
+
+    def _serves(self, route: str) -> bool:
+        for name in self.locations:
+            if name == "/":
+                continue  # the catch-all goes to Open WebUI, so it proves nothing
+            if name == f"= {route}" or (not name.startswith("= ") and route.startswith(name)):
+                return True
+        return False
+
+    def test_every_control_plane_route_has_a_gateway_location(self) -> None:
+        unexplained = [route for route in self._cp_routes() if not self._serves(route)]
+        self.assertEqual(unexplained, [], f"nginx will not proxy these CP routes: {unexplained}")
+
+    def test_identity_routes_carry_their_gate_and_their_fallback(self) -> None:
+        for route, gates in self.MANAGED.items():
+            name = route if route.endswith("/") else f"= {route}"
+            with self.subTest(route=route):
+                body = _nix_location(self.text, name)
+                for gate in gates:
+                    self.assertIn(gate, body)
+                if not gates:
+                    self.assertNotIn("authGate", body)
+                self.assertIn(FIVE_XX + " /_lemonseed/cp-down;", body)
+
+
+class NginxLogTests(unittest.TestCase):
+    """nginx's own logs: errors and access go to journald, never to files —
+    and the proxy-headers hash is sized for the identity gate, so the
+    compiled default /var/log/nginx/error.log never fills with parse
+    warnings (BM-3 review)."""
+
+    def setUp(self) -> None:
+        self.text = GATEWAY.read_text(encoding="utf-8")
+
+    def test_errors_and_access_go_to_journald(self) -> None:
+        self.assertIn('logError = "stderr";', self.text)
+        self.assertIn("access_log syslog:server=unix:/dev/log", self.text)
+
+    def test_the_proxy_headers_hash_is_sized_for_the_gate(self) -> None:
+        self.assertIn("proxy_headers_hash_max_size 1024;", self.text)
+        self.assertIn("proxy_headers_hash_bucket_size 128;", self.text)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -19,7 +19,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from disks import list_candidate_disks, pick_default
-from install import InstallError, image_base_url, run_install
+from install import InstallError, attach_admin_rosters, image_base_url, run_install
 from preflight import MIN_DISK_BYTES, evaluate_host
 
 HOST = os.environ.get("LEMONSEED_INSTALLER_HOST", "0.0.0.0")
@@ -28,6 +28,9 @@ IMAGE_BASE = image_base_url()
 STATIC = Path(__file__).resolve().parent / "static"
 
 _lock = threading.Lock()
+# Reading the admin roster means mounting the target's user-data, so probes are
+# serialized: two concurrent /api/disks calls would fight over one mount point.
+_disk_probe_lock = threading.Lock()
 _state: dict[str, Any] = {
     "role": "installer",
     "phase": "idle",
@@ -139,6 +142,30 @@ def request_reboot() -> tuple[int, dict[str, Any]]:
     return 200, {"ok": True, "message": "Rebooting"}
 
 
+# The sentence the reset checkbox carried before it knew the roster: written for
+# the one-admin household, and still the honest fallback when we have no names.
+RESET_ADMIN_LINE = (
+    "Ask for a new admin account after reinstall. Other users and their data are kept."
+)
+
+
+def reset_admin_copy(admin_usernames: list[str] | None) -> str:
+    """The line under the "Reset admin credentials" checkbox (D-28).
+
+    Two or more admins must be named: a checkbox that quietly resets several
+    accounts is not informed consent. One admin is the case the existing
+    sentence was written for, and a box with no roster file gets the same
+    wording, because a count we did not actually read is worse than none.
+    """
+    admins = [name for name in (admin_usernames or []) if name]
+    if len(admins) >= 2:
+        return (
+            f"Removes admin access from {len(admins)} accounts: "
+            f"{', '.join(admins)}. Their chats and files are kept."
+        )
+    return RESET_ADMIN_LINE
+
+
 INDEX_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -175,7 +202,7 @@ INDEX_HTML = """<!DOCTYPE html>
             <input id="reset-admin" type="checkbox" />
             <span>
               <strong>Reset admin credentials</strong>
-              <small>Ask for a new admin account after reinstall. Other users and their data are kept.</small>
+              <small id="reset-admin-copy">Ask for a new admin account after reinstall. Other users and their data are kept.</small>
             </span>
           </span>
         </span>
@@ -231,7 +258,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, INDEX_HTML.encode(), "text/html; charset=utf-8")
             return
         if path == "/api/disks":
-            disks = list_candidate_disks()
+            # admin_usernames/reset_admin_copy ride along so the row can name
+            # the accounts a reset would touch (D-28). Probing mounts the
+            # target's user-data, so it happens under a lock.
+            with _disk_probe_lock:
+                disks = attach_admin_rosters(list_candidate_disks())
+            for d in disks:
+                d["reset_admin_copy"] = reset_admin_copy(d.get("admin_usernames"))
             host = evaluate_host()
             self._json(
                 200,

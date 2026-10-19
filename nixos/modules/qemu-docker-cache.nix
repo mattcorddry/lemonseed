@@ -67,9 +67,15 @@ in
   systemd.services.lemonseed-qemu-docker-load-data = {
     description = "Load pre-fetched Postgres + Valkey images (QEMU smoke profile)";
     wantedBy = [ "multi-user.target" ];
+    # The control plane provisions the data plane from a background thread, so it
+    # has to be ordered behind the pre-load as well: on a cold disk it used to win
+    # the race, pull both images from the registry by digest, and hand the *-start
+    # units a digest reference — the exact boot-path pull this profile exists to
+    # rule out (and what the QEMU smoke test asserts against).
     before = [
       "lemonseed-postgres.service"
       "lemonseed-valkey.service"
+      "appliance-control-plane.service"
     ];
     after = [ "docker.service" ];
     requires = [ "docker.service" ];

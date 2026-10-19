@@ -3,20 +3,25 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Optional
 from unittest import mock
 
 CP = Path(__file__).resolve().parent
 sys.path.insert(0, str(CP))
 
+import audit  # noqa: E402
 import auth  # noqa: E402
 import data_services  # noqa: E402
 import db  # noqa: E402
 import sessions  # noqa: E402
+import srp  # noqa: E402
 
 
 def _conn_with_cur():
@@ -65,6 +70,8 @@ class AuthGateSnippetTests(unittest.TestCase):
         self._patches = [
             mock.patch.object(auth, "GATE_CONF", root / "auth-gate.conf"),
             mock.patch.object(auth, "ADMIN_CONF", root / "auth-admin.conf"),
+            mock.patch.object(auth, "GATE_PERSIST", root / "auth-gate-persist.conf"),
+            mock.patch.object(auth, "ADMIN_PERSIST", root / "auth-admin-persist.conf"),
         ]
         for patch in self._patches:
             patch.start()
@@ -91,10 +98,16 @@ class AuthGateSnippetTests(unittest.TestCase):
         # Admin group check is enforced by the CP (X-Forwarded-Groups), not
         # nginx `if` (which runs in the rewrite phase, before auth_request).
         self.assertEqual(auth.ADMIN_CONF.read_text(), "")
+        # The persistent copies the boot seeder restores (bare-metal review:
+        # an empty-seeded gate left the edge open until Postgres was up).
+        self.assertEqual(auth.GATE_PERSIST.read_text(), auth.GATE_CONF.read_text())
+        self.assertEqual(auth.ADMIN_PERSIST.read_text(), auth.ADMIN_CONF.read_text())
 
         auth.write_gate(False)
         self.assertEqual(auth.GATE_CONF.read_text(), "")
         self.assertEqual(auth.ADMIN_CONF.read_text(), "")
+        self.assertEqual(auth.GATE_PERSIST.read_text(), "")
+        self.assertEqual(auth.ADMIN_PERSIST.read_text(), "")
 
 
 class AuthAdminStateTests(unittest.TestCase):
@@ -394,7 +407,13 @@ class SessionGenerationDbTests(unittest.TestCase):
             self.assertFalse(auth.revoke_sessions("nobody"))
 
 
-class VerifyCredentialsTests(unittest.TestCase):
+class SrpLoadUserTests(unittest.TestCase):
+    """``srp_load_user`` replaced ``verify_credentials``.
+
+    It loads state; it does not authenticate. Nothing here takes a password,
+    because there is no function left in ``auth`` that does.
+    """
+
     def setUp(self) -> None:
         self._patches = [
             mock.patch.object(db, "postgres_admin_dsn", return_value="postgresql://u:p@127.0.0.1/postgres"),
@@ -409,42 +428,80 @@ class VerifyCredentialsTests(unittest.TestCase):
 
     def test_pg_down_returns_none(self) -> None:
         with mock.patch.object(db, "pg_isready", return_value=False):
-            self.assertIsNone(auth.verify_credentials("matt", "password1"))
+            self.assertIsNone(auth.srp_load_user("matt"))
 
-    def test_valid_credentials(self) -> None:
+    def test_enrolled_row_exposes_the_verifier_and_groups(self) -> None:
         conn, cur = _conn_with_cur()
-        # First query (user) returns one row; second (groups) returns rows.
-        cur.fetchone.return_value = ("matt", "Matt", "matt@example.com", "$2b$12$hash", False)
+        cur.fetchone.return_value = (
+            "matt", "Matt", "matt@example.com", "ab" * 16, "deadbeef", False, False,
+        )
         cur.fetchall.return_value = [("admin",), ("users",)]
-        with mock.patch.object(db, "cp_connect", return_value=conn), \
-             mock.patch("bcrypt.checkpw", return_value=True):
-            user = auth.verify_credentials("matt", "password1")
+        with mock.patch.object(db, "cp_connect", return_value=conn):
+            user = auth.srp_load_user("matt")
         self.assertEqual(user["username"], "matt")
         self.assertEqual(user["groups"], ["admin", "users"])
+        self.assertEqual(user["srp_verifier"], "deadbeef")
+        self.assertEqual(user["srp_salt"], "ab" * 16)
+        self.assertFalse(user["password_reset_required"])
 
     def test_unknown_user_returns_none(self) -> None:
         conn, cur = _conn_with_cur()
         cur.fetchone.return_value = None
         with mock.patch.object(db, "cp_connect", return_value=conn):
-            self.assertIsNone(auth.verify_credentials("ghost", "password1"))
+            self.assertIsNone(auth.srp_load_user("ghost"))
 
     def test_disabled_user_returns_none(self) -> None:
         conn, cur = _conn_with_cur()
-        cur.fetchone.return_value = ("matt", "Matt", "", "$2b$12$hash", True)
+        cur.fetchone.return_value = (
+            "matt", "Matt", "", "ab" * 16, "deadbeef", True, False,
+        )
         with mock.patch.object(db, "cp_connect", return_value=conn):
-            self.assertIsNone(auth.verify_credentials("matt", "password1"))
+            self.assertIsNone(auth.srp_load_user("matt"))
 
-    def test_wrong_password_returns_none(self) -> None:
+    def test_unenrolled_row_is_distinguishable_by_an_empty_verifier(self) -> None:
+        """A row exists but cannot sign in; the caller must be able to tell."""
         conn, cur = _conn_with_cur()
-        cur.fetchone.return_value = ("matt", "Matt", "", "$2b$12$hash", False)
+        cur.fetchone.return_value = ("matt", "Matt", "", None, None, False, False)
         cur.fetchall.return_value = []
-        with mock.patch.object(db, "cp_connect", return_value=conn), \
-             mock.patch("bcrypt.checkpw", return_value=False):
-            self.assertIsNone(auth.verify_credentials("matt", "wrong"))
+        with mock.patch.object(db, "cp_connect", return_value=conn):
+            user = auth.srp_load_user("matt")
+        self.assertIsNotNone(user)
+        self.assertEqual(user["srp_verifier"], "")
+        self.assertEqual(user["srp_salt"], "")
+
+    def test_reset_flag_is_carried_for_the_verify_phase(self) -> None:
+        """D-11: only the handshake row can say "rotate before you get a session".
+
+        If the flag were absent, verify would mint a session for an account still
+        sitting on a one-time password, which is the half-authenticated state the
+        decision exists to avoid.
+        """
+        conn, cur = _conn_with_cur()
+        cur.fetchone.return_value = (
+            "matt", "Matt", "", "ab" * 16, "deadbeef", False, True,
+        )
+        cur.fetchall.return_value = [("users",)]
+        with mock.patch.object(db, "cp_connect", return_value=conn):
+            user = auth.srp_load_user("matt")
+        self.assertTrue(user["password_reset_required"])
 
     def test_db_error_returns_none(self) -> None:
         with mock.patch.object(db, "cp_connect", side_effect=RuntimeError("down")):
-            self.assertIsNone(auth.verify_credentials("matt", "password1"))
+            self.assertIsNone(auth.srp_load_user("matt"))
+
+    def test_no_password_column_is_read(self) -> None:
+        """The query must not select ``password_hash`` any more.
+
+        It is vestigial, and a code path that still reads it is a code path one
+        refactor away from becoming a plaintext comparison again.
+        """
+        conn, cur = _conn_with_cur()
+        cur.fetchone.return_value = None
+        with mock.patch.object(db, "cp_connect", return_value=conn):
+            auth.srp_load_user("matt")
+        sql = cur.execute.call_args_list[0].args[0]
+        self.assertNotIn("password_hash", sql)
+        self.assertIn("srp_verifier", sql)
 
 
 class RateLimitTests(unittest.TestCase):
@@ -479,6 +536,188 @@ class RateLimitTests(unittest.TestCase):
             auth.rate_limit_record_failure("1.2.3.4")
         self.assertFalse(auth.rate_limit_check("1.2.3.4"))
         self.assertTrue(auth.rate_limit_check("5.6.7.8"))
+
+
+class _FakeValkey:
+    """Enough of the client for the rate limiter: exists/get/set/delete/pipeline."""
+
+    def __init__(self) -> None:
+        self.store: dict[str, object] = {}
+        self.ttls: dict[str, int] = {}
+        self.calls: list[tuple] = []
+        self.fail = False
+
+    def _check(self) -> None:
+        if self.fail:
+            raise RuntimeError("valkey is down")
+
+    def exists(self, key: str) -> int:
+        self._check()
+        self.calls.append(("exists", key))
+        return 1 if key in self.store else 0
+
+    def get(self, key: str):
+        self._check()
+        return self.store.get(key)
+
+    def set(self, key: str, value: object, ex: Optional[int] = None) -> bool:
+        self._check()
+        self.calls.append(("set", key, ex))
+        self.store[key] = value
+        if ex is not None:
+            self.ttls[key] = ex
+        return True
+
+    def delete(self, *keys: str) -> int:
+        self._check()
+        self.calls.append(("delete",) + keys)
+        removed = 0
+        for key in keys:
+            if self.store.pop(key, None) is not None:
+                removed += 1
+            self.ttls.pop(key, None)
+        return removed
+
+    def pipeline(self, transaction: bool = True):
+        return _FakePipeline(self, transaction)
+
+
+class _FakePipeline:
+    def __init__(self, client: _FakeValkey, transaction: bool) -> None:
+        self.client = client
+        self.transaction = transaction
+        self.ops: list[tuple] = []
+
+    def incr(self, key: str) -> None:
+        self.ops.append(("incr", key))
+
+    def expire(self, key: str, seconds: int) -> None:
+        self.ops.append(("expire", key, seconds))
+
+    def execute(self) -> list[object]:
+        results: list[object] = []
+        for op in self.ops:
+            if op[0] == "incr":
+                self.client.store[op[1]] = int(self.client.store.get(op[1], 0)) + 1
+                self.client.calls.append(("incr", op[1]))
+                results.append(self.client.store[op[1]])
+            elif op[0] == "expire":
+                self.client.ttls[op[1]] = op[2]
+                self.client.calls.append(("expire", op[1], op[2]))
+                results.append(True)
+        self.ops = []
+        return results
+
+
+class RateLimitValkeyTests(unittest.TestCase):
+    """The lockout must outlive a control-plane restart (M7 P2).
+
+    This is the reason for the move off process dicts: an A/B update restarts the
+    CP, which used to wipe every lockout and hand an attacker a fresh budget.
+    """
+
+    IP = "192.0.2.7"
+
+    def setUp(self) -> None:
+        auth._rate_failures.clear()
+        auth._rate_lockouts.clear()
+        self.valkey = _FakeValkey()
+        patch = mock.patch.object(sessions, "client", return_value=self.valkey)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(self._clear)
+
+    def _clear(self) -> None:
+        auth._rate_failures.clear()
+        auth._rate_lockouts.clear()
+
+    def _fail_to_lockout(self) -> None:
+        for _ in range(auth.RATE_LIMIT_MAX_FAILURES):
+            auth.rate_limit_record_failure(self.IP)
+
+    def test_failures_are_counted_in_valkey(self) -> None:
+        auth.rate_limit_record_failure(self.IP)
+        self.assertIn(self._failures_key(), self.valkey.store)
+
+    def _failures_key(self) -> str:
+        return f"{auth.RATE_LIMIT_KEY_PREFIX}:f:{self.IP}"
+
+    def _lockout_key(self) -> str:
+        return f"{auth.RATE_LIMIT_KEY_PREFIX}:l:{self.IP}"
+
+    def test_lockout_lands_in_valkey_with_a_ttl(self) -> None:
+        self._fail_to_lockout()
+        self.assertIn(self._lockout_key(), self.valkey.store)
+        self.assertEqual(self.valkey.ttls[self._lockout_key()], auth.RATE_LIMIT_LOCKOUT_SECONDS)
+
+    def test_lockout_survives_a_control_plane_restart(self) -> None:
+        """The regression this whole change exists to fix.
+
+        Simulated by clearing the process dicts, which is exactly what a restart
+        does. The lockout must still be in force.
+        """
+        self._fail_to_lockout()
+        self.assertFalse(auth.rate_limit_check(self.IP))
+        auth._rate_failures.clear()
+        auth._rate_lockouts.clear()
+        self.assertFalse(auth.rate_limit_check(self.IP))
+
+    def test_the_counter_key_always_gets_a_ttl(self) -> None:
+        """A counter with no TTL is a permanent lockout waiting to happen."""
+        auth.rate_limit_record_failure(self.IP)
+        expires = [c for c in self.valkey.calls if c[0] == "expire" and c[1] == self._failures_key()]
+        self.assertTrue(expires, "INCR was not paired with EXPIRE")
+        self.assertEqual(expires[0][2], auth.RATE_LIMIT_WINDOW_SECONDS)
+
+    def test_increment_and_expire_share_one_pipeline(self) -> None:
+        """Split across two round trips, a crash between them leaks a key forever."""
+        calls: list[str] = []
+        original = self.valkey.pipeline
+
+        def spy(*a, **kw):
+            calls.append("pipeline")
+            return original(*a, **kw)
+
+        self.valkey.pipeline = spy  # type: ignore[method-assign]
+        auth.rate_limit_record_failure(self.IP)
+        self.assertEqual(calls, ["pipeline"])
+        # INCR and EXPIRE both went through it, not as separate client calls.
+        incr_at = [i for i, c in enumerate(self.valkey.calls) if c[0] == "incr"]
+        expire_at = [i for i, c in enumerate(self.valkey.calls) if c[0] == "expire"]
+        self.assertEqual(len(incr_at), 1)
+        self.assertEqual(len(expire_at), 1)
+
+    def test_success_clears_both_keys(self) -> None:
+        self._fail_to_lockout()
+        auth.rate_limit_reset(self.IP)
+        self.assertNotIn(self._failures_key(), self.valkey.store)
+        self.assertNotIn(self._lockout_key(), self.valkey.store)
+        self.assertTrue(auth.rate_limit_check(self.IP))
+
+    def test_allows_when_valkey_is_absent(self) -> None:
+        """Failure direction is allow.
+
+        Inverse of the session store on purpose: a session store we cannot read
+        must not serve authenticated pages, but a counter we cannot read must not
+        lock a household out of their own appliance.
+        """
+        self.valkey.fail = True
+        self.assertTrue(auth.rate_limit_check(self.IP))
+        # And a failed write must not raise into the sign-in path.
+        auth.rate_limit_record_failure(self.IP)
+        auth.rate_limit_reset(self.IP)
+
+    def test_falls_back_to_the_local_dicts_when_valkey_is_absent(self) -> None:
+        """With no Valkey the throttle still works in-process."""
+        self.valkey.fail = True
+        for _ in range(auth.RATE_LIMIT_MAX_FAILURES):
+            auth.rate_limit_record_failure(self.IP)
+        self.assertFalse(auth.rate_limit_check(self.IP))
+
+    def test_lockout_locks_only_the_offending_ip(self) -> None:
+        self._fail_to_lockout()
+        self.assertFalse(auth.rate_limit_check(self.IP))
+        self.assertTrue(auth.rate_limit_check("198.51.100.9"))
 
 
 class AuthStatusTests(unittest.TestCase):
@@ -526,13 +765,25 @@ class AuthCreateAdminTests(unittest.TestCase):
         self.gate = root / "auth-gate.conf"
         self.admin_conf = root / "auth-admin.conf"
         self.marker = root / "reset-admin"
+        self.conn, self.cur = _conn_with_cur()
         self._patches = [
             mock.patch.object(auth, "SESSION_SECRET_FILE", root / "session-secret"),
             mock.patch.object(auth, "GATE_CONF", self.gate),
             mock.patch.object(auth, "ADMIN_CONF", self.admin_conf),
+            mock.patch.object(auth, "GATE_PERSIST", root / "auth-gate-persist.conf"),
+            mock.patch.object(auth, "ADMIN_PERSIST", root / "auth-admin-persist.conf"),
             mock.patch.object(auth, "RESET_MARKER_FILE", self.marker),
-            mock.patch.object(auth, "hash_password", return_value="$2y$12$testhash"),
+            mock.patch.object(auth, "ADMINS_FILE", root / "admins.json"),
             mock.patch.object(auth, "reload_nginx"),
+            # The roster is D-28's installer affordance; AuthAdminRosterTests owns it.
+            mock.patch.object(auth, "publish_admin_roster"),
+            # Audit rows are asserted as calls here; test_audit.py covers their SQL.
+            mock.patch.object(audit, "record"),
+            # create_admin writes in one transaction (D-6), so it asks for
+            # cp_transaction, not cp_connect. The fake conn is the same shape.
+            mock.patch.object(
+                db, "cp_transaction", lambda: contextlib.nullcontext(self.conn)
+            ),
             mock.patch.object(auth, "PG_WAIT_SECONDS", 0),
             mock.patch.object(db, "postgres_admin_dsn", return_value="postgresql://u:p@127.0.0.1/postgres"),
             mock.patch.object(db, "pg_isready", return_value=True),
@@ -546,34 +797,137 @@ class AuthCreateAdminTests(unittest.TestCase):
             patch.stop()
         self._tmp.cleanup()
 
-    def test_rejects_invalid_username(self) -> None:
-        for bad in ("", "Matt", "1bad", "a" * 65, "has space"):
-            with self.assertRaises(ValueError, msg=repr(bad)):
-                auth.create_admin(bad, "longenough")
+    @staticmethod
+    def _enrollment(username: str = "admin", password: str = "longenough") -> tuple[str, str]:
+        """A real browser-produced pair, so the validation path is exercised."""
+        salt, verifier = srp.make_enrollment(srp.SERVER_GROUP, username, password)
+        return salt.hex(), f"{verifier:x}"
 
-    def test_rejects_short_password(self) -> None:
+    def test_rejects_invalid_username(self) -> None:
+        salt, verifier = self._enrollment()
+        bad = (
+            "", "1bad", "a" * 17, "a" * 65, "has space", "-lead", "_lead",
+            "dot.", "dash-", "..", ".", "a",
+            # Reserved rather than malformed; the message must say so (D-33).
+            "root", "nobody", "nginx", "postgres", "lemonseed-cp", "lemonseed-lemond",
+            "systemd-network", "_systemd-disk", "dhcp4",
+        )
+        for value in bad:
+            with self.subTest(username=value or "<empty>"), self.assertRaises(ValueError, msg=repr(value)):
+                auth.create_admin(value, salt, verifier)
+
+    def _statements(self) -> list[str]:
+        return [call.args[0] for call in self.cur.execute.call_args_list]
+
+    def _upsert_statement(self) -> str:
+        for call in self.cur.execute.call_args_list:
+            if "INSERT INTO users" in call.args[0]:
+                return call.args[0]
+        self.fail("create_admin wrote no user row")
+        return ""
+
+    def _upsert_params(self) -> tuple:
+        """Params of the ``INSERT INTO users`` statement, wherever it sits.
+
+        Located by content rather than by index on purpose: the statement count
+        is asserted once in test_happy_path_first_admin, and every other test
+        here should keep passing when an unrelated statement is added.
+        """
+        for call in self.cur.execute.call_args_list:
+            if "INSERT INTO users" in call.args[0]:
+                return call.args[1]
+        self.fail("create_admin wrote no user row")
+
+    def test_username_is_normalised_not_rejected(self) -> None:
+        """``Matt`` is ``matt`` (D-33), and the row stored is the lower-cased one.
+
+        Refusing mixed case would be the friendlier-looking bug: the same person
+        typing their name the way it is written would be told their own account
+        does not exist. Normalising is only safe because the *stored* form is the
+        normalised one on every path, including the SRP identity string.
+        """
+        salt, verifier = self._enrollment("matt")
+        result = auth.create_admin("  Matt  ", salt, verifier)
+        self.assertEqual(result["username"], "matt")
+        self.assertEqual(self._upsert_params()[0], "matt")
+
+    def test_display_name_is_stored_not_the_username(self) -> None:
+        """D-25: the setup form's name field reaches ``display_name``."""
+        salt, verifier = self._enrollment()
+        auth.create_admin("admin", salt, verifier, display_name="   Matt D.   ")
+        self.assertEqual(self._upsert_params()[1], "Matt D.")
+
+    def test_display_name_defaults_to_the_username(self) -> None:
+        """No name field on a pre-P3 setup post → the username, never empty."""
+        salt, verifier = self._enrollment()
+        auth.create_admin("admin", salt, verifier)
+        self.assertEqual(self._upsert_params()[1], "admin")
+
+    def test_rejects_a_control_character_in_the_display_name(self) -> None:
+        """The name goes out as an HTTP header value to Open WebUI (D-25)."""
+        salt, verifier = self._enrollment()
         with self.assertRaises(ValueError):
-            auth.create_admin("admin", "short")
+            auth.create_admin("admin", salt, verifier, display_name="Matt\nX-Role: admin")
+
+    def test_email_is_not_written_from_the_setup_form(self) -> None:
+        """D-16': the OWUI identity is derived, so nothing here stores an address.
+
+        Writing ``admin@localhost`` into ``users.email`` was the F-1 bug waiting
+        to happen: a household address in that column, and ``X-Forwarded-Email``
+        reading it, is exactly how the duplicate admin account appeared.
+        """
+        salt, verifier = self._enrollment()
+        auth.create_admin("admin", salt, verifier)
+        sqls = self._statements()
+        params = [call.args[1] for call in self.cur.execute.call_args_list]
+        self.assertNotIn("admin@localhost", " ".join(sqls))
+        self.assertFalse(any("@localhost" in str(p) for p in params))
+
+    def test_rejects_malformed_srp_pair(self) -> None:
+        """Enrollment arrives from a browser, so it is untrusted input."""
+        good_salt, good_verifier = self._enrollment()
+        for bad in (
+            ("", good_verifier),
+            ("abcd", good_verifier),
+            (good_salt, ""),
+            (good_salt, "0"),
+            (good_salt, "not hex"),
+            (good_salt, f"{srp.SERVER_GROUP.n:x}"),
+        ):
+            with self.subTest(pair=str(bad)[:24]):
+                with self.assertRaises(ValueError):
+                    auth.create_admin("admin", bad[0], bad[1])
+
+    def test_no_password_length_policy_is_enforced_server_side(self) -> None:
+        """Documents the deliberate consequence of never seeing the password.
+
+        The server cannot check a password it never receives. This is not an
+        oversight to fix here but the trade the design accepted, so it is pinned
+        where someone looking for the policy will find it.
+        """
+        salt, verifier = self._enrollment(password="x")
+        self.assertEqual(auth.create_admin("admin", salt, verifier)["state"], "ready")
 
     def test_pg_not_ready(self) -> None:
+        salt, verifier = self._enrollment()
         with mock.patch.object(db, "pg_isready", return_value=False):
             with self.assertRaises(ValueError):
-                auth.create_admin("admin", "longenough")
+                auth.create_admin("admin", salt, verifier)
 
     def test_data_services_not_ready(self) -> None:
+        salt, verifier = self._enrollment()
         with mock.patch.object(
             data_services, "ensure_provisioned", return_value={"state": "starting"}
         ):
             with self.assertRaises(ValueError):
-                auth.create_admin("admin", "longenough")
+                auth.create_admin("admin", salt, verifier)
 
     def test_provisioning_retries_until_ready(self) -> None:
         # Postgres is up but provisioning is still running: create_admin must
         # poll until ready (regression: first-admin bootstrap raced the
         # provision worker on a fresh QEMU boot).
-        conn, _cur = _conn_with_cur()
-        with mock.patch.object(db, "cp_connect", return_value=conn), \
-                mock.patch.object(auth, "PG_WAIT_SECONDS", 100), \
+        salt, verifier = self._enrollment()
+        with mock.patch.object(auth, "PG_WAIT_SECONDS", 100), \
                 mock.patch.object(
                     data_services,
                     "ensure_provisioned",
@@ -581,45 +935,132 @@ class AuthCreateAdminTests(unittest.TestCase):
                 ), \
                 mock.patch.object(auth.time, "monotonic", side_effect=[0.0, 1.0]), \
                 mock.patch.object(auth.time, "sleep"):
-            result = auth.create_admin("admin", "longenough")
+            result = auth.create_admin("admin", salt, verifier)
         self.assertEqual(result["state"], "ready")
 
     def test_db_error_wrapped(self) -> None:
-        with mock.patch.object(db, "cp_connect", side_effect=RuntimeError("boom")):
+        salt, verifier = self._enrollment()
+
+        def _boom():
+            raise RuntimeError("boom")
+
+        with mock.patch.object(db, "cp_transaction", _boom):
             with self.assertRaises(ValueError):
-                auth.create_admin("admin", "longenough")
+                auth.create_admin("admin", salt, verifier)
 
     def test_happy_path_first_admin(self) -> None:
-        conn, cur = _conn_with_cur()
-        with mock.patch.object(db, "cp_connect", return_value=conn):
-            result = auth.create_admin("admin", "longenough")
+        salt, verifier = self._enrollment()
+        result = auth.create_admin("admin", salt, verifier)
         self.assertEqual(result["state"], "ready")
         self.assertEqual(result["reset"], False)
-        # User upsert + both default groups + both mappings (5 statements).
-        sqls = [call.args[0] for call in cur.execute.call_args_list]
-        self.assertEqual(len(sqls), 5)
-        self.assertFalse(any("DELETE FROM user_groups" in sql for sql in sqls))
-        self.assertIn("INSERT INTO users", sqls[0])
-        # Deterministic local-part email fallback (OWUI keys identity on email).
-        user_params = cur.execute.call_args_list[0].args[1]
-        self.assertEqual(user_params[2], "admin@localhost")
+        self.assertEqual(result["owui_cleanup"], [])
+        sqls = self._statements()
+        # Two system groups + user upsert + both mappings + the first-admin
+        # marker (6 statements).
+        self.assertEqual(len(sqls), 6)
+        self.assertFalse(any("DELETE" in sql.upper() for sql in sqls))
+        # Groups are seeded with their system flag asserted (D-3), which is why
+        # seeding lives here and not in migration SQL.
+        self.assertIn("INSERT INTO groups", sqls[0])
+        self.assertIn("system", sqls[0])
         self.assertIn("INSERT INTO groups", sqls[1])
-        self.assertIn("INSERT INTO groups", sqls[2])
-        self.assertIn("INSERT INTO user_groups", sqls[3])
-        self.assertIn("INSERT INTO user_groups", sqls[4])
+        upsert = self._upsert_statement()
+        self.assertIn("ON CONFLICT (username) DO UPDATE", upsert)
+        self.assertIn("srp_salt = EXCLUDED.srp_salt", upsert)
+        self.assertIn("srp_verifier = EXCLUDED.srp_verifier", upsert)
+        self.assertIn("password_reset_required = FALSE", upsert)
+        # A reset must invalidate sessions issued to whoever held the row before.
+        self.assertIn("token_generation = users.token_generation + 1", upsert)
+        self.assertIn("srp_verifier", upsert)
+        user_params = self._upsert_params()
+        self.assertEqual(user_params[0], "admin")
+        self.assertEqual(user_params[1], "admin")
+        # The verifier and its salt are what actually get stored.
+        self.assertEqual(user_params[2], salt)
+        self.assertEqual(user_params[3], verifier)
+        self.assertEqual(
+            len([sql for sql in sqls if "INSERT INTO user_groups" in sql]), 2
+        )
+        self.assertEqual(len([sql for sql in sqls if "INSERT INTO cp_meta" in sql]), 1)
         self.assertIn("auth_request", self.gate.read_text())
         # Admin group check moved to CP (X-Forwarded-Groups); admin conf is empty.
         self.assertEqual(self.admin_conf.read_text(), "")
-        conn.close.assert_called_once()
+        actors = [call.args[:3] for call in audit.record.call_args_list]
+        self.assertEqual(actors, [(audit.ACTOR_SYSTEM, "admin", "user.create")])
 
-    def test_reset_path_demotes_admins_and_consumes_marker(self) -> None:
+    def test_first_admin_row_is_recorded_by_identity_not_by_name(self) -> None:
+        """D-22: the reserved first-admin row has to be findable after a rename.
+
+        The username is whatever the operator typed at setup, so anything that
+        hard-codes ``admin`` is a latent bug. The marker is the row, and the only
+        thing that may rely on it is a check for *this* row.
+        """
+        salt, verifier = self._enrollment("matt")
+        auth.create_admin("matt", salt, verifier)
+        meta = [
+            call for call in self.cur.execute.call_args_list
+            if "INSERT INTO cp_meta" in call.args[0]
+        ]
+        self.assertEqual(len(meta), 1)
+        self.assertEqual(meta[0].args[0].count("%s"), 2)
+        self.assertEqual(meta[0].args[1][0], auth.FIRST_ADMIN_KEY)
+        self.assertEqual(json.loads(meta[0].args[1][1]), {"username": "matt"})
+
+    def test_reset_overwrites_the_old_verifier(self) -> None:
+        """An admin reset must not leave the previous password working.
+
+        The upsert has to assign both SRP columns. If it only inserted, a reset
+        would report success while the row kept authenticating with the old
+        verifier — a silent failure in the one flow people reach when locked out.
+        """
+        salt, verifier = self._enrollment()
         self.marker.write_text("1\n")
-        conn, cur = _conn_with_cur()
-        with mock.patch.object(db, "cp_connect", return_value=conn):
-            result = auth.create_admin("admin", "longenough")
+        self.cur.fetchall.return_value = []
+        auth.create_admin("admin", salt, verifier)
+        upsert = self._upsert_statement()
+        self.assertIn("ON CONFLICT (username) DO UPDATE", upsert)
+        self.assertIn("srp_salt = EXCLUDED.srp_salt", upsert)
+        self.assertIn("srp_verifier = EXCLUDED.srp_verifier", upsert)
+        # The pair stored is the freshly derived one, not the stored old pair.
+        self.assertEqual(self._upsert_params()[2], salt)
+        self.assertEqual(self._upsert_params()[3], verifier)
+
+    def test_reset_deletes_differently_named_admins_and_consumes_marker(self) -> None:
+        """D-20a: a straggler admin row may not keep a working verifier.
+
+        Demoting instead of deleting left the former admin signed-in-able as an
+        ordinary user with their OWUI history intact, which is the outcome the
+        checkbox explicitly warns about.
+        """
+        salt, verifier = self._enrollment("newadmin")
+        self.marker.write_text("1\n")
+        self.cur.fetchall.return_value = [("oldadmin", "owui-uuid-1")]
+        result = auth.create_admin("newadmin", salt, verifier)
         self.assertEqual(result["reset"], True)
-        sqls = [call.args[0] for call in cur.execute.call_args_list]
-        self.assertIn("DELETE FROM user_groups", sqls[0])
+        self.assertEqual(
+            result["owui_cleanup"],
+            [{"username": "oldadmin", "owui_id": "owui-uuid-1",
+              "email": "oldadmin@localhost"}],
+        )
+        sqls = self._statements()
+        delete_users = "DELETE FROM users WHERE username = %s"
+        # The former admin's own row goes; the admin *group* is not emptied.
+        self.assertIn(delete_users, sqls)
+        self.assertFalse(any("DELETE FROM user_groups" in sql for sql in sqls))
+        deletes = [
+            call.args[1] for call in self.cur.execute.call_args_list
+            if delete_users in call.args[0]
+        ]
+        self.assertEqual(deletes, [("oldadmin",)])
+        # The straggler is removed before the new admin's joins are written, so a
+        # crash between the two can never leave both accounts in the group.
+        self.assertLess(
+            sqls.index(delete_users),
+            next(i for i, sql in enumerate(sqls) if "INSERT INTO user_groups" in sql),
+        )
+        actors = [call.args[:3] for call in audit.record.call_args_list]
+        self.assertIn((audit.ACTOR_SYSTEM, "oldadmin", "user.delete"), actors)
+        self.assertIn((audit.ACTOR_SYSTEM, "newadmin", "user.password_reset"), actors)
         self.assertFalse(self.marker.exists())
 
 
@@ -643,6 +1084,8 @@ class AuthGateWorkerTests(unittest.TestCase):
             mock.patch.object(auth, "SESSION_SECRET_FILE", root / "session-secret"),
             mock.patch.object(auth, "GATE_CONF", root / "auth-gate.conf"),
             mock.patch.object(auth, "ADMIN_CONF", root / "auth-admin.conf"),
+            mock.patch.object(auth, "GATE_PERSIST", root / "auth-gate-persist.conf"),
+            mock.patch.object(auth, "ADMIN_PERSIST", root / "auth-admin-persist.conf"),
             mock.patch.object(auth, "RESET_MARKER_FILE", root / "reset-admin"),
             mock.patch.object(auth, "reload_nginx"),
         ]

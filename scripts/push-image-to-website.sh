@@ -4,7 +4,11 @@ set -e
 
 cd "$(dirname -- "${BASH_SOURCE[0]}")" || exit 1
 
-URI="https://lemonseed.ai/releases/stable/"
+# Publishing target. URI is the channel appliances and installer USBs actually
+# read; SCP_PATH is the origin filesystem path it is served from. The public
+# lemonseed.ai name sits behind Cloudflare, which forbids large objects, so the
+# channel is the internal origin record (see scripts/lemonseed_artifacts.py).
+URI="http://test.lemonseed.ai/releases/stable/"
 SCP_HOST="fubar-ssh.badbit.net"
 SCP_PATH="/websites/lemonseed.ai/releases/stable/"
 SCP_TGT="${SCP_HOST}:${SCP_PATH}"

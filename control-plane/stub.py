@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 import os
 import re
+import secrets
 import shlex
 import subprocess
 import sys
@@ -25,15 +27,20 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 from zoneinfo import available_timezones
 
+import audit
 import auth
 import catalog
 import chat_ready
 import data_services
 import hardware
+import journal
 import modules
 import owui_policy
 import owui_portal
 import sessions
+import srp
+import updates
+import usermgmt
 from catalog import plan_model
 
 HOST = os.environ.get("APPLIANCE_CP_HOST", "127.0.0.1")
@@ -43,6 +50,13 @@ FIRST_BOOT_FILE = Path("/etc/appliance-first-boot")
 SETUP_COMPLETE_FILE = Path("/etc/appliance-setup-complete")
 SETUP_STATE_FILE = Path("/etc/appliance-setup.json")
 HANDOFF_DONE_FILE = Path("/run/lemonseed/mdns-handoff-done")
+# One journald channel for the access trail: journald rotates and retains it,
+# and `journalctl -t appliance-control-plane-access` reads it back — while the
+# service's own log stays readable (BM-3 review).
+ACCESS_LOGGER = logging.getLogger("appliance-control-plane-access")
+ACCESS_LOGGER.setLevel(logging.INFO)
+ACCESS_LOGGER.addHandler(journal.JournalHandler("appliance-control-plane-access"))
+ACCESS_LOGGER.propagate = False
 LEMOND_ENV_FILE = Path("/var/lib/lemonseed/lemonade/lemond.env")
 # One status, two meanings, two body shapes (M6.6): 403 from an OWUI guard is
 # "Lemonseed owns this setting" and carries lemonseed=managed-by-lemonseed;
@@ -67,6 +81,14 @@ BRAND_MIME = {
     ".svg": "image/svg+xml",
     ".webp": "image/webp",
 }
+# Vocabulary for the four-word sign-in codes an admin hands out. It ships as a
+# data file whose *name carries the locale*, so words-fr_CA.txt can be added
+# later without touching code, and the page fetches it only when it is about to
+# build a code — ~12 KB that no ordinary page load pays for. Only the selection
+# is secret, and the browser makes that with crypto.getRandomValues, so serving
+# the vocabulary discloses nothing.
+WORDLIST_LOCALE = "en_US"
+WORDLIST_FILE = Path(__file__).resolve().with_name(f"words-{WORDLIST_LOCALE}.txt")
 TIMEZONES = sorted(
     ["UTC"]
     + [
@@ -95,6 +117,34 @@ def _read_text(path: Path) -> Optional[str]:
 
 def appliance_version() -> str:
     return _read_text(VERSION_FILE) or "unknown"
+
+
+# --- Power controls (M7 P5) -------------------------------------------------
+#
+# Two actions, both admin-only at the gateway *and* in the control plane. The
+# delay is not ceremony: the response has to reach the browser before the machine
+# disappears under it, or the portal reports a failed request for an action that
+# worked.
+POWER_ACTIONS = ("reboot", "shutdown")
+POWER_COMMANDS = {"reboot": "reboot", "shutdown": "poweroff"}
+POWER_DELAY_SEC = 2.0
+
+
+def schedule_power(action: str) -> None:
+    """Reboot or power off on a daemon thread, a moment from now.
+
+    Off the request thread for the reason above, and kept as one named function
+    because it is the only thing in the control plane that can end a test
+    machine's session: the tests patch this, and nothing else calls it.
+    """
+
+    def go() -> None:
+        time.sleep(POWER_DELAY_SEC)
+        command = POWER_COMMANDS[action]
+        print(f"lemonseed-power: {command} requested from the portal", flush=True)
+        run_best_effort(["systemctl", command])
+
+    threading.Thread(target=go, name="lemonseed-power", daemon=True).start()
 
 
 def setup_complete() -> bool:
@@ -492,6 +542,1749 @@ async function portalError(res, fallback) {
 """
 
 
+# --- One dialog component for the whole portal (M7) --------------------------
+
+# window.prompt, window.confirm and window.alert were the first pass, and they are
+# not good enough here. They paint in the browser's chrome rather than this theme,
+# they carry one line of copy, a "type the username to confirm" prompt cannot
+# disable its own OK button, and each has a different focus and Escape behaviour.
+# Worse, they are *blocking*: a native dialog inside the settings iframe takes the
+# whole page's event loop, which is why a confirm sitting over the chat frame
+# reads as a freeze.
+#
+# So there is one component. It builds DOM nodes and never parses a string as
+# markup, which keeps the rule the panels already follow (a display name is free
+# text somebody typed) true on the way back out. Escape and a click outside mean
+# "no", focus is trapped and then handed back, and the page cannot scroll out
+# from under the box.
+DIALOG_JS = r"""
+const DIALOG_FOCUSABLE = 'a[href],button:not([disabled]),input:not([disabled]),'
+  + 'select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
+const dialogStack = [];
+let dialogSeq = 0;
+
+function dialogNode(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text != null) node.textContent = text;
+  return node;
+}
+
+function dialogVisible(node) {
+  return node.getClientRects().length > 0;
+}
+
+function dialogTop() { return dialogStack[dialogStack.length - 1] || null; }
+
+function dialogScrollLock() {
+  document.documentElement.classList.toggle('dialog-open', dialogStack.length > 0);
+}
+
+// Closes the dialog it is called from, not merely the top one: a callback held
+// by an older box must not be able to close whoever happens to be on top.
+function dialogDismiss(dlg, value) {
+  const index = dialogStack.indexOf(dlg);
+  if (index < 0) return;
+  dialogStack.splice(index, 1);
+  document.removeEventListener('keydown', dlg.onKey, true);
+  dlg.mask.remove();
+  dialogScrollLock();
+  if (dlg.returnFocus && typeof dlg.returnFocus.focus === 'function') {
+    dlg.returnFocus.focus();
+  }
+  dlg.settle(value);
+}
+
+// spec: {title, copy, body, build(api), actions, dismiss}
+//   actions: [{label, kind, value, primary, disabled}] — `value` may be a
+//            function, read when the button is clicked, which is how a prompt
+//            returns what its field holds without a sentinel string.
+//   build(api): called once the box is assembled, before it is shown. api is
+//            {body, ok, choose} — append fields to api.body, wire gating to
+//            api.ok, and call api.choose(value) to answer the dialog.
+// Resolves the chosen action's value, or spec.dismiss when closed without one.
+function dialog(spec) {
+  return new Promise((resolve) => {
+    dialogSeq += 1;
+    const titleId = 'dialog-title-' + dialogSeq;
+    const mask = dialogNode('div', 'dialog-mask');
+    const box = dialogNode('div', 'dialog');
+    // The mask is what goes in the document, so the box has to be inside it.
+    // Missing this line paints an empty dark overlay, which is exactly what the
+    // first harness run caught.
+    mask.appendChild(box);
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-modal', 'true');
+    box.setAttribute('aria-labelledby', titleId);
+    const heading = dialogNode('h2', null, spec.title || '');
+    heading.id = titleId;
+    box.appendChild(heading);
+    if (spec.copy) box.appendChild(dialogNode('p', 'dialog-copy', spec.copy));
+    const bodySlot = dialogNode('div', 'dialog-body');
+    box.appendChild(bodySlot);
+    if (spec.body) bodySlot.appendChild(spec.body);
+
+    const dlg = {
+      mask: mask,
+      returnFocus: document.activeElement,
+      settle: resolve,
+      quiet: spec.dismiss === undefined ? null : spec.dismiss,
+    };
+    function choose(value) { dialogDismiss(dlg, value); }
+
+    const actions = dialogNode('div', 'dialog-actions');
+    let ok = null;
+    const chosen = spec.actions || [{label: 'Close', kind: 'primary', value: true}];
+    chosen.forEach((a) => {
+      const b = dialogNode('button', 'btn' + (a.kind ? ' ' + a.kind : ''), a.label);
+      b.type = 'button';
+      b.disabled = !!a.disabled;
+      b.addEventListener('click', () => {
+        choose(typeof a.value === 'function' ? a.value() : a.value);
+      });
+      actions.appendChild(b);
+      if (a.primary) ok = b;
+    });
+    box.appendChild(actions);
+
+    dlg.onKey = (ev) => {
+      if (dialogTop() !== dlg) return;   // only the top box answers the keyboard
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        ev.stopPropagation();
+        choose(dlg.quiet);
+        return;
+      }
+      if (ev.key !== 'Tab') return;
+      const items = Array.prototype.filter.call(
+        box.querySelectorAll(DIALOG_FOCUSABLE),
+        (n) => dialogVisible(n),
+      );
+      if (!items.length) { ev.preventDefault(); return; }
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (ev.shiftKey && document.activeElement === first) {
+        ev.preventDefault();
+        last.focus();
+      } else if (!ev.shiftKey && document.activeElement === last) {
+        ev.preventDefault();
+        first.focus();
+      }
+    };
+
+    mask.addEventListener('mousedown', (ev) => {
+      if (ev.target === mask) choose(dlg.quiet);
+    });
+
+    // build() runs before the box is shown, so a caller that gates its own OK
+    // button never has a frame where an unarmed button is clickable.
+    if (spec.build) spec.build({body: bodySlot, ok: ok, choose: choose});
+
+    dialogStack.push(dlg);
+    dialogScrollLock();
+    document.body.appendChild(mask);
+    document.addEventListener('keydown', dlg.onKey, true);
+    const field = box.querySelector('input,textarea,select');
+    if (field) field.focus();
+    else if (ok) ok.focus();
+    else {
+      box.tabIndex = -1;
+      box.focus();
+    }
+  });
+}
+
+// The one yes/no question. Every caller gets the same words for the same act.
+function dialogConfirm(title, copy, options) {
+  const opts = options || {};
+  return dialog({
+    title: title,
+    copy: copy,
+    dismiss: false,
+    actions: [
+      {label: opts.cancelLabel || 'Cancel', kind: 'ghost', value: false},
+      {
+        label: opts.confirmLabel || 'Continue',
+        kind: opts.danger ? 'danger' : 'primary',
+        value: true,
+        primary: true,
+      },
+    ],
+  });
+}
+
+// The box that replaces the browser's message box: the copy is the point, so it
+// cannot be dismissed by clicking past it, and there is only one way out.
+function dialogMessage(title, copy) {
+  return dialog({
+    title: title,
+    copy: copy,
+    dismiss: false,
+    actions: [{label: 'OK', kind: 'primary', value: true, primary: true}],
+  });
+}
+
+// The browser's text-input box, replaced. Resolves the new text, or null if it
+// was cancelled.
+function dialogPrompt(title, copy, options) {
+  const opts = options || {};
+  let field = null;
+  return dialog({
+    title: title,
+    copy: copy,
+    dismiss: null,
+    actions: [
+      {label: 'Cancel', kind: 'ghost', value: null},
+      {
+        label: opts.confirmLabel || 'Save',
+        kind: 'primary',
+        primary: true,
+        value: () => (field ? field.value : ''),
+      },
+    ],
+    build: (api) => {
+      const label = dialogNode('label', null, opts.label || 'Value');
+      label.htmlFor = 'dialog-field-' + dialogSeq;
+      field = dialogNode('input');
+      field.id = 'dialog-field-' + dialogSeq;
+      field.type = opts.inputType || 'text';
+      field.value = opts.value == null ? '' : String(opts.value);
+      field.maxLength = opts.maxLength || 254;
+      field.autocomplete = 'off';
+      api.body.appendChild(label);
+      api.body.appendChild(field);
+      if (opts.hint) api.body.appendChild(dialogNode('p', 'owui-hint', opts.hint));
+      field.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter') {
+          ev.preventDefault();
+          api.choose(field.value);
+        }
+      });
+    },
+  });
+}
+
+// The confirmation a destructive act needs. The button stays disabled until the
+// word is typed, so there is no "you mistyped it" message to read and the only
+// way to press it is to have written the name.
+function dialogTypedConfirm(title, copy, word, options) {
+  const opts = options || {};
+  let field = null;
+  let armed = null;
+  return dialog({
+    title: title,
+    copy: copy,
+    dismiss: false,
+    actions: [
+      {label: 'Cancel', kind: 'ghost', value: false},
+      {label: opts.confirmLabel || 'Confirm', kind: 'danger', primary: true, disabled: true, value: true},
+    ],
+    build: (api) => {
+      armed = api.ok;
+      const label = dialogNode('label', null, opts.label || ('Type "' + word + '" to confirm'));
+      label.htmlFor = 'dialog-field-' + dialogSeq;
+      field = dialogNode('input');
+      field.id = 'dialog-field-' + dialogSeq;
+      field.type = 'text';
+      field.autocomplete = 'off';
+      field.spellcheck = false;
+      api.body.appendChild(label);
+      api.body.appendChild(field);
+      if (opts.extra) api.body.appendChild(opts.extra);
+      const check = () => {
+        armed.disabled = field.value.trim().toLowerCase() !== String(word).toLowerCase();
+      };
+      field.addEventListener('input', check);
+      field.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter' && !armed.disabled) {
+          ev.preventDefault();
+          api.choose(true);
+        }
+      });
+      check();
+    },
+  });
+}
+"""
+
+
+# --- SRP-6a sign-in (M7 P2) -------------------------------------------------
+
+# The browser half of SRP-6a, injected into *both* /login (handshake) and /setup
+# (enrollment). Like PORTAL_FETCH_JS it lives in a module constant rather than a
+# static file so it cannot drift from the server it talks to, and so a new nginx
+# location is not needed (AGENTS.md keeps the gateway to exact-match CP routes).
+#
+# Why this is here at all: the appliance is HTTP-only forever (no FQDN, no
+# usable CA), so the previous design put the password in a JSON body that anyone
+# on the LAN could read. SRP removes the credential from the wire. What it does
+# **not** buy, stated plainly because overselling it would be worse than not
+# doing it: the session cookie is still a bearer token on plaintext HTTP, and an
+# active on-path attacker can still rewrite this page. What it does stop is
+# passive sniffing and the reuse of one wire capture as a password.
+#
+# SHA-256 is hand-rolled on purpose. window.crypto.subtle is undefined unless the
+# page is a secure context, and this page never is, so "just use the browser's"'
+# is not available. One code path, always this one — no subtle/fallback fork to
+# get wrong. The KAT gate at the bottom is what makes a wrong digest loud instead
+# of a mysterious "invalid credentials" for a correct password.
+SRP_CLIENT_JS = r"""
+var LemonseedSRP = (function () {
+  'use strict';
+
+  // SHA-256 round constants, K[i] = floor(2^32 * frac(cbrt(prime(i)))).
+  var K = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+    0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+    0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+    0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+    0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+    0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  ];
+
+  function rotr(x, n) { return ((x >>> n) | (x << (32 - n))) >>> 0; }
+
+  function sha256(msg) {
+    var total = (((msg.length + 8) >> 6) + 1) << 6;
+    var m = new Uint8Array(total);
+    m.set(msg);
+    m[msg.length] = 0x80;
+    var bits = msg.length * 8;
+    var view = new DataView(m.buffer);
+    view.setUint32(total - 8, Math.floor(bits / 0x100000000));
+    view.setUint32(total - 4, bits >>> 0);
+
+    var H = [
+      0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c,
+      0x1f83d9ab, 0x5be0cd19
+    ];
+    var w = new Uint32Array(64);
+    for (var off = 0; off < total; off += 64) {
+      for (var i = 0; i < 16; i++) w[i] = view.getUint32(off + i * 4);
+      for (i = 16; i < 64; i++) {
+        var s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+        var s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+        w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+      }
+      var a = H[0], b = H[1], c = H[2], d = H[3];
+      var e = H[4], f = H[5], g = H[6], h = H[7];
+      for (i = 0; i < 64; i++) {
+        var S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+        var ch = (e & f) ^ (~e & g);
+        var t1 = (h + S1 + ch + K[i] + w[i]) >>> 0;
+        var S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+        var maj = (a & b) ^ (a & c) ^ (b & c);
+        var t2 = (S0 + maj) >>> 0;
+        h = g; g = f; f = e;
+        e = (d + t1) >>> 0;
+        d = c; c = b; b = a;
+        a = (t1 + t2) >>> 0;
+      }
+      for (i = 0; i < 8; i++) H[i] = (H[i] + [a, b, c, d, e, f, g, h][i]) >>> 0;
+    }
+    var out = new Uint8Array(32);
+    var ov = new DataView(out.buffer);
+    for (i = 0; i < 8; i++) ov.setUint32(i * 4, H[i]);
+    return out;
+  }
+
+  function utf8(s) { return new TextEncoder().encode(s); }
+
+  function toHex(bytes) {
+    var s = '';
+    for (var i = 0; i < bytes.length; i++) {
+      s += (bytes[i] >> 4).toString(16) + (bytes[i] & 15).toString(16);
+    }
+    return s;
+  }
+
+  function fromHex(hex) {
+    if (typeof hex !== 'string' || hex.length % 2 || !/^[0-9a-fA-F]*$/.test(hex)) {
+      throw new Error('not hexadecimal');
+    }
+    var out = new Uint8Array(hex.length / 2);
+    for (var i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    return out;
+  }
+
+  function concat() {
+    var n = 0, i;
+    for (i = 0; i < arguments.length; i++) n += arguments[i].length;
+    var out = new Uint8Array(n), at = 0;
+    for (i = 0; i < arguments.length; i++) { out.set(arguments[i], at); at += arguments[i].length; }
+    return out;
+  }
+
+  // RFC 5054 2.1 implicit conversion: minimal length, non-zero top byte. A and B
+  // and S are hashed in this form; only u and the multiplier use pad(). Mixing
+  // the two produces an implementation that agrees with itself and nothing else.
+  function intToBytes(v) {
+    if (v === 0n) return new Uint8Array(0);
+    var hex = v.toString(16);
+    if (hex.length % 2) hex = '0' + hex;
+    return fromHex(hex);
+  }
+
+  function bytesToInt(bytes) {
+    var v = 0n;
+    for (var i = 0; i < bytes.length; i++) v = (v << 8n) | BigInt(bytes[i]);
+    return v;
+  }
+
+  function shaHex() { return toHex(sha256(concat.apply(null, arguments))); }
+  function shaInt() { return BigInt('0x' + shaHex.apply(null, arguments)); }
+
+  // RFC 5054 Appendix A group 3 (2048-bit), generator 2. Pinned, never generated:
+  // 3.2 is explicit that trusting N comes from matching a published list.
+  var GROUP_N_HEX =
+    'AC6BDB41324A9A9BF166DE5E1389582FAF72B6651987EE07FC319294' +
+    '3DB56050A37329CBB4A099ED8193E0757767A13DD52312AB4B03310D' +
+    'CD7F48A9DA04FD50E8083969EDB767B0CF6095179A163AB3661A05FB' +
+    'D5FAAAE82918A9962F0B93B855F97993EC975EEAA80D740ADBF4FF74' +
+    '7359D041D5C33EA71D281E446B14773BCA97B43A23FB801676BD207A' +
+    '436C6481F1D2B9078717461A5B9D32E688F87748544523B524B0D57D' +
+    '5EA77A2775D2ECFA032CFBDBF52FB3786160279004E57AE6AF874E73' +
+    '03CE53299CCC041C7BC308D82A5698F3A8D0C38271AE35F8E9DBFBB6' +
+    '94B5C803D89F7AE435DE236D525F54759B65E372FCD68EF20FA7111F' +
+    '9E4AFF73';
+  var N = BigInt('0x' + GROUP_N_HEX);
+  var G = 2n;
+  var N_BYTES = 256;
+
+  function pad(v) {
+    var bytes = intToBytes(v);
+    if (bytes.length > N_BYTES) throw new Error('value wider than N');
+    var out = new Uint8Array(N_BYTES);
+    out.set(bytes, N_BYTES - bytes.length);
+    return out;
+  }
+
+  function modPow(base, exp, mod) {
+    var result = 1n;
+    base = ((base % mod) + mod) % mod;
+    while (exp > 0n) {
+      if (exp & 1n) result = (result * base) % mod;
+      base = (base * base) % mod;
+      exp >>= 1n;
+    }
+    return result;
+  }
+
+  // k is the SRP-6 multiplier; without it a hostile server can mount a 2-for-1
+  // guessing attack. Derived, never transcribed.
+  var K_MULT = shaInt(intToBytes(N), pad(G));
+
+  function xFromPassword(salt, identity, password) {
+    // x = H(s | H(I | ":" | P)). The identity inside the inner hash is what stops
+    // one verifier being portable across two accounts.
+    return shaInt(salt, sha256(utf8(identity + ':' + password)));
+  }
+
+  function randomBytes(n) {
+    if (typeof crypto === 'undefined' || !crypto.getRandomValues) {
+      throw new Error('no source of randomness available');
+    }
+    var out = new Uint8Array(n);
+    crypto.getRandomValues(out);
+    return out;
+  }
+
+  function randomPrivate() {
+    // RFC 5054 3.1: at least 256 bits, and strictly below N.
+    for (var tries = 0; tries < 8; tries++) {
+      var v = bytesToInt(randomBytes(32));
+      if (v > 0n && v < N) return v;
+    }
+    throw new Error('could not draw a private value');
+  }
+
+  function enroll(identity, password) {
+    var salt = randomBytes(16);
+    var v = modPow(G, xFromPassword(salt, identity, password), N);
+    return { salt: toHex(salt), verifier: v.toString(16) };
+  }
+
+  function authenticate(identity, password, saltHex, bHex) {
+    var salt = fromHex(saltHex);
+    if (salt.length !== 16) throw new Error('salt has the wrong length');
+    if (typeof bHex !== 'string' || !/^[0-9a-fA-F]+$/.test(bHex)) {
+      throw new Error('server value is not hexadecimal');
+    }
+    var B = BigInt('0x' + bHex);
+    // RFC 5054 2.5.3: the client MUST abort if B % N == 0. Skipping this is how
+    // an implementation ends up believing a session key nobody else holds.
+    if (B <= 0n || B >= N || B % N === 0n) throw new Error('bad server value');
+
+    var a = randomPrivate();
+    var A = modPow(G, a, N);
+    var u = shaInt(pad(A), pad(B));
+    if (u === 0n) throw new Error('scrambler is zero');
+    var x = xFromPassword(salt, identity, password);
+    var base = (B - K_MULT * modPow(G, x, N)) % N;
+    if (base < 0n) base += N;
+    var S = modPow(base, a + u * x, N);
+    var key = sha256(intToBytes(S));
+    var m1 = sha256(concat(intToBytes(A), intToBytes(B), intToBytes(S)));
+    var m2 = sha256(concat(intToBytes(A), m1, key));
+    return { A: A.toString(16), M1: toHex(m1), expectM2: toHex(m2) };
+  }
+
+  function verifyServer(expectedHex, gotHex) {
+    if (typeof gotHex !== 'string' || gotHex.length !== expectedHex.length) return false;
+    var diff = 0;
+    for (var i = 0; i < expectedHex.length; i++) {
+      diff |= expectedHex.charCodeAt(i) ^ gotHex.charCodeAt(i);
+    }
+    return diff === 0;
+  }
+
+  // FIPS 180-4 known-answer vectors. Runs at load; a failure here means every
+  // digest this page produces is wrong, so both forms refuse to submit.
+  var KAT_VECTORS = [
+    ['', 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'],
+    ['abc', 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'],
+    ['abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq',
+     '248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1']
+  ];
+
+  function selfTest() {
+    try {
+      for (var i = 0; i < KAT_VECTORS.length; i++) {
+        if (toHex(sha256(utf8(KAT_VECTORS[i][0]))) !== KAT_VECTORS[i][1]) return false;
+      }
+      return GROUP_N_HEX.length === 512 && K_MULT > 0n;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  return {
+    ok: selfTest(),
+    enroll: enroll,
+    authenticate: authenticate,
+    verifyServer: verifyServer,
+    sha256Hex: function (s) { return toHex(sha256(utf8(s))); },
+    sha256HexBytes: function (hex) { return toHex(sha256(fromHex(hex))); }
+  };
+})();
+"""
+
+
+# Sign-in glue for page_login. Separate from SRP_CLIENT_JS so its braces stay
+# single: PORTAL_JS-style doubling inside the page f-string is exactly the kind
+# of thing that breaks silently, and a constant needs none of it.
+#
+# Note what is *not* here: the password never enters any object that is
+# serialised. It is read once, handed to LemonseedSRP, and dropped.
+SRP_LOGIN_JS = r"""
+(function () {
+  'use strict';
+  // The gate can land this page inside the shell's iframe, and a page inside a
+  // page is unusable, so break out to the top frame first (M6.6 D3).
+  if (window.top !== window.self) {
+    window.top.location = window.location.href;
+  }
+
+  function show(card, form, message) {
+    let err = card.querySelector('.login-error');
+    if (!err) {
+      err = document.createElement('p');
+      err.className = 'login-error';
+      card.insertBefore(err, form);
+    }
+    err.textContent = message;
+  }
+
+  async function post(path, payload) {
+    const res = await fetch(path, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Requested-With': 'fetch'},
+      body: JSON.stringify(payload),
+    });
+    let data = {};
+    try { data = await res.json(); } catch (err) { data = {}; }
+    return {ok: res.ok, status: res.status, data: data};
+  }
+
+  // D-11: a reset hands out a code that must be exchanged for a password of the
+  // user's own. ``srp/verify`` answers with ``rotate_required`` and deliberately
+  // no cookie, so the exchange happens *before* anyone is signed in — a code
+  // handed over a shoulder should not open a live session on the way to being
+  // changed. Two phases, same page: prove the current password, then replace it.
+  let rotating = false;
+  let who = '';
+
+  function askNewPassword(form) {
+    if (form.querySelector('.rotate-fields')) return;
+    const box = document.createElement('div');
+    box.className = 'rotate-fields';
+    const hint = document.createElement('p');
+    hint.className = 'lede';
+    hint.textContent = 'Choose a new password to finish signing in.';
+    box.appendChild(hint);
+    [['new_password', 'New password'], ['confirm_password', 'Repeat it']].forEach((f) => {
+      const wrap = document.createElement('div');
+      wrap.className = 'field';
+      const label = document.createElement('label');
+      label.textContent = f[1];
+      label.htmlFor = f[0];
+      const input = document.createElement('input');
+      input.id = f[0];
+      input.name = f[0];
+      input.type = 'password';
+      input.autocomplete = 'new-password';
+      input.required = true;
+      wrap.appendChild(label);
+      wrap.appendChild(input);
+      box.appendChild(wrap);
+    });
+    const submit = form.querySelector('button[type=submit]');
+    form.insertBefore(box, submit);
+    submit.textContent = 'Set password and sign in';
+  }
+
+  async function finishRotation(form) {
+    const next = form.elements.new_password.value || '';
+    const again = form.elements.confirm_password.value || '';
+    if (next.length < 8) return 'Your new password must be at least 8 characters.';
+    if (next !== again) return 'The two passwords do not match.';
+    const current = form.elements.password.value || '';
+    const challenge = await post('/_lemonseed/api/srp/challenge', {username: who});
+    if (!challenge.ok) return challenge.data.detail || 'Sign in failed.';
+    const c = challenge.data;
+    // Two derivations, neither of which is a password the appliance sees: a proof
+    // that the caller knows the *current* one, and the verifier of the *new* one.
+    const proof = LemonseedSRP.authenticate(who, current, c.salt, c.B);
+    const pair = LemonseedSRP.enroll(who, next);
+    const done = await post('/_lemonseed/api/srp/rotate', {
+      cid: c.cid, A: proof.A, M1: proof.M1, salt: pair.salt, verifier: pair.verifier,
+    });
+    if (!done.ok) return done.data.detail || 'The password was not changed.';
+    if (!LemonseedSRP.verifyServer(proof.expectM2, done.data.M2)) {
+      return 'The appliance could not prove its identity. Try again.';
+    }
+    window.top.location = done.data.target || '/';
+    return null;
+  }
+
+  document.getElementById('login-form').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const form = ev.target;
+    const card = document.querySelector('.login-card');
+    // The KAT gate. If SHA-256 is wrong here, M1 cannot match and every correct
+    // password reads as "invalid credentials"; refusing and saying so is the
+    // only honest outcome, so this check is not optional.
+    if (!window.LemonseedSRP || !LemonseedSRP.ok) {
+      show(card, form, 'This browser failed a security self-check, so signing in is disabled.');
+      return;
+    }
+    if (rotating) {
+      try {
+        const problem = await finishRotation(form);
+        if (problem) show(card, form, problem);
+      } catch (err) {
+        show(card, form, 'The appliance is not answering yet. Try again in a moment.');
+      }
+      return;
+    }
+    const username = (form.elements.username.value || '').trim();
+    const password = form.elements.password.value || '';
+    const rd = (form.elements.rd && form.elements.rd.value) || '/';
+    try {
+      const challenge = await post('/_lemonseed/api/srp/challenge', {username: username});
+      if (!challenge.ok) {
+        show(card, form, challenge.data.detail || 'Sign in failed.');
+        return;
+      }
+      const c = challenge.data;
+      const proof = LemonseedSRP.authenticate(username, password, c.salt, c.B);
+      const done = await post('/_lemonseed/api/srp/verify',
+                              {cid: c.cid, A: proof.A, M1: proof.M1});
+      if (!done.ok) {
+        show(card, form, done.data.detail || 'Sign in failed.');
+        return;
+      }
+      // Mutual authentication. A sign-in that skips this has proved something
+      // *to* the appliance and received nothing back.
+      if (!LemonseedSRP.verifyServer(proof.expectM2, done.data.M2)) {
+        show(card, form, 'The appliance could not prove its identity. Try again.');
+        return;
+      }
+      if (done.data.rotate_required) {
+        who = username;
+        rotating = true;
+        askNewPassword(form);
+        return;
+      }
+      window.top.location = done.data.target || '/';
+    } catch (err) {
+      show(card, form, 'The appliance is not answering yet. Try again in a moment.');
+    }
+  });
+})();
+"""
+
+# Enrollment glue for page_setup. The browser derives (salt, verifier) and posts
+# those; the password field is disabled before the native submit runs, so it is
+# not in the request body at all.
+SRP_ENROLL_JS = r"""
+(function () {
+  'use strict';
+  const form = document.getElementById('setup-form');
+  if (!form) return;
+
+  function fail(message) {
+    const err = document.getElementById('setup-srp-error');
+    if (err) err.textContent = message;
+  }
+
+  form.addEventListener('submit', function (ev) {
+    const user = document.getElementById('admin_username');
+    if (!user) return;  // No admin bootstrap on this variant of the form.
+    const pw = document.getElementById('admin_password');
+    if (!window.LemonseedSRP || !LemonseedSRP.ok) {
+      ev.preventDefault();
+      fail('This browser failed a security self-check, so setup cannot continue.');
+      return;
+    }
+    // The password policy now lives *here*. The server never sees the password,
+    // so it structurally cannot enforce one; this is the only place it can live.
+    if ((pw.value || '').length < 8) {
+      ev.preventDefault();
+      fail('Admin password must be at least 8 characters.');
+      return;
+    }
+    let pair;
+    try {
+      pair = LemonseedSRP.enroll(user.value.trim(), pw.value);
+    } catch (err) {
+      ev.preventDefault();
+      fail('Could not prepare sign-in data: ' + (err && err.message ? err.message : err));
+      return;
+    }
+    document.getElementById('admin_srp_salt').value = pair.salt;
+    document.getElementById('admin_srp_verifier').value = pair.verifier;
+    // A disabled input is not submitted, so the plaintext leaves the document
+    // entirely rather than merely being ignored by the server.
+    pw.disabled = true;
+  });
+})();
+"""
+
+
+# The one place that changes the caller's own password. Two screens need it (the
+# admin's account panel and every user's My Profile page), and a four-step SRP
+# sequence duplicated across both is exactly the kind of thing that drifts.
+#
+# It takes the page's own `post` so the helper stays agnostic about how a refusal
+# becomes a sentence: both callers use a `post` that throws an Error carrying
+# text meant for a human. Throwing is deliberate — a rotation that failed halfway
+# must not be able to leave the caller believing a password changed.
+ROTATE_JS = r"""
+window.LemonseedRotate = (function () {
+  'use strict';
+
+  // Throws instead of returning false, so the caller cannot forget the check.
+  async function change(post, username, current, next) {
+    const c = await post('/_lemonseed/api/srp/challenge', { username: username });
+    // Two derivations, and neither is a password the appliance can see: a proof
+    // of the current one, and the verifier of the new one (D-5).
+    const proof = LemonseedSRP.authenticate(username, current, c.salt, c.B);
+    const pair = LemonseedSRP.enroll(username, next);
+    const done = await post('/_lemonseed/api/srp/rotate', {
+      cid: c.cid, A: proof.A, M1: proof.M1, salt: pair.salt, verifier: pair.verifier,
+    });
+    // M2 is the appliance proving itself. If it cannot, nothing was changed.
+    if (!LemonseedSRP.verifyServer(proof.expectM2, done.M2)) {
+      throw new Error('The appliance could not prove its identity. Nothing was changed.');
+    }
+  }
+
+  return { change: change };
+})();
+"""
+
+# Who you are, in the corner of the bar. Every signed-in person needs to see
+# their own name, sign out, and reach their profile, so this lives apart from the
+# admin-only account panel and is emitted on every signed-in page.
+ACCOUNT_JS = r"""
+(function () {
+  'use strict';
+
+  const btn = document.getElementById('nav-account');
+  const pop = document.getElementById('account-pop');
+  if (!btn || !pop) return;
+
+  function open(on) {
+    pop.hidden = !on;
+    btn.setAttribute('aria-expanded', on ? 'true' : 'false');
+  }
+
+  btn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    open(pop.hidden);
+  });
+  // The popover is a plain element, so dismissing it is our job: a click
+  // anywhere else, or Escape, closes it.
+  document.addEventListener('click', (ev) => {
+    if (!pop.hidden && !pop.contains(ev.target)) open(false);
+  });
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') open(false);
+  });
+
+  document.getElementById('nav-logout').addEventListener('click', async () => {
+    // Tear the chat frame down before navigating, when this page has one. It
+    // carries its own Open WebUI session, so leaving it loaded keeps a
+    // signed-in, interactive chat on screen for as long as the browser takes to
+    // paint /login (M6.6 step 4). The profile page has no frame, hence the test.
+    if (typeof window.retireChatFrame === 'function') window.retireChatFrame();
+    // /logout answers 302 and fetch() follows it, so the cookie is cleared by the
+    // request itself; the navigation is what actually leaves the page.
+    try {
+      await portalFetch('/logout', { method: 'POST' });
+    } catch (err) {
+      // A failed logout still gets the user out: the cookie is HttpOnly and
+      // idle-expiring, and a stuck signed-in page is worse.
+    }
+    window.top.location = '/login';
+  });
+
+  // One request, three consequences: who the popover says you are, whether the
+  // Settings gear is yours to see (non-admins never get the system panel), and
+  // whether "Edit profile" is worth offering on a page that already is one.
+  (async function fill() {
+    const res = await portalFetch('/_lemonseed/api/profile');
+    if (!res.ok) return;
+    const me = (await res.json()).user || {};
+    const name = document.getElementById('pop-name');
+    const who = document.getElementById('pop-user');
+    if (name) name.textContent = me.display_name || me.username || '';
+    if (who) who.textContent = me.username || '';
+    const gear = document.getElementById('nav-settings');
+    // A non-admin reaching /settings/ is refused at the gateway; hiding the gear
+    // is honesty, not access control.
+    if (gear) gear.hidden = !(me.groups || []).includes('admin');
+    // A newer version is admin news (P5): the red dot rides the gear, and the
+    // SYSTEM panel is where the buttons live. One extra request for admins;
+    // members never see the gear and never ask.
+    if (gear && !(me.groups || []).includes('admin')) {
+      portalFetch('/_lemonseed/api/update').then(async (res) => {
+        if (!res.ok) return;
+        const state = (await res.json());
+        if (state.available) gear.classList.add('update-dot');
+      }).catch(() => {});
+    }
+    const link = document.getElementById('pop-profile');
+    if (link && document.getElementById('profile-panel')) link.hidden = true;
+  })();
+})();
+"""
+
+# Users and groups (M7 P3/P4): the Users & Groups pane of /settings/content/,
+# rendered for admins. Three rules hold this screen together:
+#   * Passwords are never typed into it and never leave it. Creating an account
+#     and resetting one both derive (salt, verifier) in THIS document and post
+#     only that, so the appliance never sees a password it could leak. The
+#     one-time code is generated here for the same reason (D-10, D-27).
+#   * Every row is built with textContent, never innerHTML, and the glyphs are
+#     built with createElementNS. A display name is free text a household types
+#     in; treating it as markup would be an injected script in their own session.
+#   * Every question goes through the one dialog component, and a row action the
+#     control plane would refuse is rendered disabled with the reason in its
+#     title (D-39, D-40). The server still refuses; the panel only says so first.
+ACCOUNTS_JS = r"""
+(function () {
+  'use strict';
+
+  let people = [];
+  let groups = [];
+  let firstAdmin = '';
+  let attributeKeys = [];
+  let me = '';
+  let busy = false;
+  let auditLog = [];
+
+  // The username rule, from USERS-AND-GROUPS.md D-25 (POSIX-shaped, lower-cased,
+  // 2-16 characters). The control plane enforces it again and owns the reserved
+  // list; this only stops the dialog offering Save on a name that cannot work.
+  const USERNAME_RE = /^[a-z][a-z0-9_.-]{1,15}$/;
+
+  function note(message, bad) {
+    const el = document.getElementById('acct-note');
+    if (!el) return;
+    el.textContent = message || '';
+    el.hidden = !message;
+    el.className = 'owui-status' + (bad ? ' bad' : '');
+  }
+
+  function setBusy(on) {
+    busy = on;
+    document.querySelectorAll('#accounts button').forEach((b) => { b.disabled = on; });
+  }
+
+  // A refusal carries a sentence written for the person reading it, so render
+  // the server's words rather than the HTTP status.
+  async function post(path, payload) {
+    const res = await portalFetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error(await portalError(res, 'That did not work.'));
+    return res.json();
+  }
+
+  function el(tag, cls, text) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text != null) node.textContent = text;
+    return node;
+  }
+
+  // Emptying a container by removing its children, so this panel has exactly one
+  // rendering rule: nothing here ever parses a string as markup, which leaves no
+  // path from a name a household typed to a script tag in their own session.
+  function clear(node) {
+    while (node.firstChild) node.removeChild(node.firstChild);
+    return node;
+  }
+
+  // --- icons ------------------------------------------------------------------
+  // One <path> of subpaths, built with createElementNS rather than from a markup
+  // string, because the rule above is what keeps a typed display name inert. The
+  // visible label is a title plus a screen-reader span, so the glyph is never the
+  // only way to find out what a button does.
+  const ICONS = {
+    edit: 'M4.5 19.5h4L19 9l-4-4L4.5 15.5z M14.5 5.5l4 4',
+    code: 'M8.5 12a3.5 3.5 0 1 0 0 7a3.5 3.5 0 1 0 0-7 M10.9 13.1L19 5'
+      + ' M16.5 7.5l1.8 1.8 M14.3 9.7l1.8 1.8',
+    remove: 'M4.5 6.5h15 M9.5 4h5 M6.5 6.5l1 13.5h9l1-13.5 M10.3 10v7 M13.7 10v7',
+    members: 'M9.6 8.6a3.2 3.2 0 1 0 6.4 0a3.2 3.2 0 1 0-6.4 0'
+      + ' M3.8 19.6c0-3.2 2.6-5.2 5.8-5.2s5.8 2 5.8 5.2'
+      + ' M16 5.8a3.2 3.2 0 0 1 0 5.9 M17.4 14.6c2.1.7 3.4 2.5 3.4 4.7',
+    settings: 'M4 7h7.6 M16.8 7H20 M14.2 4.8a2.2 2.2 0 1 0 0 4.4a2.2 2.2 0 1 0 0-4.4'
+      + ' M4 12h2.8 M12 12H20 M9.4 9.8a2.2 2.2 0 1 0 0 4.4a2.2 2.2 0 1 0 0-4.4'
+      + ' M4 17h7.6 M16.8 17H20 M14.2 14.8a2.2 2.2 0 1 0 0 4.4a2.2 2.2 0 1 0 0-4.4',
+    add: 'M12 5v14 M5 12h14',
+  };
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+
+  function svgIcon(name) {
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('width', '15');
+    svg.setAttribute('height', '15');
+    svg.setAttribute('fill', 'none');
+    svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('stroke-width', '1.7');
+    svg.setAttribute('stroke-linecap', 'round');
+    svg.setAttribute('stroke-linejoin', 'round');
+    svg.setAttribute('aria-hidden', 'true');
+    const path = document.createElementNS(SVG_NS, 'path');
+    path.setAttribute('d', ICONS[name] || '');
+    svg.appendChild(path);
+    return svg;
+  }
+
+  // A row action. `blocked` is a sentence: bare-metal review found buttons that
+  // the appliance would refuse, which reads as a broken panel. Greyed out, with
+  // the reason in the title, the refusal is already explained.
+  function iconButton(icon, label, title, onClick, blocked) {
+    const b = el('button', 'icon-btn' + (icon === 'remove' ? ' danger' : ''));
+    b.type = 'button';
+    b.appendChild(svgIcon(icon));
+    b.appendChild(el('span', 'sr-only', label));
+    b.title = blocked || title;
+    if (blocked) {
+      b.disabled = true;
+      b.setAttribute('aria-disabled', 'true');
+    } else {
+      b.addEventListener('click', onClick);
+    }
+    return b;
+  }
+
+  // A "Title | control" row, which is the shape every dialog in this panel uses.
+  function fieldRow(body, label, value, options) {
+    const opts = options || {};
+    const row = el('div', 'dialog-field');
+    const text = el('label', null, label);
+    const input = el('input');
+    input.type = 'text';
+    input.value = value == null ? '' : String(value);
+    input.maxLength = opts.maxLength || 254;
+    input.autocomplete = 'off';
+    if (opts.readonly) {
+      input.readOnly = true;
+      input.title = opts.readonly;
+    }
+    text.htmlFor = input.id = 'field-' + label.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    row.appendChild(text);
+    row.appendChild(input);
+    body.appendChild(row);
+    if (opts.hint) body.appendChild(el('p', 'owui-hint', opts.hint));
+    return input;
+  }
+
+  function checkRow(body, label, checked, blocked) {
+    const row = el('label', 'dialog-check');
+    const input = el('input');
+    input.type = 'checkbox';
+    input.checked = !!checked;
+    row.appendChild(input);
+    row.appendChild(el('span', null, label));
+    if (blocked) {
+      input.disabled = true;
+      row.title = blocked;
+    }
+    body.appendChild(row);
+    return input;
+  }
+
+  // --- the one question a table row can ask ----------------------------------
+  // Every "what do you want to call it" in this panel goes through dialogPrompt,
+  // and every irreversible one through dialogTypedConfirm, so there is one set of
+  // words for each and no browser-native box anywhere.
+
+  // Sign-in codes are four words from the appliance's curated vocabulary. The
+  // list arrives on first use rather than at page load, so the ~12 KB is paid
+  // only by whoever generates a code, and the URL's file name carries a locale
+  // so another vocabulary can appear beside it without a code change. The words
+  // themselves are public; only the *draw* has to happen here (D-27).
+  const OTP_WORDS = 4;
+  const WORDLIST_MIN = 512;
+  let wordbook = null;
+
+  async function loadWordbook() {
+    if (wordbook) return wordbook;
+    const res = await portalFetch('/_lemonseed/api/wordlist');
+    if (!res.ok) throw new Error(await portalError(res, 'Could not load the word list.'));
+    const words = (await res.text()).split('\n').filter((w) => w);
+    if (words.length < WORDLIST_MIN) {
+      throw new Error('The sign-in code word list is too small to be safe.');
+    }
+    wordbook = words;
+    return words;
+  }
+
+  // Uniform index in [0, words.length). The cutoff is the largest multiple of
+  // the list size that fits in 32 bits, and a draw past it is retried: folding
+  // with plain modulo biases the low indices, which would quietly weaken every
+  // code we hand out. Retry cost is under one extra draw in a thousand.
+  function wordIndex(words) {
+    const limit = Math.floor(4294967296 / words.length) * words.length;
+    const draw = new Uint32Array(1);
+    for (;;) {
+      crypto.getRandomValues(draw);
+      if (draw[0] < limit) return draw[0] % words.length;
+    }
+  }
+
+  // Synchronous and takes its vocabulary as an argument on purpose: the entropy
+  // source is the only thing it touches, so a test can pin crypto and prove that
+  // no timestamp or counter contributes a byte.
+  function makeOtp(words) {
+    if (!Array.isArray(words) || words.length < WORDLIST_MIN) {
+      throw new Error('The sign-in code word list is unavailable.');
+    }
+    const parts = [];
+    for (let i = 0; i < OTP_WORDS; i += 1) parts.push(words[wordIndex(words)]);
+    return parts.join('-');
+  }
+
+  function derive(username, code) {
+    if (!window.LemonseedSRP || !LemonseedSRP.ok) {
+      throw new Error('This browser failed a security self-check, so passwords cannot be set here.');
+    }
+    return LemonseedSRP.enroll(username, code);
+  }
+
+  // navigator.clipboard exists only in a secure context, and the portal is
+  // plain HTTP on a LAN address, so the async API is usually absent here. The
+  // textarea/execCommand path is deprecated but universal, and both run over
+  // HTTP, so the button never reports success it did not achieve.
+  function copyText(text, done) {
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(() => done(true), () => done(false));
+      return;
+    }
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try {
+      ok = document.execCommand('copy');
+    } catch (err) {
+      ok = false;
+    }
+    ta.remove();
+    done(ok);
+  }
+
+  // The code is shown once, in a box with a Copy button, and there is no way to
+  // read it again: it is not stored anywhere, which is the same reason the
+  // appliance never sees the words it is made of.
+  function showCode(username, code, extraCopy) {
+    const body = el('div');
+    body.appendChild(el('p', 'otp-code', code));
+    const copy = el('button', 'btn ghost', 'Copy');
+    copy.type = 'button';
+    copy.addEventListener('click', () => {
+      copy.disabled = true;
+      copyText(code, (ok) => {
+        copy.disabled = false;
+        copy.textContent = ok ? 'Copied' : 'Select it and copy it by hand';
+      });
+    });
+    body.appendChild(copy);
+    body.appendChild(el('p', 'owui-hint',
+      'This code is not stored on the appliance, so write it down or copy it now.'));
+    return dialog({
+      title: 'Sign-in code for ' + username,
+      copy: extraCopy || ('Give this to ' + username + '. It works once, and they choose '
+        + 'their own password the first time they sign in.'),
+      dismiss: false,
+      body: body,
+      actions: [{label: 'Done', kind: 'primary', value: true, primary: true}],
+    });
+  }
+
+  // --- accounts ---------------------------------------------------------------
+
+  function isAdmin(u) {
+    return (u.groups || []).includes('admin');
+  }
+
+  // D-2: the appliance must always have someone who can administer it, so the
+  // last enabled admin cannot demote themselves. A disabled admin does not count,
+  // which is the same reading the server's guard uses; the panel says so before
+  // anyone clicks Save.
+  function isLastEnabledAdmin(u) {
+    if (!isAdmin(u)) return false;
+    return !people.some((other) => other !== u && isAdmin(other) && !other.disabled);
+  }
+
+  function userDialog(user) {
+    const isNew = !user;
+    const u = user || {};
+    const self = !isNew && u.username === me;
+    const fields = {};
+    let armed = null;
+    return dialog({
+      title: isNew ? 'Add a user' : 'Edit ' + u.username,
+      copy: isNew
+        ? 'They get a sign-in code once, then choose their own password. You never '
+          + 'need to know what it is, and it never passes through this page.'
+        : 'Their sign-in name cannot change: it is what their chats and settings belong to.',
+      dismiss: null,
+      actions: [
+        {label: 'Cancel', kind: 'ghost', value: null},
+        {label: 'Save', kind: 'primary', primary: true, disabled: isNew,
+         value: () => ({
+           username: fields.username.value.trim().toLowerCase(),
+           displayName: fields.displayName.value.trim(),
+           email: fields.email.value.trim(),
+           isAdmin: fields.isAdmin.checked,
+           disabled: fields.isDisabled.checked,
+         })},
+      ],
+      build: (api) => {
+        armed = api.ok;
+        fields.username = fieldRow(api.body, 'Sign-in name', isNew ? '' : u.username, {
+          maxLength: 16,
+          readonly: isNew ? null : 'The sign-in name cannot be changed',
+          hint: isNew ? 'Lower-case letters, digits and . _ - , starting with a letter, '
+            + '2 to 16 characters. Names are case-insensitive.' : null,
+        });
+        fields.displayName = fieldRow(api.body, 'Full name', u.display_name, {maxLength: 80});
+        fields.email = fieldRow(api.body, 'E-mail address', u.email, {
+          maxLength: 254,
+          hint: 'Kept on the appliance. The chat interface uses '
+            + (isNew ? 'their name' : u.username) + '@localhost as its own address.',
+        });
+        fields.isAdmin = checkRow(api.body, 'Administrator', isAdmin(u),
+          (!isNew && isLastEnabledAdmin(u))
+            ? 'This is the last admin who can sign in. Give someone else '
+              + 'Administrator first.'
+            : null);
+        fields.isDisabled = checkRow(api.body, 'Cannot sign in', !!u.disabled,
+          self ? 'You cannot disable the account you are signed in as.' : null);
+        if (isNew) {
+          // Same reason the typed delete confirm disables its own button: the
+          // only way to press Save is to have written something that can work.
+          const check = () => {
+            armed.disabled = !USERNAME_RE.test(fields.username.value.trim().toLowerCase());
+          };
+          fields.username.addEventListener('input', check);
+          check();
+        }
+      },
+    });
+  }
+
+  async function saveUser(user, values) {
+    if (!values || !values.username) return false;
+    if (!user) {
+      const code = makeOtp(await loadWordbook());
+      const pair = derive(values.username, code);
+      await post('/_lemonseed/api/users/create', {
+        username: values.username,
+        display_name: values.displayName,
+        email: values.email,
+        is_admin: values.isAdmin,
+        salt: pair.salt,
+        verifier: pair.verifier,
+      });
+      await showCode(values.username, code);
+      return true;
+    }
+    // One field per request, so "which of these did you change" has exactly one
+    // answer in the audit log (the control plane refuses two at once).
+    const username = user.username;
+    if (values.displayName !== (user.display_name || '')) {
+      await post('/_lemonseed/api/users/update',
+                 {username: username, display_name: values.displayName});
+    }
+    if (values.email !== (user.email || '')) {
+      await post('/_lemonseed/api/users/update', {username: username, email: values.email});
+    }
+    if (values.isAdmin !== isAdmin(user)) {
+      await post('/_lemonseed/api/users/groups', {
+        username: username,
+        groups: values.isAdmin
+          ? Array.from(new Set((user.groups || []).concat('admin')))
+          : (user.groups || []).filter((g) => g !== 'admin'),
+      });
+    }
+    if (values.disabled !== !!user.disabled) {
+      await post('/_lemonseed/api/users/disabled', {username: username, disabled: values.disabled});
+    }
+    return true;
+  }
+
+  function userRow(u) {
+    const row = el('tr');
+
+    const nameCell = el('td', 'col-user');
+    nameCell.appendChild(el('span', 'user-name', u.username));
+    const flags = [];
+    if (u.disabled) flags.push('cannot sign in');
+    if (u.password_reset_required) flags.push('must choose a new one');
+    if (flags.length) nameCell.appendChild(el('span', 'acct-sub', flags.join(' · ')));
+    row.appendChild(nameCell);
+
+    const name = el('td');
+    name.appendChild(el('span', null, u.display_name || ''));
+    const memberOf = (u.groups || []).filter((g) => g !== 'users');
+    if (memberOf.length) name.appendChild(el('span', 'acct-sub', memberOf.join(', ')));
+    row.appendChild(name);
+
+    const email = el('td', 'col-email', u.email || '');
+    row.appendChild(email);
+
+    const actions = el('td', 'col-actions');
+    actions.appendChild(iconButton('edit', 'Edit ' + u.username, 'Edit this account', async () => {
+      run(async () => { if (await saveUser(u, await userDialog(u))) note('Saved.'); }, null);
+    }));
+    actions.appendChild(iconButton('code', 'Give ' + u.username + ' a new sign-in code',
+      'Replace their code: their current password stops working', async () => {
+      const sure = await dialogConfirm(
+        'Give ' + u.username + ' a new sign-in code?',
+        (u.username === me
+          ? 'This is the account you are signed in as. '
+          : '')
+        + 'Their current stops working, along with every device already signed in, '
+        + 'and they set a new one at the next sign-in.',
+        {confirmLabel: 'Generate a code'});
+      if (!sure) return;
+      run(async () => {
+        const code = makeOtp(await loadWordbook());
+        const pair = derive(u.username, code);
+        await post('/_lemonseed/api/users/reset-password',
+                   {username: u.username, salt: pair.salt, verifier: pair.verifier});
+        await showCode(u.username, code);
+      }, null);
+    }));
+    actions.appendChild(iconButton('remove', 'Delete ' + u.username, 'Delete this account', async () => {
+      const go = await dialogTypedConfirm(
+        'Delete ' + u.username + '?',
+        'The account and their chat data go with it. This cannot be undone.',
+        u.username, {confirmLabel: 'Delete account'});
+      if (!go) return;
+      run(() => post('/_lemonseed/api/users/delete', {username: u.username}), 'Account deleted.');
+    }, u.username === firstAdmin
+      ? 'The first admin cannot be deleted.'
+      : (u.username === me ? 'You cannot delete the account you are signed in as.' : null)));
+    row.appendChild(actions);
+    return row;
+  }
+
+  // --- groups -----------------------------------------------------------------
+
+  function groupMembers(g) {
+    return (g.members || people.filter((u) => (u.groups || []).includes(g.name))
+      .map((u) => u.username));
+  }
+
+  function membersDialog(g) {
+    const current = groupMembers(g);
+    const boxes = [];
+    const body = el('div', 'dialog-scroll');
+    people.forEach((u) => {
+      const row = el('label', 'dialog-check');
+      const box = el('input');
+      box.type = 'checkbox';
+      box.checked = current.includes(u.username);
+      row.appendChild(box);
+      row.appendChild(el('span', null, u.display_name && u.display_name !== u.username
+        ? u.username + ' — ' + u.display_name
+        : u.username));
+      // Admin membership is the Administrator tick on the account, so the two
+      // surfaces cannot disagree about who is an admin (D-2).
+      if (g.name === 'admin') {
+        box.disabled = isAdmin(u);
+        if (isAdmin(u)) row.title = 'Admin membership is set on the account.';
+      }
+      body.appendChild(row);
+      boxes.push({username: u.username, box: box});
+    });
+    if (!boxes.length) body.appendChild(el('p', 'owui-hint', 'There are no accounts yet.'));
+    return dialog({
+      title: 'Members of ' + g.name,
+      copy: 'Whoever is in this group gets the settings that go with it.',
+      dismiss: null,
+      body: body,
+      actions: [
+        {label: 'Cancel', kind: 'ghost', value: null},
+        {label: 'Save', kind: 'primary', primary: true,
+         value: () => boxes.filter((b) => b.box.checked).map((b) => b.username)},
+      ],
+    });
+  }
+
+  // Today every attribute the appliance declares is a switch, so a checkbox is
+  // the honest control. A key that wants a list or a string needs its own row
+  // type; inventing a text box for a value the server will not accept that way
+  // would be worse than not offering it.
+  function groupSettingsDialog(g) {
+    const boxes = [];
+    const body = el('div');
+    attributeKeys.forEach((key) => {
+      const on = !!(g.attributes || {})[key];
+      const row = el('label', 'dialog-check');
+      const box = el('input');
+      box.type = 'checkbox';
+      box.checked = on;
+      row.appendChild(box);
+      row.appendChild(el('span', null, key.replace(/_/g, ' ')));
+      body.appendChild(row);
+      boxes.push({key: key, box: box, was: on});
+    });
+    if (!boxes.length) {
+      body.appendChild(el('p', 'owui-hint', 'This group has no settings to change.'));
+    }
+    return dialog({
+      title: 'Settings for ' + g.name,
+      copy: 'These apply to everyone in the group.',
+      dismiss: null,
+      body: body,
+      actions: [
+        {label: 'Cancel', kind: 'ghost', value: null},
+        {label: 'Save', kind: 'primary', primary: true, value: () => boxes},
+      ],
+    });
+  }
+
+  function groupRow(g) {
+    const row = el('tr');
+    const name = el('td', 'col-user', g.name);
+    if (g.system) name.appendChild(el('span', 'acct-sub', 'built in'));
+    row.appendChild(name);
+    const members = groupMembers(g);
+    row.appendChild(el('td', null, members.length + (members.length === 1 ? ' member' : ' members')));
+
+    const actions = el('td', 'col-actions');
+    if (!g.system) {
+      actions.appendChild(iconButton('members', 'Members of ' + g.name,
+        'Who is in this group', async () => {
+        run(async () => {
+          const chosen = await membersDialog(g);
+          if (!chosen) return;
+          const before = groupMembers(g);
+          for (const username of before) {
+            if (!chosen.includes(username)) {
+              await post('/_lemonseed/api/groups/member',
+                         {group: g.name, username: username, add: false});
+            }
+          }
+          for (const username of chosen) {
+            if (!before.includes(username)) {
+              await post('/_lemonseed/api/groups/member',
+                         {group: g.name, username: username, add: true});
+            }
+          }
+        }, 'Membership saved.');
+      }));
+      actions.appendChild(iconButton('settings', 'Settings for ' + g.name,
+        'The settings this group carries', async () => {
+        run(async () => {
+          const boxes = await groupSettingsDialog(g);
+          if (!boxes) return;
+          for (const item of boxes) {
+            if (item.was === item.box.checked) continue;
+            if (item.box.checked) {
+              await post('/_lemonseed/api/groups/attribute',
+                         {group: g.name, key: item.key, value: true});
+            } else {
+              await post('/_lemonseed/api/groups/attribute-remove',
+                         {group: g.name, key: item.key});
+            }
+          }
+        }, 'Group settings saved.');
+      }));
+      actions.appendChild(iconButton('remove', 'Delete ' + g.name, 'Delete this group', async () => {
+        const go = await dialogTypedConfirm(
+          'Delete the group ' + g.name + '?',
+          'Nobody loses an account; the memberships and the settings on this group '
+          + 'are removed.',
+          g.name, {confirmLabel: 'Delete group'});
+        if (!go) return;
+        run(() => post('/_lemonseed/api/groups/delete', {group: g.name}), 'Group deleted.');
+      }));
+    }
+    row.appendChild(actions);
+    return row;
+  }
+
+  // --- audit log --------------------------------------------------------------
+
+  function auditRow(e) {
+    const row = el('div', 'row');
+    row.appendChild(el('span', 'name', (e.at || '').slice(0, 16).replace('T', ' ')
+      + ' · ' + (e.actor || '') + ' → ' + (e.target || '')));
+    row.appendChild(el('span', 'state ok', e.action || ''));
+    return row;
+  }
+
+  function csvField(value) {
+    const text = value == null ? '' : (typeof value === 'object' ? JSON.stringify(value) : String(value));
+    return '"' + text.replace(/"/g, '""') + '"';
+  }
+
+  // The download is built in the browser from the rows already fetched: the log
+  // is small, it is admin-only, and a CSV endpoint would be a second way to read
+  // the same table for the gateway to have to gate.
+  function downloadCsv() {
+    const lines = ['timestamp,actor,target,action,detail'];
+    auditLog.forEach((e) => {
+      lines.push([e.at, e.actor, e.target, e.action, e.detail].map(csvField).join(','));
+    });
+    const url = URL.createObjectURL(new Blob([lines.join('\r\n') + '\r\n'],
+      {type: 'text/csv;charset=utf-8'}));
+    const link = el('a');
+    link.href = url;
+    link.download = 'lemonseed-audit-log.csv';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  async function auditDialog() {
+    const body = el('div', 'dialog-scroll');
+    if (!auditLog.length) body.appendChild(el('p', 'owui-hint', 'Nothing recorded yet.'));
+    auditLog.forEach((e) => body.appendChild(auditRow(e)));
+    const answer = await dialog({
+      title: 'Recent changes',
+      copy: 'Who changed what, in the appliance’s own words. Kept for a year.',
+      dismiss: null,
+      body: body,
+      actions: [
+        {label: 'Download CSV', kind: 'ghost', value: 'csv'},
+        {label: 'Close', kind: 'primary', value: null, primary: true},
+      ],
+    });
+    if (answer === 'csv') downloadCsv();
+  }
+
+  async function loadAudit() {
+    const box = document.getElementById('acct-audit-log');
+    if (!box) return;
+    const res = await portalFetch('/_lemonseed/api/audit');
+    clear(box);
+    if (!res.ok) {
+      box.appendChild(el('p', 'owui-hint', await portalError(res, 'No log available.')));
+      return;
+    }
+    auditLog = (await res.json()).events || [];
+    if (!auditLog.length) {
+      box.appendChild(el('p', 'owui-hint', 'Nothing recorded yet.'));
+      return;
+    }
+    auditLog.slice(0, 5).forEach((e) => box.appendChild(auditRow(e)));
+    if (auditLog.length > 5) {
+      box.appendChild(el('p', 'owui-hint', 'Showing the 5 newest of ' + auditLog.length + '.'));
+    }
+  }
+
+  // --- the screen -------------------------------------------------------------
+
+  function render() {
+    const list = clear(document.getElementById('acct-people'));
+    people.forEach((u) => list.appendChild(userRow(u)));
+    const glist = clear(document.getElementById('acct-groups'));
+    groups.forEach((g) => glist.appendChild(groupRow(g)));
+  }
+
+  async function load() {
+    const who = await portalFetch('/_lemonseed/api/profile');
+    if (who.ok) {
+      const self = await who.json();
+      me = (self.user && self.user.username) || '';
+    }
+    const res = await portalFetch('/_lemonseed/api/users');
+    if (!res.ok) {
+      note(await portalError(res, 'Accounts are unavailable.'), true);
+      return;
+    }
+    const data = await res.json();
+    people = data.users || [];
+    groups = data.groups || [];
+    firstAdmin = data.first_admin || '';
+    attributeKeys = data.attributes || [];
+    render();
+    await loadAudit();
+  }
+
+  // run() wraps a change: one busy flag for the panel, the server's own sentence
+  // on a refusal, and a re-read afterwards so the table shows what the appliance
+  // actually has rather than what the click asked for.
+  function run(fn, done) {
+    if (busy) return Promise.resolve();
+    return (async () => {
+      setBusy(true);
+      note('');
+      try {
+        await fn();
+        if (done) note(done);
+        await load();
+      } catch (err) {
+        note(err.message || 'That did not work.', true);
+      } finally {
+        setBusy(false);
+      }
+    })();
+  }
+
+  function decorate(button, icon) {
+    if (!button) return;
+    button.prepend(svgIcon(icon));
+  }
+
+  function wire() {
+    decorate(document.getElementById('acct-add-user'), 'add');
+    decorate(document.getElementById('group-add-button'), 'add');
+
+    const add = document.getElementById('acct-add-user');
+    if (add) {
+      add.addEventListener('click', () => {
+        run(async () => {
+          const values = await userDialog(null);
+          if (!values) return;
+          if (!USERNAME_RE.test(values.username)) {
+            throw new Error('That sign-in name cannot be used.');
+          }
+          if (await saveUser(null, values)) note('Account added.');
+        }, null);
+      });
+    }
+    const newGroup = document.getElementById('group-add-button');
+    if (newGroup) {
+      newGroup.addEventListener('click', () => {
+        run(async () => {
+          const name = await dialogPrompt('Add a group',
+            'Lower-case, no spaces. It appears in the list straight away.',
+            {label: 'Group name', confirmLabel: 'Add group', maxLength: 32});
+          if (!name) return;
+          await post('/_lemonseed/api/groups/create', {group: name.trim().toLowerCase()});
+        }, 'Group added.');
+      });
+    }
+    const audit = document.getElementById('acct-audit');
+    if (audit) audit.addEventListener('click', () => { auditDialog(); });
+  }
+
+  if (document.getElementById('accounts')) {
+    wire();
+    load().catch((err) => note(err.message, true));
+  }
+})();
+"""
+
+# My Profile (/profile/), reachable by anyone signed in. Three things live here
+# and nothing else: your name and address, your password, and a read-only look at
+# your role and last sign-in. The Settings panel is an admin's room; this is
+# everybody's.
+PROFILE_JS = r"""
+(function () {
+  'use strict';
+
+  let me = null;
+
+  const noteEl = document.getElementById('profile-note');
+
+  function note(text, bad) {
+    noteEl.textContent = text || '';
+    noteEl.className = bad ? 'owui-status bad' : 'owui-status';
+    // An empty status pill still draws its border, so an idle page shows a
+    // mystery box; keep it out of the layout until it has something to say.
+    noteEl.hidden = !text;
+  }
+
+  function setBusy(on) {
+    document.querySelectorAll('#profile-panel button, #profile-panel input').forEach((b) => {
+      b.disabled = on;
+    });
+  }
+
+  async function post(path, payload) {
+    const res = await portalFetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error(await portalError(res, 'That did not work.'));
+    return res.json();
+  }
+
+  // The appliance stamps UTC; showing a browser-local reinterpretation of it
+  // would be a guess about a time zone the appliance never claimed.
+  function stamp(iso) {
+    const text = String(iso || '');
+    return text.length >= 16 ? text.slice(0, 16).replace('T', ' ') + ' UTC' : '';
+  }
+
+  function fill(user) {
+    me = user;
+    document.getElementById('profile-name').value = user.display_name || '';
+    document.getElementById('profile-email').value = user.email || '';
+    // Plain text only, always: a display name is free text somebody typed.
+    document.getElementById('profile-user').value = user.username || '';
+    document.getElementById('profile-role').textContent =
+      (user.groups || []).indexOf('admin') >= 0 ? 'Administrator' : 'Member';
+    document.getElementById('profile-last').textContent = stamp(user.last_login) || 'Never';
+  }
+
+  async function load() {
+    const res = await portalFetch('/_lemonseed/api/profile');
+    if (!res.ok) {
+      note(await portalError(res, 'Your details are unavailable.'), true);
+      return;
+    }
+    fill((await res.json()).user || {});
+  }
+
+  async function save(ev) {
+    ev.preventDefault();
+    if (!me) return;
+    const name = document.getElementById('profile-name').value.trim();
+    const email = document.getElementById('profile-email').value.trim();
+    // One field per request, because that is what the route accepts, and because
+    // a refusal then names the field that caused it instead of the form.
+    const wanted = [];
+    if (name !== (me.display_name || '')) wanted.push(['display_name', name]);
+    if (email !== (me.email || '')) wanted.push(['email', email]);
+    if (!wanted.length) {
+      note('Nothing to save.');
+      return;
+    }
+    setBusy(true);
+    note('');
+    try {
+      for (let i = 0; i < wanted.length; i += 1) {
+        await post('/_lemonseed/api/profile', { [wanted[i][0]]: wanted[i][1] });
+      }
+      note('Saved.');
+      await load();
+    } catch (err) {
+      note(err.message || 'That change could not be saved.', true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function changePassword(ev) {
+    ev.preventDefault();
+    if (!window.LemonseedSRP || !LemonseedSRP.ok) {
+      note('This browser failed a security self-check, so passwords cannot be changed here.', true);
+      return;
+    }
+    if (!me) return;
+    const current = document.getElementById('pw-current').value;
+    const next = document.getElementById('pw-next').value;
+    const again = document.getElementById('pw-again').value;
+    if (next.length < 8) { note('Your new password must be at least 8 characters.', true); return; }
+    if (next !== again) { note('The two new passwords do not match.', true); return; }
+    if (current === next) { note('That is the same password.', true); return; }
+    setBusy(true);
+    note('');
+    try {
+      await LemonseedRotate.change(post, me.username, current, next);
+      // Everything else was torn down by the rotation, including this session;
+      // the new cookie came back with the response, so say only what happened.
+      document.getElementById('password-form').reset();
+      note('Password changed.');
+    } catch (err) {
+      note(err.message || 'The password was not changed.', true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  document.getElementById('profile-form').addEventListener('submit', save);
+  document.getElementById('password-form').addEventListener('submit', changePassword);
+  load();
+})();
+"""
+
+# In-flight SRP handshakes. Process-local on purpose: ``b`` is never persisted,
+# so a control-plane restart costs a client one retry instead of putting a
+# handshake secret on disk next to the verifiers.
+PENDING_HANDSHAKES = srp.PendingStore()
+
+# Account- and group-management actions, as the trailing path segment of
+# /_lemonseed/api/users/<action>. Listed rather than dispatched by reflection:
+# an unknown action must 404 from a fixed set, not reach a function someone
+# added later and never meant to be reachable over HTTP.
+USER_ACTIONS = frozenset(
+    {"create", "update", "groups", "disabled", "reset-password", "delete"}
+)
+GROUP_ACTIONS = frozenset(
+    {"create", "delete", "member", "attribute", "attribute-remove"}
+)
+
+
+def _srp_fold_secret() -> bytes:
+    """Seed for the unknown-account simulation, with a stable fallback.
+
+    Before the first admin exists there is no session secret and no account to
+    enumerate, so the fallback only has to be *consistent*, not secret. Deriving
+    it from a constant keeps the simulated path well-formed rather than raising
+    inside a challenge handler.
+    """
+    return auth.fold_secret() or b"lemonseed-srp-fold-secret-unbootstrapped"
+
+
 def state_class(value: str) -> str:
     if value in ("active", "yes", "true"):
         return "ok"
@@ -564,16 +2357,27 @@ def page_setup(
         "Confirm and continue" if review_required else "Finish setup"
     )
     admin_fields = ""
+    srp_enroll_js = ""
     if auth_admin_required:
+        # The password input is still here, but its value never leaves the
+        # browser: SRP_ENROLL_JS derives (salt, verifier), writes them into the
+        # hidden fields, and disables the password input before the native
+        # submit runs, so it is not in the body at all.
         admin_fields = """
+<label for="admin_display_name">Your name</label>
+<input id="admin_display_name" name="admin_display_name" maxlength="80" autocomplete="off" placeholder="Optional"/>
 <label for="admin_username">Admin username</label>
-<input id="admin_username" name="admin_username" maxlength="64" autocomplete="off" value="admin" required/>
+<input id="admin_username" name="admin_username" maxlength="16" autocomplete="off" value="admin" required/>
 <label for="admin_password">Admin password</label>
 <input id="admin_password" name="admin_password" type="password" minlength="8" maxlength="128" autocomplete="new-password" required/>
+<input id="admin_srp_salt" name="admin_srp_salt" type="hidden"/>
+<input id="admin_srp_verifier" name="admin_srp_verifier" type="hidden"/>
+<p class="err" id="setup-srp-error"></p>
 """
+        srp_enroll_js = f"<script>{SRP_CLIENT_JS}</script><script>{SRP_ENROLL_JS}</script>"
     review_html = f"""<section class="panel">
 <h2>{heading}</h2>
-<form method="POST" action="/setup" autocomplete="off">
+<form id="setup-form" method="POST" action="/setup" autocomplete="off">
 <label for="name">Name</label>
 <input id="name" name="name" maxlength="64" autocomplete="off" value="{escape(name, quote=True)}" required/>
 <p class="lede" style="margin-top:0.75rem">Lemonseed will be available at <span id="portal-url">{escape(portal_url)}</span>.</p>
@@ -643,6 +2447,7 @@ waitForStartup();
 {continue_html}
 </section>
 {review_html if show_form else ""}
+{srp_enroll_js}
 {poll_script}
 <script>
 const nameInput = document.getElementById('name');
@@ -714,48 +2519,54 @@ def page_login(*, rd: str = "/", error: str = "") -> bytes:
 </form>
 </div>
 </main>
-<script>
-// The gate can land this page inside the shell's iframe, and a page inside a
-// page is unusable, so break out to the top frame first (M6.6 D3).
-if (window.top !== window.self) {{
-  window.top.location = window.location.href;
-}}
-// Submit as JSON (the CP expects application/json) and label the request as
-// ours, so the CP answers with a body instead of a 302 that fetch() would
-// follow without ever exposing Location.
-document.getElementById('login-form').addEventListener('submit', async (ev) => {{
-  const form = ev.target;
-  ev.preventDefault();
-  const card = document.querySelector('.login-card');
-  let message = '';
-  let target = '/';
-  try {{
-    const body = Object.fromEntries(new FormData(form).entries());
-    const res = await fetch('/login', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json', 'X-Requested-With': 'fetch'}},
-      body: JSON.stringify(body),
-    }});
-    const data = await res.json().catch(() => ({{}}));
-    if (res.ok) {{
-      window.top.location = data.target || '/';
-      return;
-    }}
-    message = data.detail || 'Sign in failed.';
-  }} catch (err) {{
-    message = 'The appliance is not answering yet. Try again in a moment.';
-  }}
-  let err = card.querySelector('.login-error');
-  if (!err) {{
-    err = document.createElement('p');
-    err.className = 'login-error';
-    card.insertBefore(err, form);
-  }}
-  err.textContent = message;
-}});
-</script>
+<script>{SRP_CLIENT_JS}</script>
+<script>{SRP_LOGIN_JS}</script>
 </body></html>"""
     return body.encode()
+
+
+def app_bar(name: str, *, view: str = "chat", metrics: bool = True) -> str:
+    """The appliance's top bar.
+
+    Two documents render it (the app shell and the profile page), so it is one
+    function rather than two copies that drift the first time a control moves.
+
+    ``metrics`` is off on pages that have no script to fill the bars; a load
+    meter pinned at zero would be a lie, not decoration.
+    """
+    chat_active = "active" if view == "chat" else ""
+    gear_active = "active" if view == "settings" else ""
+    meter = """
+<div class="metrics" aria-hidden="true">
+  <div class="metric" title="System load (1 min)">
+    <label>Load</label>
+    <div class="bar"><span id="metric-load" style="width:0%"></span></div>
+  </div>
+  <div class="metric" title="Storage used on /var/lib/lemonseed">
+    <label>Storage</label>
+    <div class="bar"><span id="metric-storage" style="width:0%"></span></div>
+  </div>
+</div>""" if metrics else ""
+
+    return f"""<header class="app-bar">
+<img class="brand-logo" src="/_lemonseed/brand/lemon-64.png" width="28" height="28" alt=""/>
+<p class="title">{name}</p>
+<nav class="nav" aria-label="Main">
+  <a href="/" id="nav-chat" class="{chat_active}" data-view="chat">Chat</a>
+  <span class="disabled" title="Coming soon">Modules</span>
+</nav>
+<span class="spacer"></span>{meter}
+<a href="/settings/" id="nav-settings" class="gear {gear_active}" title="Settings" data-view="settings">⚙</a>
+<span class="pop-wrap">
+<button id="nav-account" class="gear" title="Account" aria-label="Account" aria-haspopup="true" aria-expanded="false"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 12a5 5 0 1 0-5-5a5 5 0 0 0 5 5Zm0 2c-4.4 0-8 2.2-8 5v1h16v-1c0-2.8-3.6-5-8-5Z"/></svg></button>
+<span id="account-pop" class="popover" hidden>
+  <span class="pop-name" id="pop-name"></span>
+  <span class="pop-user" id="pop-user"></span>
+  <a href="/profile/" id="pop-profile">Edit profile</a>
+  <button id="nav-logout" type="button">Log out</button>
+</span>
+</span>
+</header>"""
 
 
 def page_shell(snap: dict[str, Any], *, view: str = "chat") -> bytes:
@@ -767,8 +2578,6 @@ def page_shell(snap: dict[str, Any], *, view: str = "chat") -> bytes:
     if view not in ("chat", "settings", "modules"):
         view = "chat"
 
-    chat_active = "active" if view == "chat" else ""
-    gear_active = "active" if view == "settings" else ""
     # Chat frame stays blank until healthy; panel frame holds settings/modules.
     chat_frame_class = "hidden"
     panel_frame_class = "" if view == "settings" else "hidden"
@@ -781,27 +2590,7 @@ def page_shell(snap: dict[str, Any], *, view: str = "chat") -> bytes:
 <title>{name}</title>{brand_head_links()}<link rel="stylesheet" href="/_lemonseed/lemonseed.css"/>
 </head><body>
 <main class="app-shell">
-<header class="app-bar">
-<img class="brand-logo" src="/_lemonseed/brand/lemon-64.png" width="28" height="28" alt=""/>
-<p class="title">{name}</p>
-<nav class="nav" aria-label="Main">
-  <a href="/" id="nav-chat" class="{chat_active}" data-view="chat">Chat</a>
-  <span class="disabled" title="Coming soon">Modules</span>
-</nav>
-<span class="spacer"></span>
-<div class="metrics" aria-hidden="true">
-  <div class="metric" title="System load (1 min)">
-    <label>Load</label>
-    <div class="bar"><span id="metric-load" style="width:0%"></span></div>
-  </div>
-  <div class="metric" title="Storage used on /var/lib/lemonseed">
-    <label>Storage</label>
-    <div class="bar"><span id="metric-storage" style="width:0%"></span></div>
-  </div>
-</div>
-<a href="/settings/" id="nav-settings" class="gear {gear_active}" title="Settings" data-view="settings">⚙</a>
-<button id="nav-logout" class="gear" title="Log out" aria-label="Log out">⎋</button>
-</header>
+{app_bar(name, view=view)}
 <div class="frame-wrap">
 <div class="frame-fallback {landing_class}" id="chat-fallback">
   <div class="landing" id="landing-card">
@@ -818,6 +2607,7 @@ def page_shell(snap: dict[str, Any], *, view: str = "chat") -> bytes:
 </div>
 </main>
 <script>{PORTAL_FETCH_JS}</script>
+<script>{ACCOUNT_JS}</script>
 <script>
 let currentView = {json.dumps(view)};
 let chatBootstrapped = false;
@@ -857,7 +2647,8 @@ function landingCopy(chat, owui) {{
   if (chatState === 'rebooting') {{
     return {{
       title: 'Rebooting',
-      workflow: 'Applying GPU memory settings',
+      workflow: 'Rebooting',
+      task: 'The appliance is rebooting — this page will reconnect automatically…',
       task: 'The appliance is rebooting — this page will reconnect automatically…',
       cls: 'wait',
     }};
@@ -1019,21 +2810,8 @@ document.getElementById('nav-settings').addEventListener('click', (ev) => {{
   ev.preventDefault();
   setView('settings', true);
 }});
-document.getElementById('nav-logout').addEventListener('click', async () => {{
-  // Tear the chat frame down before navigating. It carries its own Open WebUI
-  // session, so leaving it loaded keeps a signed-in, interactive chat on screen
-  // for as long as it takes the browser to paint /login (M6.6 step 4).
-  retireChatFrame();
-  // /logout answers 302 and fetch() follows it, so the cookie is cleared by the
-  // request itself; the navigation is what actually leaves the shell.
-  try {{
-    await portalFetch('/logout', {{method: 'POST'}});
-  }} catch (_err) {{
-    // A failed logout still gets the user out of the shell: the cookie is
-    // HttpOnly and idle-expiring, and a stuck signed-in page is worse.
-  }}
-  window.top.location = '/login';
-}});
+// Log out lives in the account popover (ACCOUNT_JS), which retires the chat
+// frame before navigating; signing out is not the shell's own concern.
 window.addEventListener('popstate', () => {{
   const path = location.pathname.replace(/\\/$/, '') || '/';
   setView(path === '/settings' ? 'settings' : 'chat', false);
@@ -1168,6 +2946,72 @@ setInterval(refreshStatus, 5000);
 refreshStatus();
 if (currentView === 'settings') showPanelFrame(SETTINGS_SRC);
 </script>
+</body></html>"""
+    return body.encode()
+
+
+def page_profile(snap: dict[str, Any]) -> bytes:
+    """My Profile (``/profile/``): the one page every signed-in person can reach.
+
+    Deliberately small, and deliberately not a shrunken Settings panel. A
+    non-admin gets chat and this page, so everything on it is something they can
+    act on for themselves; role and last sign-in are shown because people ask,
+    not because they are actionable here.
+
+    The username is rendered into a disabled field rather than a label so it can
+    be selected and copied, which is what people want from it, and it is filled
+    from the API response rather than from a cookie the browser cannot read.
+    """
+    setup = load_setup()
+    name = escape(str(setup.get("name") or "Lemonseed"))
+    # A member cannot reach the settings panel, so this row is the only place they
+    # can see which model the appliance is answering from. Read-only on purpose:
+    # the model is one choice for the whole household, and whoever changes it
+    # changes it for everyone, so that button belongs to an admin.
+    chat = chat_ready.chat_snapshot()
+    model = escape(str(chat.get("display_name") or chat.get("model_id") or ""))
+    model_state = "ok" if model else "wait"
+    model_label = model or "not chosen yet"
+    body = f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>{name} — Profile</title>{brand_head_links()}<link rel="stylesheet" href="/_lemonseed/lemonseed.css"/>
+</head><body>
+<main class="app-shell">
+{app_bar(name, metrics=False)}
+<div class="frame-wrap">
+<section class="panel profile-panel" id="profile-panel">
+<h2>My profile</h2>
+<p class="owui-status" id="profile-note" hidden></p>
+<form id="profile-form">
+<div class="field"><label for="profile-user">Username</label><input id="profile-user" type="text" maxlength="16" autocomplete="off" disabled/></div>
+<div class="field"><label for="profile-name">Name</label><input id="profile-name" name="display_name" type="text" maxlength="80" autocomplete="off"/></div>
+<div class="field"><label for="profile-email">E-mail</label><input id="profile-email" name="email" type="text" maxlength="254" autocomplete="off"/></div>
+<button type="submit" class="btn primary">Save</button>
+</form>
+</section>
+<section class="panel profile-panel" id="profile-password-panel">
+<h2>Change password</h2>
+<p class="lede">Lemonseed never sends your password over the network; passwords are converted to
+single-use passcodes before transmission to the Lemonseed appliance.</p>
+<form id="password-form">
+<div class="field"><label for="pw-current">Current password</label><input id="pw-current" name="current-password" type="password" autocomplete="current-password" required/></div>
+<div class="field"><label for="pw-next">New password</label><input id="pw-next" name="new-password" type="password" autocomplete="new-password" minlength="8" required/></div>
+<div class="field"><label for="pw-again">New password again</label><input id="pw-again" name="confirm-password" type="password" autocomplete="new-password" minlength="8" required/></div>
+<button type="submit" class="btn primary">Change password</button>
+</form>
+<h3 class="subhead">Account</h3>
+<div class="row"><span class="name">Role</span><span class="state" id="profile-role">…</span></div>
+<div class="row"><span class="name">Last sign-in</span><span class="state" id="profile-last">…</span></div>
+<div class="row"><span class="name">Chat model</span><span class="state {model_state}" id="profile-model">{model_label}</span></div>
+</section>
+</div>
+</main>
+<script>{PORTAL_FETCH_JS}</script>
+<script>{SRP_CLIENT_JS}</script>
+<script>{ROTATE_JS}</script>
+<script>{ACCOUNT_JS}</script>
+<script>{PROFILE_JS}</script>
 </body></html>"""
     return body.encode()
 
@@ -1407,14 +3251,14 @@ function owuiResetPoll() {
 async function owuiResetConfig() {
   // Server-rendered so the word the admin types and the one the control plane
   // checks cannot drift apart across a deploy. Compared case-insensitively by
-  // the CP; single-line copy because window.prompt wraps awkwardly.
+  // the CP, and the dialog keeps its own OK disabled until it is typed.
   const phrase = document.getElementById('owui-reset').dataset.confirm || '';
-  const typed = window.prompt(
-    'Reset rebuilds the chat interface settings from Lemonseed defaults. Chats, '
-    + 'models and accounts are kept; settings changed in Open WebUI are lost. '
-    + 'Type ' + phrase + ' to confirm.',
-    '');
-  if (typed === null) return;
+  const go = await dialogTypedConfirm(
+    'Reset the chat interface settings?',
+    'Lemonseed rebuilds the chat interface settings from its own defaults. Chats, '
+    + 'models and accounts are kept; settings changed inside Open WebUI are lost.',
+    phrase, { confirmLabel: 'Reset settings' });
+  if (!go) return;
   owuiStatus('');
   try {
     const res = await portalFetch('/_lemonseed/api/owui/reset-config', {
@@ -1502,6 +3346,496 @@ def _fmt_utc(iso: Optional[str]) -> str:
     return utc.strftime("%Y-%m-%d %H:%M UTC")
 
 
+# --- The settings control panel: one rail, five panes (M7) -------------------
+
+# Bare-metal review finding: every control the admin has was stacked in one tall
+# column inside a 42rem iframe, so "change the model" and "add a person" were two
+# scrolls apart and nothing read as a control panel. This is a rail of tabs down
+# the left and one pane of controls on the right.
+#
+# The rail lives *inside* /settings/content rather than in the portal shell on
+# purpose. The chat view is an Open WebUI iframe that already owns a left rail,
+# and both of them auto-hide; two rails side by side is a mess you only find by
+# using the box. The shell keeps its top bar for chat / settings / profile, and
+# only the settings document grows a rail of its own.
+
+# Hand-drawn 24x24 stroke icons, not an icon font and not emoji: they inherit
+# currentColor so the selected tab stays legible, they cost no request at page
+# load, and an emoji renders in whichever font that OS happens to have.
+def _icon(paths: str) -> str:
+    return (
+        '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor"'
+        ' stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"'
+        f' aria-hidden="true">{paths}</svg>'
+    )
+
+
+ICON_GENERAL = _icon(
+    '<path d="M4 7h7.6"/><path d="M16.8 7H20"/><circle cx="14.2" cy="7" r="2.2"/>'
+    '<path d="M4 12h2.8"/><path d="M12 12H20"/><circle cx="9.4" cy="12" r="2.2"/>'
+    '<path d="M4 17h7.6"/><path d="M16.8 17H20"/><circle cx="14.2" cy="17" r="2.2"/>'
+)
+ICON_MODELS = _icon(
+    '<rect x="7" y="7" width="10" height="10" rx="2"/>'
+    '<rect x="10.4" y="10.4" width="3.2" height="3.2" rx="0.8"/>'
+    '<path d="M9.8 4v3M14.2 4v3M9.8 17v3M14.2 17v3'
+    'M4 9.8h3M4 14.2h3M17 9.8h3M17 14.2h3"/>'
+)
+ICON_PEOPLE = _icon(
+    '<circle cx="9.6" cy="8.6" r="3.2"/>'
+    '<path d="M3.8 19.6c0-3.2 2.6-5.2 5.8-5.2s5.8 2 5.8 5.2"/>'
+    '<path d="M16 5.8a3.2 3.2 0 0 1 0 5.9"/>'
+    '<path d="M17.4 14.6c2.1.7 3.4 2.5 3.4 4.7"/>'
+)
+ICON_CHAT = _icon(
+    '<path d="M20.4 14.5a2.4 2.4 0 0 1-2.4 2.4H9.1l-4.6 3.5V6.9a2.4 2.4 0 0 1 2.4-2.4h11.1'
+    'a2.4 2.4 0 0 1 2.4 2.4z"/>'
+)
+ICON_MODULES = _icon(
+    '<rect x="4" y="4" width="7" height="7" rx="1.6"/><rect x="13" y="4" width="7" height="7" rx="1.6"/>'
+    '<rect x="4" y="13" width="7" height="7" rx="1.6"/><rect x="13" y="13" width="7" height="7" rx="1.6"/>'
+)
+ICON_POWER = _icon('<path d="M12 3.6v8"/><path d="M17.9 7.4a8 8 0 1 1-11.8.04"/>')
+
+# (pane suffix, rail label, icon). The order is the rail's order; the label must
+# fit one line at the narrowest desktop width, because a wrapped rail label makes
+# every row a different height and reads as broken.
+SETTINGS_TABS: tuple[tuple[str, str, str], ...] = (
+    ("general", "General", ICON_GENERAL),
+    ("models", "AI Models", ICON_MODELS),
+    ("people", "Users & Groups", ICON_PEOPLE),
+    ("chat", "Open WebUI", ICON_CHAT),
+    ("modules", "Modules", ICON_MODULES),
+)
+SETTINGS_FIRST_TAB = SETTINGS_TABS[0][0]
+
+
+def settings_rail() -> str:
+    """The rail's buttons. aria-selected is all false here; the pane the server
+    renders visible and the selection the script makes are reconciled by
+    ``SETTINGS_JS`` on load, before the first paint the admin can see.
+    """
+    return "\n".join(
+        f'<button type="button" class="rail-item" role="tab" id="tab-{pane}"'
+        f' data-pane="{pane}" aria-controls="pane-{pane}" aria-selected="false">'
+        f'{icon}<span class="rail-label">{escape(label)}</span></button>'
+        for pane, label, icon in SETTINGS_TABS
+    )
+
+
+# Plain strings (not f-strings) on purpose: JS braces stay single.
+SETTINGS_JS = r"""
+// Rail switching. Every pane is already in the served HTML and only one is
+// unhidden, so the page reads with JS off and the smoke test can assert on
+// markup no browser had to produce.
+const SETTINGS_PANES = ['general', 'models', 'people', 'chat', 'modules'];
+const SETTINGS_TAB_KEY = 'lemonseed-settings-tab';
+
+function selectSettingsTab(pane, remember) {
+  if (!SETTINGS_PANES.includes(pane)) pane = 'general';
+  for (const name of SETTINGS_PANES) {
+    const tab = document.getElementById('tab-' + name);
+    const box = document.getElementById('pane-' + name);
+    if (!tab || !box) continue;
+    const on = name === pane;
+    tab.setAttribute('aria-selected', on ? 'true' : 'false');
+    tab.tabIndex = on ? 0 : -1;
+    box.hidden = !on;
+  }
+  // Not on first load: a fresh browser tab should start at General, and writing
+  // the default here would make that permanent.
+  if (remember !== false) {
+    try { sessionStorage.setItem(SETTINGS_TAB_KEY, pane); } catch (err) {}
+  }
+}
+
+function settingsTabFromUrl() {
+  const hash = (window.location.hash || '').replace('#', '');
+  if (SETTINGS_PANES.includes(hash)) return hash;
+  try {
+    const saved = sessionStorage.getItem(SETTINGS_TAB_KEY);
+    if (SETTINGS_PANES.includes(saved)) return saved;
+  } catch (err) {}
+  return 'general';
+}
+
+function initSettingsRail() {
+  const rail = document.querySelector('.settings-rail');
+  if (!rail) return;
+  rail.addEventListener('click', (ev) => {
+    const item = ev.target.closest('.rail-item');
+    if (item) selectSettingsTab(item.dataset.pane);
+  });
+  // A tablist with a roving tabindex: Tab leaves the rail, arrows move inside it.
+  rail.addEventListener('keydown', (ev) => {
+    const item = ev.target.closest('.rail-item');
+    if (!item) return;
+    const items = Array.from(rail.querySelectorAll('.rail-item'));
+    const at = items.indexOf(item);
+    let next = -1;
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowRight') next = (at + 1) % items.length;
+    else if (ev.key === 'ArrowUp' || ev.key === 'ArrowLeft') next = (at - 1 + items.length) % items.length;
+    else if (ev.key === 'Home') next = 0;
+    else if (ev.key === 'End') next = items.length - 1;
+    if (next < 0) return;
+    ev.preventDefault();
+    items[next].focus();
+    selectSettingsTab(items[next].dataset.pane);
+  });
+  selectSettingsTab(settingsTabFromUrl(), false);
+}
+initSettingsRail();
+"""
+
+# Power controls (P5). Only the two the appliance can do honestly today; update
+# affordances stay in P5's later phases. Admin-only at the gateway *and* in the
+# control plane, so a member gets a 403 rather than a greyed-out mystery.
+POWER_JS = r"""
+function powerNote(text, bad) {
+  const note = document.getElementById('power-note');
+  if (!note) return;
+  note.textContent = text || '';
+  note.hidden = !text;
+  note.className = 'owui-status' + (bad ? ' bad' : '');
+}
+
+function powerDisable() {
+  // The box is on its way out. Leaving the buttons live invites a second click
+  // that cannot do anything except fail confusingly.
+  for (const id of ['power-reboot', 'power-shutdown']) {
+    const button = document.getElementById(id);
+    if (button) button.disabled = true;
+  }
+}
+
+async function powerWatch(action) {
+  // "It is rebooting" is only true once the box stops answering, so say it when
+  // the poll goes quiet and reload when it answers again. /api/chat, not the
+  // open /api/status: this page already polls it, and the open subset is the
+  // installer's handoff, not the portal's (test_portal_fetch holds that line).
+  let offline = false;
+  const timer = setInterval(async () => {
+    const res = await portalFetch('/api/chat');
+    if (!res.ok) {
+      if (offline) return;
+      offline = true;
+      powerNote(action === 'shutdown'
+        ? 'The appliance is off. Press its power button to start it again.'
+        : 'The appliance is rebooting. This page reconnects when it is back.',
+        action !== 'shutdown');
+      return;
+    }
+    if (offline) {
+      clearInterval(timer);
+      window.top.location.reload();
+    }
+  }, 2000);
+}
+
+const POWER_COPY = {
+  reboot: {
+    title: 'Reboot the appliance?',
+    copy: 'Anything running now stops, and the appliance comes back on its own in '
+      + 'a minute or two. Chats, models and settings are not changed.',
+    confirm: 'Reboot now',
+    refused: 'The appliance refused to reboot.',
+  },
+  shutdown: {
+    title: 'Shut down the appliance?',
+    copy: 'The appliance will stay off, with no lights and no network, until someone '
+      + 'presses its power button. Chats, models and settings are not changed.',
+    confirm: 'Shut down',
+    refused: 'The appliance refused to shut down.',
+  },
+};
+
+async function powerAct(action) {
+  const copy = POWER_COPY[action];
+  if (!copy) return;
+  const go = await dialogConfirm(copy.title, copy.copy, {
+    confirmLabel: copy.confirm, cancelLabel: 'Stay on', danger: action === 'shutdown',
+  });
+  if (!go) return;
+  powerNote('');
+  let res = null;
+  try {
+    res = await portalFetch('/_lemonseed/api/power', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action: action}),
+    });
+  } catch (err) {
+    res = null;
+  }
+  if (res === null) {
+    powerNote('Could not reach the control plane.', true);
+    return;
+  }
+  if (!res.ok) {
+    // 409 carries the sentence naming the work in flight (a model download, an
+    // Open WebUI window). Rendering it verbatim is the whole point of the refusal.
+    powerNote(await portalError(res, copy.refused), true);
+    return;
+  }
+  powerDisable();
+  powerNote(action === 'shutdown' ? 'Shutting down…' : 'Rebooting…');
+  powerWatch(action);
+}
+
+function initPower() {
+  for (const action of ['reboot', 'shutdown']) {
+    const button = document.getElementById('power-' + action);
+    if (!button) continue;
+    button.addEventListener('click', () => { powerAct(action); });
+  }
+}
+initPower();
+"""
+
+
+# The SYSTEM panel's Version section (M7 P5): running vs latest, Check now,
+# Download and install, and the failed-update banner. The updater is run as a
+# job server-side; this only renders the snapshot and starts jobs.
+UPDATE_JS = r"""
+(function () {
+  'use strict';
+
+  const note = document.getElementById('update-note');
+  const failedBox = document.getElementById('update-failed');
+  const checkButton = document.getElementById('update-check');
+  const install = document.getElementById('update-install');
+  if (!note || !failedBox || !checkButton || !install) return;
+
+  // The one status line under the buttons. It was named after the power
+  // panel's powerNote and the rename never landed here — hence the silent
+  // dead panel on the first error (bare-metal review, BM-3).
+  function noteIt(text, bad) {
+    if (!note) return;
+    note.textContent = text;
+    note.classList.toggle('bad', !!bad);
+    note.hidden = !text;
+  }
+
+  let poll = null;
+  let known = null;      // the last snapshot render() saw
+  let watching = null;   // the install dialog's poll, independent of render's
+
+  function busy(s) {
+    const state = (s.job && s.job.state) || 'idle';
+    return state === 'running' || state === 'downloading' || state === 'writing'
+      || state === 'rebooting';
+  }
+
+  function render(s) {
+    known = s;
+    const job = s.job || {state: 'idle', detail: ''};
+    document.getElementById('version-running').textContent = s.running || 'unknown';
+    document.getElementById('version-latest').textContent = s.latest || 'not checked';
+    if (s.failed) {
+      failedBox.textContent = 'The update to ' + s.failed.intended + ' did not land; the '
+        + 'appliance is running ' + (s.failed.running || 'an earlier version') + '.';
+      failedBox.hidden = false;
+    } else {
+      failedBox.hidden = true;
+    }
+    const working = busy(s);
+    install.disabled = !s.available || working;
+    checkButton.disabled = working;
+    if (working) {
+      noteIt(job.detail || 'Working…');
+      if (!poll) poll = setInterval(refresh, 2000);
+    } else {
+      if (job.state === 'failed') noteIt(job.detail || 'The update failed.', true);
+      else if (job.state === 'rebooting') noteIt('Rebooting to apply the update…');
+      else noteIt('');   // done/idle: the in-progress note goes with the job
+      if (poll) {
+        clearInterval(poll);
+        poll = null;
+      }
+    }
+  }
+
+  async function refresh() {
+    let state = null;
+    try {
+      const res = await portalFetch('/_lemonseed/api/update');
+      if (res.ok) state = await res.json();
+    } catch (err) {
+      // The box may be on its way down mid-job; the going-away page covers it.
+      return;
+    }
+    if (state) render(state);
+  }
+
+  async function post(url, body) {
+    let res = null;
+    try {
+      res = await portalFetch(url, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body || {}),
+      });
+    } catch (err) {
+      res = null;
+    }
+    if (res === null) {
+      noteIt('Could not reach the control plane.', true);
+      return false;
+    }
+    if (!res.ok) {
+      noteIt(await portalError(res, 'That did not work.'), true);
+      return false;
+    }
+    return true;
+  }
+
+  checkButton.addEventListener('click', async () => {
+    // Say something the moment the button is pressed: the check runs as a
+    // server-side job, so the answer arrives through the poll, not this POST.
+    checkButton.disabled = true;
+    noteIt('Checking for an update…');
+    if (await post('/_lemonseed/api/update/check')) refresh();
+    else checkButton.disabled = false;
+  });
+
+  // One dialog held open across download, write, and reboot (bare-metal
+  // review, BM-3). The updater's own stdout percentages ride the job status,
+  // so the bar is the updater's opinion, not a fake timer.
+  // `onRetry` re-arms the flow after a failure: the failed dialog offers
+  // Retry/Cancel (bare-metal review, BM-4) because at that point the job is
+  // over — Hide made sense while something was still running, and the
+  // server-side retry path cancels the leftover attempt record first.
+  function openProgressDialog(onRetry) {
+    const line = document.createElement('p');
+    line.className = 'dialog-copy';
+    line.textContent = 'Starting the update…';
+    const bar = document.createElement('div');
+    bar.className = 'progress';
+    const fill = document.createElement('span');
+    fill.style.width = '0%';
+    bar.appendChild(fill);
+    let close = null;
+    dialog({
+      title: 'Updating the appliance',
+      body: (function () {
+        const wrap = document.createElement('div');
+        wrap.appendChild(line);
+        wrap.appendChild(bar);
+        return wrap;
+      })(),
+      dismiss: null,
+      // Hide, not Cancel: the job keeps running either way, and the page
+      // still redirects to the sign-in screen when the box comes back.
+      actions: [{label: 'Hide', kind: 'ghost', value: false}],
+      build: function (api) {
+        close = function () { api.choose(false); };
+      },
+    });
+    return {
+      set: function (text, pct) {
+        line.textContent = text;
+        if (pct !== null && pct !== undefined) fill.style.width = pct + '%';
+      },
+      fail: function (text) {
+        line.textContent = text;
+        line.classList.add('bad');
+        bar.hidden = true;
+        if (close) close();
+        dialog({
+          title: 'Update failed',
+          copy: text,
+          dismiss: null,
+          actions: [
+            {label: 'Cancel', kind: 'ghost', value: false},
+            {label: 'Retry', kind: 'primary', value: true},
+          ],
+        }).then(function (retry) {
+          if (retry && onRetry) onRetry();
+        });
+      },
+      close: function () {
+        if (close) close();
+      },
+    };
+  }
+
+  function watchInstall(ui) {
+    let sawRebooting = false;
+    const timer = setInterval(async () => {
+      let s = null;
+      try {
+        const res = await portalFetch('/_lemonseed/api/update');
+        if (res.ok) s = await res.json();
+      } catch (err) {
+        // The box going down mid-reboot is the expected silence.
+      }
+      if (!s) {
+        if (sawRebooting) return;   // keep waiting through the outage
+        return;
+      }
+      const job = s.job || {};
+      const state = job.state || 'idle';
+      if (state === 'failed') {
+        clearInterval(timer);
+        ui.fail(job.detail || 'The update failed; nothing was changed on boot.');
+        return;
+      }
+      if (state === 'done') {
+        // A finished job (e.g. a check another panel action started) is not
+        // ours to watch; close the dialog instead of parking at "Working…".
+        clearInterval(timer);
+        ui.close();
+        return;
+      }
+      if (state === 'rebooting') {
+        sawRebooting = true;
+        ui.set('Update finished; rebooting to apply it…', 100);
+        return;
+      }
+      if (sawRebooting) {
+        // The status API answers again after the outage: the new version is
+        // up. Sessions survive the reboot, but the update deserves a clean
+        // sign-in, so the browser goes to the login screen (BM-3).
+        clearInterval(timer);
+        window.top.location = '/login';
+        return;
+      }
+      if (state === 'downloading' || state === 'writing' || state === 'running') {
+        ui.set(job.detail || 'Working…', job.progress);
+      }
+    }, 2000);
+  }
+
+  install.addEventListener('click', async () => {
+    if (!known || !known.available) return;
+    const copy = 'The appliance will be updated from ' + known.running + ' to '
+      + known.latest + '. The update will be downloaded and the appliance will '
+      + 'reboot automatically; this can take a few minutes, which will interrupt '
+      + 'active sessions. Chats, models and settings are always preserved.';
+    const go = await dialogConfirm('Download and install the update?', copy,
+                                   {confirmLabel: 'Install'});
+    if (!go) return;
+    runUpdate(false);
+  });
+
+  // One attempt: open the progress box, start the job, watch it. A failed job
+  // hands the user Retry/Cancel; Retry comes back here with the retry flag,
+  // which makes the updater cancel the leftover attempt record before it
+  // re-applies — and the download is re-fetched over the corrupt file.
+  async function runUpdate(retry) {
+    const ui = openProgressDialog(function () { runUpdate(true); });
+    if (await post('/_lemonseed/api/update', retry ? {retry: true} : {})) {
+      watchInstall(ui);
+    } else {
+      ui.fail(note.textContent || 'The appliance refused to start the update.');
+    }
+  }
+
+  refresh();
+})();
+"""
+
+
 def page_settings_content(snap: dict[str, Any]) -> bytes:
     setup = load_setup()
     chat = snap.get("chat") or chat_ready.chat_snapshot()
@@ -1583,31 +3917,75 @@ def page_settings_content(snap: dict[str, Any]) -> bytes:
         owui_config_class = "bad"
         owui_config_title = escape(str(owui_policy_state.get("last_error") or ""))
     owui_config_hint = f' title="{owui_config_title}"' if owui_config_title else ""
+    # The Version section renders the running version server-side (the same
+    # value /api/system carries); "latest" is filled by the panel's JS, which
+    # polls /_lemonseed/api/update — the one place the check result lives.
+    running_version = escape(str(snap.get("version") or "unknown"))
 
     body = f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Settings</title>{brand_head_links()}<link rel="stylesheet" href="/_lemonseed/lemonseed.css"/>
-</head><body><main class="embed-shell">
-<h1>Settings</h1>
+</head><body>
+<main class="settings-app">
+<nav class="settings-rail" role="tablist" aria-label="Settings" aria-orientation="vertical">
+{settings_rail()}
+</nav>
+<div class="settings-panes">
+<div class="pane" id="pane-general" role="tabpanel" aria-labelledby="tab-general" tabindex="-1">
 <section class="panel">
 <h2>Lemonade AI Engine</h2>
 <div class="row"><span class="name">status</span><span class="state {chat_class}" id="chat-state">{chat_label}</span></div>
 <div class="row"><span class="name">model</span><span class="state ok" id="chat-model">{display}</span></div>
 <p class="lede" id="chat-lede">{chat_lede}</p>
 </section>
+<section class="panel">
+<h2>Status</h2>
+<div class="row"><span class="name">setup</span><span class="state ok">complete</span></div>
+<div class="row"><span class="name">timezone</span><span class="state ok">{setup.get("timezone","UTC")}</span></div>
+{gpu_rows}
+</section>
+<section class="panel" id="power">
+<h2>Power</h2>
+<p class="lede">Reboot the appliance, or shut it down. A shutdown leaves it off, with no
+lights and no network, until someone presses the power button on the box.</p>
+<p class="owui-status" id="power-note" hidden></p>
+<div class="owui-actions">
+<button type="button" id="power-reboot">{ICON_POWER}<span>Reboot</span></button>
+<button type="button" class="danger" id="power-shutdown">{ICON_POWER}<span>Shut down</span></button>
+</div>
+</section>
+<section class="panel" id="software-update">
+<h2>Software update</h2>
+<div class="row"><span class="name">Current Version</span><span class="state" id="version-running">{running_version}</span></div>
+<div class="row"><span class="name">Latest available</span><span class="state" id="version-latest">checking…</span></div>
+<p class="owui-status bad" id="update-failed" hidden></p>
+<div class="owui-actions">
+<button type="button" id="update-check">Check now</button>
+<button type="button" id="update-install" disabled>Download and install</button>
+</div>
+<p class="owui-status" id="update-note" hidden></p>
+</section>
+<section class="panel">
+<h2>API</h2>
+<details>
+<summary style="cursor:pointer;color:var(--muted)">System API Data</summary>
+<p class="lede" id="chat-reason">{reason}</p>
+<p class="lede"><a style="color:var(--accent)" href="/api/hardware">/api/hardware</a> ·
+<a style="color:var(--accent)" href="/api/chat">/api/chat</a> ·
+<a style="color:var(--accent)" href="/api/modules">/api/modules</a> ·
+<a style="color:var(--accent)" href="/api/system">/api/system</a></p>
+</details>
+</section>
+</div>
+<div class="pane" id="pane-models" role="tabpanel" aria-labelledby="tab-models" tabindex="-1" hidden>
 <section class="panel" id="model-picker">
 <h2>Large Language Model</h2>
 <p class="lede">AI requires a Large Language Model to power the chat system. Select a model from the list below that best fits your needs, and Lemonseed will download it for you. These are large files and may take a long time to download on slower internet connections.</p>
 <div id="model-cards" class="model-cards"></div>
 </section>
-<section class="panel">
-<h2>Status</h2>
-<div class="row"><span class="name">version</span><span class="state ok">{snap.get("version","unknown")}</span></div>
-<div class="row"><span class="name">setup</span><span class="state ok">complete</span></div>
-<div class="row"><span class="name">timezone</span><span class="state ok">{setup.get("timezone","UTC")}</span></div>
-{gpu_rows}
-</section>
+</div>
+<div class="pane" id="pane-chat" role="tabpanel" aria-labelledby="tab-chat" tabindex="-1" hidden>
 <section class="panel" id="owui-config">
 <h2>Chat</h2>
 <h3 class="subhead">Status</h3>
@@ -1624,18 +4002,55 @@ def page_settings_content(snap: dict[str, Any]) -> bytes:
 <button type="button" id="owui-refresh">Refresh status</button>
 </div>
 </section>
-<section class="panel">
-<h2>API</h2>
-<details>
-<summary style="cursor:pointer;color:var(--muted)">System API Data</summary>
-<p class="lede" id="chat-reason">{reason}</p>
-<p class="lede"><a style="color:var(--accent)" href="/api/hardware">/api/hardware</a> ·
-<a style="color:var(--accent)" href="/api/chat">/api/chat</a> ·
-<a style="color:var(--accent)" href="/api/modules">/api/modules</a> ·
-<a style="color:var(--accent)" href="/api/system">/api/system</a></p>
-</details>
+</div>
+<div class="pane" id="pane-people" role="tabpanel" aria-labelledby="tab-people" tabindex="-1" hidden>
+<section class="panel" id="accounts">
+<h2>Users</h2>
+<p class="owui-status" id="acct-note" hidden></p>
+<div class="table-wrap">
+<table class="grid">
+<thead><tr><th scope="col">Username</th><th scope="col">Name</th><th scope="col">E-mail</th><th scope="col" class="col-actions"><span class="sr-only">Actions</span></th></tr></thead>
+<tbody id="acct-people"></tbody>
+</table>
+</div>
+<div class="owui-actions">
+<button type="button" id="acct-add-user">Add user</button>
+</div>
 </section>
+<section class="panel" id="groups-panel">
+<h2>Groups</h2>
+<p class="owui-hint">System groups are built in. A custom group is a way to hand the same settings to several people at once.</p>
+<div class="table-wrap">
+<table class="grid">
+<thead><tr><th scope="col">Group</th><th scope="col">Members</th><th scope="col" class="col-actions"><span class="sr-only">Actions</span></th></tr></thead>
+<tbody id="acct-groups"></tbody>
+</table>
+</div>
+<div class="owui-actions">
+<button type="button" id="group-add-button">Add group</button>
+</div>
+</section>
+<section class="panel" id="audit-panel">
+<h2>Recent changes</h2>
+<div id="acct-audit-log"></div>
+<div class="owui-actions">
+<button type="button" id="acct-audit">See more history</button>
+</div>
+</section>
+</div>
+<div class="pane" id="pane-modules" role="tabpanel" aria-labelledby="tab-modules" tabindex="-1" hidden>
+<section class="panel">
+<h2>Modules</h2>
+<p class="lede">Modules are the apps the appliance runs for you. The chat interface is the
+first of them; the others appear here as they become installable.</p>
+</section>
+</div>
+</div>
+</main>
+<script>{DIALOG_JS}</script>
 <script>{PORTAL_FETCH_JS}</script>
+<script>{UPDATE_JS}</script>
+<script>{SETTINGS_JS}</script>
 <script>
 async function refreshChat() {{
   try {{
@@ -1715,18 +4130,22 @@ async function chooseFamily(family) {{
       // An HTTP status is not a message. A non-admin, or a family that stopped
       // fitting, both have a real reason sitting in the body already.
       const body = await res.json().catch(() => ({{}}));
-      alert(body.detail || 'Could not change model (HTTP ' + res.status + ').');
+      dialogMessage('Could not change the model',
+        body.detail || 'The appliance refused (HTTP ' + res.status + ').');
       return;
     }}
     // Re-render to reflect the new selection; the status row shows progress.
     loadModelPicker();
-  }} catch (_err) {{ alert('Could not reach the control plane.'); }}
+  }} catch (_err) {{ dialogMessage('Could not change the model', 'Could not reach the control plane.'); }}
 }}
 
 loadModelPicker();
 </script>
+<script>{SRP_CLIENT_JS}</script>
+<script>{ACCOUNTS_JS}</script>
 <script>{OWUI_CONFIG_JS}</script>
-</main></body></html>"""
+<script>{POWER_JS}</script>
+</body></html>"""
     return body.encode()
 
 
@@ -1770,7 +4189,12 @@ def apply_identity(name_slug: str) -> None:
 
 
 def complete_setup(
-    name: str, timezone: str, admin_username: str = "", admin_password: str = ""
+    name: str,
+    timezone: str,
+    admin_username: str = "",
+    admin_srp_salt: str = "",
+    admin_srp_verifier: str = "",
+    admin_display_name: str = "",
 ) -> None:
     name = name.strip()[:64]
     timezone = timezone.strip()[:64] or "UTC"
@@ -1778,9 +4202,19 @@ def complete_setup(
         raise ValueError("name required")
     if timezone not in TIMEZONES:
         raise ValueError("select a valid timezone")
-    admin_username = (admin_username or "").strip()
-    if auth.admin_bootstrap_required() and (not admin_username or not admin_password):
-        raise ValueError("admin username and password are required")
+    admin_username = auth.normalize_username(admin_username)
+    admin_display_name = (admin_display_name or "").strip()
+    admin_srp_salt = (admin_srp_salt or "").strip()
+    admin_srp_verifier = (admin_srp_verifier or "").strip()
+    if auth.admin_bootstrap_required() and not admin_username:
+        raise ValueError("admin username is required")
+    if auth.admin_bootstrap_required() and not (admin_srp_salt and admin_srp_verifier):
+        # Reached when the form was submitted without running the enrollment
+        # script — a no-JS browser, or a client that stripped the fields. It is
+        # not a fallback: there is no server-side path that takes a password.
+        raise ValueError(
+            "Signing in requires JavaScript. Please enable JavaScript and try again."
+        )
     name_slug = mdns_name(name)
     if mdns_conflict(name_slug):
         raise ValueError(
@@ -1812,10 +4246,30 @@ def complete_setup(
         raise
 
     run_best_effort(["timedatectl", "set-timezone", timezone])
-    if admin_username and admin_password:
+    if admin_username and admin_srp_salt and admin_srp_verifier:
         # Synchronous first-admin bootstrap: waits bounded for Postgres, then
-        # stores the bcrypt hash, generates the session secret, and flips the gate.
-        auth.create_admin(admin_username, admin_password)
+        # stores the verifier, generates the session secret, and flips the gate.
+        created = auth.create_admin(
+            admin_username,
+            admin_srp_salt,
+            admin_srp_verifier,
+            display_name=admin_display_name,
+        )
+        # D-20a: a reset that enrolled a different username deleted the former
+        # admin rows in that transaction. Their Open WebUI accounts go now, after
+        # commit — and the CP rows are gone whichever way this returns, because a
+        # former admin must not be able to sign back in. Refusals are logged
+        # rather than raised: the install already succeeded and the accounts are
+        # already powerless, so failing the setup page would be misleading.
+        problems = usermgmt.cleanup_owui_accounts(
+            created.get("owui_cleanup") or [], actor=audit.ACTOR_SYSTEM
+        )
+        for problem in problems:
+            print(
+                f"setup: Open WebUI kept the account of former admin"
+                f" {problem['username']}: {problem['error']}",
+                flush=True,
+            )
     marker = SETUP_COMPLETE_FILE.with_suffix(".tmp")
     marker.write_text(payload["completed_at"] + "\n", encoding="utf-8")
     marker.replace(SETUP_COMPLETE_FILE)
@@ -1864,6 +4318,22 @@ class Handler(BaseHTTPRequestHandler):
     def _is_xhr(self) -> bool:
         """True when the caller identified itself as the portal's own fetch()."""
         return self.headers.get(XHR_HEADER, "").strip() == XHR_MARKER
+
+    def _json_body(self, raw: bytes) -> Optional[dict[str, Any]]:
+        """Parse a JSON request body, or answer 400 and return None.
+
+        Shared by both SRP phases so neither can disagree about what a malformed
+        request costs the caller.
+        """
+        try:
+            parsed = json.loads(raw.decode() or "{}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._json(400, {"detail": "Expected a JSON body."})
+            return None
+        if not isinstance(parsed, dict):
+            self._json(400, {"detail": "Expected a JSON object."})
+            return None
+        return parsed
 
     def _require_admin(self) -> bool:
         """True when the caller is an admin; sends JSON 403 and returns False if not.
@@ -1946,57 +4416,537 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _handle_login_post(self, raw: bytes) -> None:
-        """POST /login — verify credentials, issue session token."""
-        try:
-            data = json.loads(raw.decode() or "{}")
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            self._send(400, b"bad request\n", "text/plain; charset=utf-8")
-            return
-        username = str(data.get("username", "")).strip()
-        password = str(data.get("password", ""))
-        rd = auth.safe_redirect_target(str(data.get("rd", "/")))
+    def _session_cookie(self, token: str) -> str:
+        """The one place the session cookie is assembled.
 
-        # Rate limiting by source IP.
-        ip = self.client_address[0] if self.client_address else "unknown"
+        Extracted so the SRP path and anything added later cannot drift on
+        ``HttpOnly``/``SameSite``, which is the kind of divergence that looks fine
+        in review and is a real finding later.
+        """
+        return f"{auth.SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax"
+
+    def _client_ip(self) -> str:
+        return self.client_address[0] if self.client_address else "unknown"
+
+    def _handle_login_post(self) -> None:
+        """POST /login no longer accepts credentials.
+
+        405 with a readable reason rather than 404: the ``= /login`` gateway
+        location stays alive so a no-JS browser gets an explanation instead of a
+        dead end, and the ``/login`` document still renders. There is simply no
+        server-side path that takes a password any more.
+        """
+        self._send(
+            405,
+            b"Signing in requires JavaScript.\n",
+            "text/plain; charset=utf-8",
+            extra_headers=[("Allow", "GET")],
+        )
+
+    def _handle_srp_challenge(self, raw: bytes) -> None:
+        """POST /_lemonseed/api/srp/challenge — SRP's first move.
+
+        Answers ``(salt, B)`` for a name, and *never* says whether the name
+        exists. RFC 5054 2.5.1.3: an unknown account is simulated with a
+        deterministically folded salt, so ``B`` is formed the same way on both
+        paths and this endpoint is not an account-enumeration oracle.
+
+        The username is normalised here (D-33) because ``I`` is hashed into ``x``:
+        ``John`` and ``john`` must derive the *same* verifier or the person typing
+        their own name the way it is written gets a failure that no amount of
+        retrying can fix. The browser normalises identically, on every path.
+        """
+        data = self._json_body(raw)
+        if data is None:
+            return
+        username = auth.normalize_username(data.get("username", ""))
+        ip = self._client_ip()
+        # Rate-limited too. It is not an authentication failure, so without this
+        # it would be an unthrottled way to burn CPU on modular exponentiation.
         if not auth.rate_limit_check(ip):
-            self._json(401, {"detail": "Too many attempts. Wait a minute and try again."})
+            self._json(429, {"detail": "Too many attempts. Wait a minute and try again."})
             return
-
-        user = auth.verify_credentials(username, password)
-        if user is None:
-            auth.rate_limit_record_failure(ip)
+        if not username or len(username) > 64:
             self._json(401, {"detail": "Invalid username or password."})
             return
 
-        auth.rate_limit_reset(ip)
+        user = auth.srp_load_user(username)
+        if user is not None and user["srp_verifier"] and user["srp_salt"]:
+            salt_hex = user["srp_salt"]
+            verifier = int(user["srp_verifier"], 16)
+        else:
+            # Unknown name, or a row that was never enrolled. Both take this
+            # branch so the two are indistinguishable from outside.
+            salt_hex = srp.fold_salt(_srp_fold_secret(), username).hex()
+            verifier = srp.make_verifier(
+                srp.SERVER_GROUP, srp.hash_to_int(srp.SERVER_GROUP.hash_name, bytes.fromhex(salt_hex))
+            )
+
         try:
-            token = auth.create_session(user)
+            b_public, pending = srp.begin_handshake(srp.SERVER_GROUP, username, verifier)
+        except srp.SrpError as exc:
+            self.log_message("srp challenge failed: %s", exc)
+            self._json(401, {"detail": "Invalid username or password."})
+            return
+        cid = secrets.token_urlsafe(16)
+        PENDING_HANDSHAKES.put(cid, pending)
+        self._json(200, {"cid": cid, "salt": salt_hex, "B": f"{b_public:x}"})
+
+    def _handle_srp_verify(self, raw: bytes) -> None:
+        """POST /_lemonseed/api/srp/verify — second move, and the session.
+
+        The identity comes from the *pending handshake*, not from this request,
+        so a client cannot name a different user in phase two than it named in
+        phase one. The row is re-read here, which is what makes disabling an
+        account take effect even mid-handshake.
+        """
+        data = self._json_body(raw)
+        if data is None:
+            return
+        ip = self._client_ip()
+        if not auth.rate_limit_check(ip):
+            self._json(429, {"detail": "Too many attempts. Wait a minute and try again."})
+            return
+
+        cid = str(data.get("cid", ""))
+        pending = PENDING_HANDSHAKES.take(cid)
+        if pending is None:
+            # Expired, already used, or invented. Single-use is what makes a
+            # replayed verify fail.
+            auth.rate_limit_record_failure(ip)
+            self._json(401, {"detail": "That sign-in attempt expired. Try again."})
+            return
+
+        def reject() -> None:
+            auth.rate_limit_record_failure(ip)
+            self._json(401, {"detail": "Invalid username or password."})
+
+        try:
+            a_public = srp.parse_group_value(data.get("A"), srp.SERVER_GROUP, "A")
+            proof = srp.parse_proof(data.get("M1"), srp.SERVER_GROUP)
+        except srp.SrpError:
+            reject()
+            return
+
+        user = auth.srp_load_user(pending.username)
+        if user is None or not user["srp_verifier"]:
+            # Unknown, unenrolled, or deleted mid-handshake. Still run the full
+            # arithmetic against the synthetic verifier the challenge used, then
+            # discard the result. Skipping it would return measurably faster and
+            # hand back the enumeration oracle the challenge path works to hide.
+            try:
+                srp.finish_handshake(srp.SERVER_GROUP, pending, a_public, proof)
+            except srp.SrpError:
+                pass
+            reject()
+            return
+
+        # Re-read must agree with what the challenge was built on. A row rewritten
+        # between the two phases invalidates the handshake rather than silently
+        # completing against a verifier the user no longer has.
+        try:
+            if int(user["srp_verifier"], 16) != pending.verifier:
+                reject()
+                return
+        except ValueError:
+            reject()
+            return
+
+        try:
+            m2 = srp.finish_handshake(srp.SERVER_GROUP, pending, a_public, proof)
+        except srp.SrpError:
+            reject()
+            return
+
+        auth.rate_limit_reset(ip)
+
+        if user["password_reset_required"]:
+            # D-11: a credential an admin handed out must not produce a session.
+            # M2 is still sent — the client needs it to know the appliance knows
+            # the one-time password — but there is no Set-Cookie, so an unrotated
+            # account cannot reach the portal, the APIs or Open WebUI. The
+            # alternative (issue a session and gate it) needs every surface to
+            # honour the flag, and any surface that forgets becomes a way to sit
+            # in a one-time account forever.
+            self._json(200, {"M2": m2.hex(), "rotate_required": True})
+            return
+
+        try:
+            token = auth.create_session(
+                {
+                    "username": user["username"],
+                    "display_name": user["display_name"],
+                    "email": user["email"],
+                    "groups": user["groups"],
+                }
+            )
         except sessions.SessionStoreUnavailable:
             # Fail closed: a cookie we cannot validate later is access we cannot
-            # expire or revoke. Login is the one place to say so out loud.
+            # expire or revoke. Sign-in is where to say so out loud.
             self._json(
                 503,
                 {"detail": "Sign-in is unavailable: the session store is not reachable."},
             )
             return
         except ValueError:
-            # Account vanished or was disabled between check and issue.
-            self._json(401, {"detail": "Invalid username or password."})
+            reject()
             return
 
-        # A fetch() cannot read a 302's Location, so an XHR gets the target in a
-        # 200 body and navigates _top itself; a plain form post still gets the
-        # redirect. Same cookie either way.
-        cookie = f"{auth.SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax"
-        if self._is_xhr():
-            self._json(200, {"target": rd}, extra_headers=[("Set-Cookie", cookie)])
+        # A fetch() cannot read a 302's Location, so this always answers JSON and
+        # the client navigates _top itself. Same cookie either way.
+        usermgmt.record_login(user["username"])
+        self._json(
+            200,
+            {
+                "M2": m2.hex(),
+                "target": auth.safe_redirect_target(str(data.get("rd", "/")))
+                if data.get("rd")
+                else "/",
+            },
+            extra_headers=[("Set-Cookie", self._session_cookie(token))],
+        )
+
+    def _handle_srp_rotate(self, raw: bytes) -> None:
+        """POST /_lemonseed/api/srp/rotate — change your own password (D-5).
+
+        Two credentials arrive in one request and only one of them is a secret:
+        ``A``/``M1`` prove the caller knows the **current** password, and
+        ``salt``/``verifier`` are the browser's derivation of the **new** one. The
+        appliance sees no password in either half, which is the whole point —
+        "set someone's password" is not an operation that exists here, only
+        "replace one verifier with another, after proving the first".
+
+        The old proof is validated before anything is written, and the write is
+        one guarded statement (``WHERE … AND srp_verifier = %s``), so every
+        failure — wrong current password, a second tab that rotated first, a dead
+        connection — leaves the old pair intact. There is no state in which an
+        account has no password (D-6).
+
+        A new session cookie comes back with the response: rotation bumps
+        ``token_generation``, which kills every *other* session for the account,
+        including the one issuing this request. Making the user sign in again
+        after changing their own password would be a punishing interface for no
+        security gain, since this request already proved the password.
+        """
+        data = self._json_body(raw)
+        if data is None:
             return
-        self.send_response(302)
-        self.send_header("Location", rd)
-        self.send_header("Set-Cookie", cookie)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        ip = self._client_ip()
+        if not auth.rate_limit_check(ip):
+            self._json(429, {"detail": "Too many attempts. Wait a minute and try again."})
+            return
+
+        pending = PENDING_HANDSHAKES.take(str(data.get("cid", "")))
+        if pending is None:
+            auth.rate_limit_record_failure(ip)
+            self._json(401, {"detail": "That sign-in attempt expired. Try again."})
+            return
+
+        def reject() -> None:
+            auth.rate_limit_record_failure(ip)
+            self._json(401, {"detail": "Invalid username or password."})
+
+        try:
+            a_public = srp.parse_group_value(data.get("A"), srp.SERVER_GROUP, "A")
+            proof = srp.parse_proof(data.get("M1"), srp.SERVER_GROUP)
+        except srp.SrpError:
+            reject()
+            return
+
+        user = auth.srp_load_user(pending.username)
+        if user is None or not user["srp_verifier"]:
+            # Same timing discipline as verify: run the arithmetic against the
+            # synthetic verifier, then discard it, so a missing account is not
+            # measurable.
+            try:
+                srp.finish_handshake(srp.SERVER_GROUP, pending, a_public, proof)
+            except srp.SrpError:
+                pass
+            reject()
+            return
+        try:
+            if int(user["srp_verifier"], 16) != pending.verifier:
+                reject()
+                return
+        except ValueError:
+            reject()
+            return
+
+        try:
+            m2 = srp.finish_handshake(srp.SERVER_GROUP, pending, a_public, proof)
+        except srp.SrpError:
+            reject()
+            return
+
+        # Past this point the current password is proven, so a bad *new* pair is
+        # a client bug and deserves a real message rather than "wrong password".
+        auth.rate_limit_reset(ip)
+        try:
+            usermgmt.rotate_password(
+                pending.username,
+                f"{pending.verifier:x}",
+                str(data.get("salt", "")),
+                str(data.get("verifier", "")),
+                actor=pending.username,
+            )
+        except ValueError as exc:
+            self._json(400, {"detail": str(exc)[:200]})
+            return
+
+        # A first sign-in with a one-time code lands here rather than in
+        # srp/verify, so this is the one place a rotation login can be stamped;
+        # skipping it left every OTP-created account showing "Never".
+        usermgmt.record_login(pending.username)
+
+        fresh = usermgmt.get(pending.username) or {}
+        try:
+            token = auth.create_session(
+                {
+                    "username": pending.username,
+                    "display_name": fresh.get("display_name", user["display_name"]),
+                    "groups": fresh.get("groups", user["groups"]),
+                }
+            )
+        except (sessions.SessionStoreUnavailable, ValueError):
+            # The password *did* change. Saying "sign-in unavailable" here is
+            # accurate and unavoidable; telling them nothing happened would be a
+            # lie they would act on by retrying with the old password.
+            self._json(
+                200,
+                {
+                    "M2": m2.hex(),
+                    "password_changed": True,
+                    "detail": "Your password changed. Sign in again to continue.",
+                },
+            )
+            return
+        self._json(
+            200,
+            {
+                "M2": m2.hex(),
+                "password_changed": True,
+                "target": auth.safe_redirect_target(str(data.get("rd", "/")))
+                if data.get("rd")
+                else "/",
+            },
+            extra_headers=[("Set-Cookie", self._session_cookie(token))],
+        )
+
+    def _actor(self) -> str:
+        """The signed-in username nginx forwarded, or ``""`` when there is none.
+
+        Audit rows need a real actor. Reading it from the forwarded header rather
+        than from the request body is what makes "who did this" unforgeable by
+        the caller: nginx sets the header from the session, and the CP's own
+        ``session-verify`` response is the only thing that can populate it.
+        """
+        return auth.normalize_username(self.headers.get("X-Forwarded-User", ""))
+
+    def _manage_users(self, raw: bytes, action: str) -> None:
+        """One shape for every account-management POST (admin-gated).
+
+        Lives in one place on purpose: the actor, the JSON contract, and the
+        mapping from a primitive's ``ValueError`` to a ``400 {"detail": …}`` are
+        the same for all of them, and an audit trail or an error shape that
+        differs per route is how a portal ends up lying on one screen and telling
+        the truth on another.
+        """
+        data = self._json_body(raw)
+        if data is None:
+            return
+        actor = self._actor()
+        username = auth.normalize_username(data.get("username", ""))
+        try:
+            if action == "create":
+                result = usermgmt.create(
+                    username,
+                    str(data.get("display_name", "")),
+                    str(data.get("email", "")),
+                    str(data.get("salt", "")),
+                    str(data.get("verifier", "")),
+                    is_admin=bool(data.get("is_admin")),
+                    actor=actor,
+                )
+            elif action == "update":
+                # Exactly one field at a time: "which of these did you change"
+                # has to have one answer in the audit log.
+                if "display_name" in data and "email" in data:
+                    raise ValueError("change one field at a time")
+                if "display_name" in data:
+                    result = usermgmt.set_display_name(
+                        username, str(data.get("display_name", "")), actor=actor
+                    )
+                elif "email" in data:
+                    result = usermgmt.set_email(
+                        username, str(data.get("email", "")), actor=actor
+                    )
+                else:
+                    raise ValueError("nothing to change")
+            elif action == "groups":
+                groups = data.get("groups")
+                if not isinstance(groups, list):
+                    raise ValueError("groups must be a list of names")
+                result = usermgmt.set_groups(username, [str(g) for g in groups], actor=actor)
+            elif action == "disabled":
+                result = usermgmt.set_disabled(
+                    username, bool(data.get("disabled")), actor=actor
+                )
+            elif action == "reset-password":
+                result = usermgmt.admin_reset_password(
+                    username,
+                    str(data.get("salt", "")),
+                    str(data.get("verifier", "")),
+                    actor=actor,
+                )
+            elif action == "delete":
+                result = usermgmt.delete(username, actor=actor)
+            else:  # pragma: no cover — unreachable from the route table
+                raise ValueError(f"unknown account action {action!r}")
+        except ValueError as exc:
+            # Every guard and validation error lands here, written for a person.
+            self._json(400, {"detail": str(exc)[:300]})
+            return
+        except Exception as exc:  # noqa: BLE001 — HTTP boundary
+            self.log_message("user management %s failed: %s", action, exc)
+            self._json(500, {"detail": "That change could not be saved. Try again."})
+            return
+        self._json(200, result)
+
+    def _manage_groups(self, raw: bytes, action: str) -> None:
+        """Group management POSTs (admin-gated). Same shape as ``_manage_users``."""
+        data = self._json_body(raw)
+        if data is None:
+            return
+        actor = self._actor()
+        group = str(data.get("group", "")).strip().lower()
+        username = auth.normalize_username(data.get("username", ""))
+        try:
+            if action == "create":
+                result = usermgmt.create_group(group, actor=actor)
+            elif action == "delete":
+                result = usermgmt.delete_group(group, actor=actor)
+            elif action == "member":
+                add = bool(data.get("add"))
+                result = (
+                    usermgmt.add_member(group, username, actor=actor)
+                    if add
+                    else usermgmt.remove_member(group, username, actor=actor)
+                )
+            elif action == "attribute":
+                if "value" not in data:
+                    raise ValueError("a value is required")
+                result = usermgmt.set_group_attribute(
+                    group, str(data.get("key", "")), data.get("value"), actor=actor
+                )
+            elif action == "attribute-remove":
+                result = usermgmt.delete_group_attribute(
+                    group, str(data.get("key", "")), actor=actor
+                )
+            else:  # pragma: no cover — unreachable from the route table
+                raise ValueError(f"unknown group action {action!r}")
+        except ValueError as exc:
+            self._json(400, {"detail": str(exc)[:300]})
+            return
+        except Exception as exc:  # noqa: BLE001 — HTTP boundary
+            self.log_message("group management %s failed: %s", action, exc)
+            self._json(500, {"detail": "That change could not be saved. Try again."})
+            return
+        self._json(200, result)
+
+    def _handle_users_get(self) -> None:
+        """GET /_lemonseed/api/users — accounts and groups for the admin panel.
+
+        Sign-in data is not in this payload. ``srp_salt`` and ``srp_verifier``
+        stay in the columns that only the handshake reads; a list endpoint is
+        exactly where a verifier must never appear, because it is the one
+        response a browser caches, logs, and screenshots.
+        """
+        users = usermgmt.list_users()
+        if not users and not auth.pg_ready():
+            self._json(
+                503,
+                {"detail": "Accounts are unavailable: the account database is not ready."},
+            )
+            return
+        self._json(
+            200,
+            {
+                "users": users,
+                "groups": usermgmt.list_groups(),
+                # The portal needs to know which row it may never delete, and it
+                # must learn that from the appliance rather than by assuming the
+                # username ``admin`` (D-22).
+                "first_admin": usermgmt.first_admin(),
+                "attributes": sorted(usermgmt.ATTRIBUTE_KEYS),
+            },
+        )
+
+    def _handle_profile_get(self) -> None:
+        """GET /_lemonseed/api/profile — the caller's own account."""
+        me = usermgmt.get(self._actor())
+        if me is None:
+            self._json(404, {"detail": "You are not signed in."})
+            return
+        self._json(200, {"user": me})
+
+    def _handle_profile_post(self, raw: bytes) -> None:
+        """POST /_lemonseed/api/profile — change your own name or address.
+
+        Deliberately a separate route from the admin surface: it acts only on the
+        caller's own username, taken from the session header, so a member can edit
+        their own profile without any ability to name someone else.
+        """
+        data = self._json_body(raw)
+        if data is None:
+            return
+        me = self._actor()
+        if not me:
+            self._json(401, {"detail": "You are not signed in."})
+            return
+        try:
+            if "display_name" in data:
+                result = usermgmt.set_display_name(
+                    me, str(data.get("display_name", "")), actor=me
+                )
+            elif "email" in data:
+                result = usermgmt.set_email(me, str(data.get("email", "")), actor=me)
+            else:
+                raise ValueError("nothing to change")
+        except ValueError as exc:
+            self._json(400, {"detail": str(exc)[:300]})
+            return
+        except Exception as exc:  # noqa: BLE001 — HTTP boundary
+            self.log_message("profile update failed: %s", exc)
+            self._json(500, {"detail": "That change could not be saved. Try again."})
+            return
+        self._json(200, result)
+
+    def _handle_wordlist_get(self) -> None:
+        """GET /_lemonseed/api/wordlist — the sign-in-code vocabulary, as text.
+
+        Served verbatim so the client can split on newlines; the page asks for it
+        once, only when it is about to generate a code.
+        """
+        try:
+            body = WORDLIST_FILE.read_bytes()
+        except OSError as exc:
+            self.log_message("word list unreadable: %s", exc)
+            self._json(500, {"detail": "The sign-in code word list is unavailable."})
+            return
+        self._send(200, body, "text/plain; charset=utf-8")
+
+    def _handle_audit_get(self, query: dict[str, list[str]]) -> None:
+        """GET /_lemonseed/api/audit[?target=name] — who did what, newest first."""
+        self._json(
+            200,
+            {
+                "events": audit.recent(
+                    limit=min(500, max(1, int((query.get("limit") or ["200"])[0]))),
+                    target=auth.normalize_username((query.get("target") or [""])[0]),
+                ),
+                "retention_days": audit.AUDIT_RETENTION_DAYS,
+            },
+        )
 
     def _handle_logout(self) -> None:
         """POST /logout — drop the session record and clear the cookie.
@@ -2057,6 +5007,80 @@ class Handler(BaseHTTPRequestHandler):
         chat_ready.cancel_active_pull()
         chat_ready.ensure_chat_worker()
         self._json(200, {"state": "ok", "choice": saved})
+
+    def _handle_power_post(self, raw: bytes) -> None:
+        """Reboot or shut down the appliance (admin-only).
+
+        The refusal is the interesting part. A reboot in the middle of a model
+        download leaves a truncated weights file that the next boot will try to
+        load, and one in the middle of an Open WebUI window leaves the managed
+        settings half-applied. So "reboot now" during that work is answered with a
+        sentence naming the work at 409, rather than with a reboot that happens to
+        land between two steps.
+        """
+        data = self._json_body(raw)
+        if data is None:
+            return
+        action = data.get("action")
+        if action not in POWER_ACTIONS:
+            self._json(400, {"detail": "Expected \"reboot\" or \"shutdown\"."})
+            return
+        blocker = chat_ready.in_flight_work() or modules.in_flight_work() or updates.in_flight()
+        if blocker:
+            self._json(
+                409,
+                {"detail": f"Not yet: {blocker}. Try again when it finishes.",
+                 "reason": "in flight"},
+            )
+            return
+        if action == "reboot":
+            # Written before the reboot is requested, so the shell's own poll
+            # reports "rebooting" instead of a progress bar that quietly stops.
+            # The CP deletes the marker at startup.
+            chat_ready.mark_reboot_pending("an admin requested a reboot from the portal")
+        audit.record(self._actor() or audit.ACTOR_CP, "appliance", f"power.{action}")
+        # Answered first, then scheduled: this response is the only thing the
+        # portal has to tell whether the appliance refused or is simply gone.
+        self._json(200, {"state": "ok", "action": action})
+        schedule_power(action)
+
+    def _handle_update_get(self) -> None:
+        """GET /_lemonseed/api/update — the SYSTEM panel's update state."""
+        self._json(200, updates.snapshot(appliance_version()))
+
+    def _handle_update_check_post(self) -> None:
+        """POST /_lemonseed/api/update/check — *Check now*, as a job.
+
+        The check is a network fetch against the release channel, so it runs in
+        the background and the panel polls; a fetch that cannot complete (the
+        WAN down, the channel unreachable) is a job failure the panel shows,
+        not a hung request.
+        """
+        reason = updates.start_check()
+        if reason:
+            self._json(409, {"detail": reason, "reason": "in flight"})
+            return
+        self._json(202, {"state": "running", "kind": "check"})
+
+    def _handle_update_post(self, raw: bytes) -> None:
+        """POST /_lemonseed/api/update — download, write, and reboot (D4).
+
+        Answered 202 with the job started; the panel polls the snapshot, whose
+        status runs downloading / writing / rebooting / failed. ``retry`` is
+        the failed-update banner's *Try again*: cancel-then-apply, which is the
+        only way past ``refuse_dirty_state`` after a failed attempt.
+        """
+        data = self._json_body(raw)
+        if data is None:
+            return
+        retry = bool(data.get("retry"))
+        reason = updates.start_install(retry=retry)
+        if reason:
+            self._json(409, {"detail": reason, "reason": "in flight"})
+            return
+        action = "update.retry" if retry else "update.install"
+        audit.record(self._actor() or audit.ACTOR_CP, "appliance", action)
+        self._json(202, {"state": "running", "kind": "install"})
 
     # ------------------------------------------------------------------
     # QEMU e2e GC helpers (test-only; admin-gated like the model choice).
@@ -2201,6 +5225,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
+        query = parse_qs(urlparse(self.path).query)
         if path in ("/healthz", "/health"):
             self._send(200, b"ok\n", "text/plain; charset=utf-8")
             return
@@ -2239,6 +5264,33 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/plan":
             report = hardware.collect_hardware()
             self._json(200, plan_model(report))
+            return
+        if path == "/_lemonseed/api/users":
+            # Admin-only here *and* in nginx, because the gateway is the piece
+            # that can be misconfigured by a future edit and the CP is not.
+            if not self._require_admin():
+                return
+            self._handle_users_get()
+            return
+        if path == "/_lemonseed/api/audit":
+            if not self._require_admin():
+                return
+            self._handle_audit_get(query)
+            return
+        if path == "/_lemonseed/api/wordlist":
+            # Admin-only in nginx too: this exists to hand out sign-in codes,
+            # which only an admin generates.
+            if not self._require_admin():
+                return
+            self._handle_wordlist_get()
+            return
+        if path == "/_lemonseed/api/update":
+            if not self._require_admin():
+                return
+            self._handle_update_get()
+            return
+        if path == "/_lemonseed/api/profile":
+            self._handle_profile_get()
             return
         if path == "/_lemonseed/api/models":
             report = hardware.collect_hardware()
@@ -2345,6 +5397,27 @@ class Handler(BaseHTTPRequestHandler):
             modules.ensure_module_worker()
             self._send(200, page_shell(snap, view="settings"), "text/html; charset=utf-8")
             return
+        if path in ("/profile", "/profile/"):
+            # Every signed-in user's own page. Unlike /settings/ there is no
+            # admin gate here, and that is the whole design: a non-admin gets
+            # chat and this page, so rotation cannot be an admin-only affordance.
+            if redirect_off_factory_mdns(self, "/profile/"):
+                return
+            if not setup_complete() or auth.reset_marker_present():
+                self.send_response(302)
+                self.send_header("Location", "/setup")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if not self._actor():
+                self.send_response(302)
+                self.send_header("Location", "/login?next=/profile/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            # Nothing on this page reads the boot snapshot, so none is taken.
+            self._send(200, page_profile(boot_snapshot()), "text/html; charset=utf-8")
+            return
         if path == "/login":
             self._handle_login_get(urlparse(self.path).query)
             return
@@ -2390,10 +5463,42 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
         if path == "/login":
-            self._handle_login_post(raw)
+            self._handle_login_post()
+            return
+        if path == "/_lemonseed/api/srp/challenge":
+            self._handle_srp_challenge(raw)
+            return
+        if path == "/_lemonseed/api/srp/verify":
+            self._handle_srp_verify(raw)
+            return
+        if path == "/_lemonseed/api/srp/rotate":
+            self._handle_srp_rotate(raw)
             return
         if path == "/logout":
             self._handle_logout()
+            return
+        if path == "/_lemonseed/api/profile":
+            # Self-service: no admin gate, and the route ignores any username in
+            # the body. It edits whoever the session says the caller is.
+            self._handle_profile_post(raw)
+            return
+        if path.startswith("/_lemonseed/api/users/"):
+            if not self._require_admin():
+                return
+            action = path[len("/_lemonseed/api/users/") :]
+            if action in USER_ACTIONS:
+                self._manage_users(raw, action)
+                return
+            self._json(404, {"error": "not found"})
+            return
+        if path.startswith("/_lemonseed/api/groups/"):
+            if not self._require_admin():
+                return
+            action = path[len("/_lemonseed/api/groups/") :]
+            if action in GROUP_ACTIONS:
+                self._manage_groups(raw, action)
+                return
+            self._json(404, {"error": "not found"})
             return
         if path == "/_lemonseed/api/models":
             self._handle_model_choice_post(raw)
@@ -2417,6 +5522,22 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._handle_owui_reset_post(raw)
             return
+        if path == "/_lemonseed/api/power":
+            # Only an admin may stop the appliance, in nginx and here.
+            if not self._require_admin():
+                return
+            self._handle_power_post(raw)
+            return
+        if path == "/_lemonseed/api/update/check":
+            if not self._require_admin():
+                return
+            self._handle_update_check_post()
+            return
+        if path == "/_lemonseed/api/update":
+            if not self._require_admin():
+                return
+            self._handle_update_post(raw)
+            return
         if path != "/setup":
             self._json(404, {"error": "not found"})
             return
@@ -2431,7 +5552,9 @@ class Handler(BaseHTTPRequestHandler):
                 str(data.get("name", "")),
                 str(data.get("timezone", "UTC")),
                 str(data.get("admin_username", "")),
-                str(data.get("admin_password", "")),
+                str(data.get("admin_srp_salt", "")),
+                str(data.get("admin_srp_verifier", "")),
+                str(data.get("admin_display_name", "")),
             )
         except (ValueError, json.JSONDecodeError) as exc:
             self._send(
@@ -2458,6 +5581,39 @@ class Handler(BaseHTTPRequestHandler):
             "text/html; charset=utf-8",
         )
 
+    def log_message(self, format: str, *args: Any) -> None:
+        # Diagnostics only (disconnects, handler failures). Access lines go to
+        # the file via log_request; these belong on stderr so journald carries
+        # them with the service's error priority, not as request noise.
+        print(f"{self.address_string()} - {format % args}", file=sys.stderr, flush=True)
+
+    def log_request(self, code: Any = "-", size: Any = "-") -> None:
+        """One access line, to the access journald channel — never the service log.
+
+        The remote address is the client nginx saw (X-Forwarded-For; the CP
+        hears every request as 127.0.0.1), and the actor is the signed-in
+        username nginx forwarded — the same trust the authz decisions already
+        place in those headers. Sending is best-effort: a log line must never
+        break a request.
+        """
+        # The gate's internal target fires once per gated request; the gated
+        # request itself is the line worth keeping (at verify time there is no
+        # user yet and the client is always loopback). Logging both doubles the
+        # channel with no information — and the verify is the one path that
+        # fires constantly (BM-4 review).
+        if getattr(self, "path", "").split("?", 1)[0] == "/_lemonseed/session-verify":
+            return
+        forwarded = str(self.headers.get("X-Forwarded-For") or "")
+        ip = forwarded.split(",")[0].strip() or (self.client_address[0] if self.client_address else "-")
+        user = self._actor() or "-"
+        # user/client ride in the message itself so a plain `journalctl -t`
+        # shows them; the structured fields stay for programmatic readers.
+        ACCESS_LOGGER.info(
+            f'"{self.requestline}" {code} {size} user={user} client={ip}',
+            extra={"CLIENT": ip, "USER": user,
+                   "REQUEST": self.requestline, "CODE": str(code)},
+        )
+
     def handle(self) -> None:  # noqa: N802
         try:
             super().handle()
@@ -2471,9 +5627,6 @@ class Handler(BaseHTTPRequestHandler):
 
             self.log_message("error handling %s", self.path)
             traceback.print_exc(file=sys.stderr)
-
-    def log_message(self, format: str, *args: Any) -> None:
-        print("%s - %s" % (self.address_string(), format % args), flush=True)
 
 
 def _safe_refresh_gpus() -> None:

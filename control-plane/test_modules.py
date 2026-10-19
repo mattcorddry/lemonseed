@@ -1078,6 +1078,20 @@ class GuardSyncTests(unittest.TestCase):
         self.addCleanup(setattr, modules, "_guards_error_logged", self._saved[2])
         self.addCleanup(setattr, modules, "_service_account_id", self._saved[3])
         self.addCleanup(setattr, modules, "_service_identity_ready", self._saved[4])
+        # Counts are derived from the shipped manifest rather than hard-coded.
+        # The enforced set changed twice during M7 (D-17b widened one rule and
+        # flipped another), and every literal in this class had to move with it;
+        # a guard set that a manifest edit cannot update on its own is a trap.
+        guards = modules.owui_policy.load_manifest().guards
+        self.enforced = sum(1 for g in guards if g.mode == "enforce")
+        self.placeholdered = sum(
+            1 for g in guards if g.mode == "enforce" and "%" in g.path
+        )
+        self.assertEqual(
+            self.placeholdered, 1,
+            "the user-update guard lost its placeholder in D-17b; if this moved,"
+            " the pending-set assertion below is stale, not the manifest",
+        )
 
     def sync(self, reload_ok: bool = True) -> dict:
         self.reload.return_value = reload_ok
@@ -1087,15 +1101,18 @@ class GuardSyncTests(unittest.TestCase):
         state = self.sync()
         self.assertTrue(self.conf.exists())
         text = self.conf.read_text(encoding="utf-8")
-        self.assertEqual(text.count("if ("), 5)
+        self.assertEqual(text.count("if ("), self.enforced)
         self.assertIn("managed-by-lemonseed", text)
-        # Placeholder resolved to the real id, not the validator's [^/]+ stand-in.
+        # Placeholders resolved to real ids; the raw %TOKEN% must never reach
+        # nginx. (A manifest-authored ``[^/]+`` in a path *is* legitimate now —
+        # see the D-17b user-update rule — so this checks for the token, not for
+        # the bracket class.)
         self.assertIn(modules._service_account_id, text)
-        self.assertNotIn("[^/]", text)
+        self.assertNotIn("%CP_OWUI_ID%", text)
         self.assertEqual(self.reload.call_count, 1)
         self.assertTrue(state["in_sync"])
-        self.assertEqual(state["enforced_count"], 5)
-        self.assertEqual(state["declared"], 5)
+        self.assertEqual(state["enforced_count"], self.enforced)
+        self.assertEqual(state["declared"], self.enforced)
         self.assertEqual(state["rendered_sha"], state["declared_sha"])
         self.assertEqual(state["nginx_sha"], state["rendered_sha"])
         self.assertEqual(state["pending"], [])
@@ -1115,7 +1132,7 @@ class GuardSyncTests(unittest.TestCase):
         self.assertEqual(state["enforced_count"], 0)
         state = self.sync(reload_ok=True)
         self.assertTrue(state["in_sync"])
-        self.assertEqual(state["enforced_count"], 5)
+        self.assertEqual(state["enforced_count"], self.enforced)
 
     def test_render_error_keeps_the_previous_file(self) -> None:
         self.sync()
@@ -1141,21 +1158,27 @@ class GuardSyncTests(unittest.TestCase):
             state = self.sync()
         text = self.conf.read_text(encoding="utf-8")
         self.assertNotIn("/ollama/config/update", text)
-        self.assertEqual(text.count("if ("), 4)
-        self.assertEqual(state["declared"], 4)
+        self.assertEqual(text.count("if ("), self.enforced - 1)
+        self.assertEqual(state["declared"], self.enforced - 1)
         self.assertTrue(state["in_sync"])
 
     def test_pending_guards_are_reported_not_guessed(self) -> None:
         modules._service_account_id = None
         state = self.sync()
-        self.assertEqual(state["enforced_count"], 3)
+        self.assertEqual(state["enforced_count"], self.enforced - self.placeholdered)
+        # Exactly one rule still waits on a placeholder. D-17b widened the
+        # user-update guard to every account, which is what took the last
+        # placeholder out of it; the delete rule for the CP's own account keeps
+        # its own because its denial copy names that account.
         self.assertEqual(sorted(state["pending"]), [
             "DELETE /api/v1/users/%CP_OWUI_ID%",
-            "POST /api/v1/users/%CP_OWUI_ID%/update",
         ])
         self.assertIn("unresolved", state["pending_reason"])
         text = self.conf.read_text(encoding="utf-8")
-        self.assertNotIn("users", text)
+        # The two unresolved rules are absent; the ones that need no placeholder
+        # still render, which is why the count above is a subtraction and not 0.
+        self.assertNotIn("%CP_OWUI_ID%", text)
+        self.assertIn("/api/v1/users/[^/]+/update", text)
         self.assertTrue(state["in_sync"])
 
     def test_write_is_atomic_and_world_readable(self) -> None:
@@ -1171,7 +1194,7 @@ class GuardSyncTests(unittest.TestCase):
              mock.patch.object(modules, "_container_running", return_value=True), \
              mock.patch.object(modules, "http_ready", return_value=True):
             snap = modules.modules_snapshot()["open_webui"]
-        self.assertEqual(snap["owui_guards"]["enforced_count"], 5)
+        self.assertEqual(snap["owui_guards"]["enforced_count"], self.enforced)
         self.assertTrue(snap["owui_guards"]["in_sync"])
 
     @mock.patch.object(modules, "sync_owui_guards", return_value={})

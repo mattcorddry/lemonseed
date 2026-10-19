@@ -7,6 +7,10 @@
   const preserveCheck = document.getElementById("preserve-user-data");
   const resetAdminRow = document.getElementById("reset-admin-row");
   const resetAdminCheck = document.getElementById("reset-admin");
+  const resetAdminCopy = document.getElementById("reset-admin-copy");
+  // The sentence as it is printed in the HTML. Kept as the fallback so a disk
+  // with no roster to read shows real copy instead of an empty line.
+  const resetAdminDefault = resetAdminCopy ? resetAdminCopy.textContent : "";
   const progressPanel = document.getElementById("progress-panel");
   const phaseTitle = document.getElementById("phase-title");
   const phaseMsg = document.getElementById("phase-msg");
@@ -129,6 +133,13 @@
     // creates the first admin at /setup regardless). It is nested under
     // preserve and greyed out until preserve is checked.
     resetAdminRow.classList.toggle("hidden", !available);
+    // Name the accounts a reset would remove admin access from (D-28). The
+    // server computed the sentence because only it can read the roster; this is
+    // per-disk, so switching the selected disk has to re-paint it.
+    if (resetAdminCopy) {
+      resetAdminCopy.textContent =
+        (disk && disk.reset_admin_copy) || resetAdminDefault;
+    }
     syncResetAdmin();
   }
 

@@ -7,6 +7,7 @@ import os
 import secrets
 import subprocess
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -15,12 +16,19 @@ POSTGRES_ENV = Path("/var/lib/lemonseed/data/secrets/postgres.env")
 SECRETS_MODULES = Path("/var/lib/lemonseed/data/secrets/modules")
 CP_DB_NAME = "lemonseed_cp"
 CP_ROLE = "lemonseed_cp"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 # Shape created by ``_create_cp_tables`` (all `CREATE TABLE IF NOT EXISTS`).
 # A database with no recorded version is assumed to be at this shape, because
 # that is what the table creation immediately preceding the migration run leaves
-# behind — on a fresh box *and* on a box upgraded from a pre-migration build.
-BASELINE_SCHEMA_VERSION = 3
+# behind on a fresh box.
+#
+# M7 P3 folded the shipped v4/v5 steps into the baseline and deleted them
+# (USERS-AND-GROUPS.md D-29): there is no install base older than M7, so the
+# cheaper move was to write the baseline honestly — including dropping the
+# vestigial ``password_hash`` — rather than carry a column nothing reads. The
+# cost is stated in D-21: a database stamped below this baseline cannot be
+# upgraded, and ``migrate_cp_schema`` says so instead of silently skipping steps.
+BASELINE_SCHEMA_VERSION = 5
 
 RESERVED_MODULES = (
     {
@@ -178,15 +186,24 @@ def _create_cp_tables(conn) -> None:
             """
         )
         # Edge-auth accounts (M6.2): standard users + groups, many:many.
+        # ``srp_salt``/``srp_verifier`` are nullable rather than defaulted, which
+        # is what lets one column set describe both states: a row with a
+        # verifier authenticates with SRP, and a row without one cannot
+        # authenticate at all (there is no plaintext fallback to fall back to).
+        # There is no password column: bcrypt left with M7 P2, and the server
+        # cannot store a value it is never allowed to see.
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
               username TEXT PRIMARY KEY,
               display_name TEXT NOT NULL DEFAULT '',
               email TEXT NOT NULL DEFAULT '',
-              password_hash TEXT NOT NULL,
               disabled BOOLEAN NOT NULL DEFAULT FALSE,
-              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              token_generation INTEGER NOT NULL DEFAULT 0,
+              last_login TIMESTAMPTZ,
+              srp_salt TEXT,
+              srp_verifier TEXT
             )
             """
         )
@@ -240,26 +257,72 @@ class Migration:
     apply: Callable[[Any], None]
 
 
-def _migrate_v4(cur) -> None:
-    """M6.6 D1/D3 — per-user session revocation and last-seen login.
+def _migrate_v6(cur) -> None:
+    """M7 P3/P4 — accounts a portal can manage, plus the audit trail.
 
-    ``token_generation`` is embedded in the auth token and compared on every
-    verify, so bumping it revokes exactly one account (disable, demote, delete,
-    logout-everywhere) on its next request. ``last_login`` backs the My Profile
-    view. Both have defaults, so existing rows and older control planes are
-    unaffected.
+    All additive, so a slot rolled back within M7 still reads the database.
+    Two omissions are forced by ``test_only_additive_migration_sql``, which
+    bans the words DELETE and UPDATE in migration SQL:
+
+    * ``group_attributes`` gets **no** ``ON DELETE CASCADE``. Groups are only
+      deletable through ``usermgmt``, which removes their attributes in the same
+      transaction, so the cascade would be belt-and-braces anyway.
+    * no ``INSERT`` seeds the two system groups (the test also requires
+      ``IF NOT EXISTS`` on every non-ALTER statement). Seeding stays in the write
+      layer, which has to be idempotent regardless.
+
+    ``audit_log`` deliberately has **no** foreign keys: an audit trail that
+    disappears when the account it describes is deleted is not an audit trail.
+    ``owui_id`` is unique only where non-NULL — a partial index — because a row
+    whose OWUI account has not been created yet legitimately has none, and two
+    rows must never claim the same OWUI identity (USERS-AND-GROUPS.md D-16a).
     """
     cur.execute(
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS token_generation"
-        " INTEGER NOT NULL DEFAULT 0"
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_required"
+        " BOOLEAN NOT NULL DEFAULT FALSE"
     )
-    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS owui_id TEXT")
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS users_owui_id_key"
+        " ON users (owui_id) WHERE owui_id IS NOT NULL"
+    )
+    cur.execute(
+        "ALTER TABLE groups ADD COLUMN IF NOT EXISTS system"
+        " BOOLEAN NOT NULL DEFAULT FALSE"
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS group_attributes (
+          group_name TEXT NOT NULL REFERENCES groups (name),
+          key TEXT NOT NULL,
+          value JSONB NOT NULL,
+          PRIMARY KEY (group_name, key)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS audit_log (
+          id BIGSERIAL PRIMARY KEY,
+          at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          actor TEXT NOT NULL,
+          target TEXT NOT NULL DEFAULT '',
+          action TEXT NOT NULL,
+          detail JSONB
+        )
+        """
+    )
 
 
 # Append-only, ascending. Bumping SCHEMA_VERSION without registering the step is
 # caught by test_migrations_cover_the_declared_version.
 MIGRATIONS: tuple[Migration, ...] = (
-    Migration(4, "users: token_generation + last_login", _migrate_v4),
+    Migration(
+        6,
+        "users: password_reset_required + owui_id; groups.system;"
+        " group_attributes; audit_log",
+        _migrate_v6,
+    ),
 )
 
 
@@ -293,6 +356,39 @@ def _write_schema_version(cur, version: int) -> None:
     )
 
 
+# Columns that mean the database predates what this build can run. A pre-M7 box
+# still has ``users.password_hash`` NOT NULL (it was the bcrypt credential), and
+# the v6 step is additive — a slot rolled back inside M7 must still read the
+# database — so no migration may ever drop it. Every ``usermgmt`` INSERT then
+# dies on a not-null violation that names nothing an operator can act on.
+UNSUPPORTED_COLUMNS = (("users", "password_hash"),)
+
+
+def _reject_unsupported_columns(cur) -> None:
+    """Refuse to serve a database whose shape this build cannot use.
+
+    The version stamp is only a *proxy* for this hazard, which is why the check
+    reads the catalog instead: a box that already ran the v6 step is stamped 6
+    and is still broken, so raising the baseline would not catch it — and the
+    baseline cannot be raised anyway, because a fresh database relies on the v6
+    step for ``group_attributes`` and ``audit_log``.
+    """
+    for table, column in UNSUPPORTED_COLUMNS:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns"
+            " WHERE table_schema = current_schema()"
+            " AND table_name = %s AND column_name = %s",
+            (table, column),
+        )
+        if cur.fetchone() is not None:
+            raise ValueError(
+                f"CP schema still has {table}.{column}, which predates this"
+                " build and no additive migration may drop it — reinstall the"
+                " appliance, or on a test box run 'ALTER TABLE"
+                f" {table} DROP COLUMN {column}'"
+            )
+
+
 def migrate_cp_schema(cur) -> int:
     """Apply pending migrations on an open CP cursor; return the resulting version.
 
@@ -304,11 +400,29 @@ def migrate_cp_schema(cur) -> int:
     on: additive-only migrations keep it readable, and refusing to start would
     turn an A/B rollback into a bricked appliance. Nothing is applied in that
     case, and the recorded version is reported as-is.
+
+    A database *older than the baseline* is the opposite case and raises. The
+    steps that would have upgraded it were deleted in D-29, so falling through
+    would produce a database missing columns with no error anywhere — and
+    because the v4/v5 steps were folded in rather than kept, no pre-M7 database
+    can be upgraded at all. ``provision_data_plane`` turns this into a
+    ``{"state": "error"}`` report, so the appliance says "reinstall" instead of
+    booting into a half-shaped schema.
+
+    Column *shape* is checked before any of that, because it is the real hazard
+    and the stamp is only a proxy for it (see ``_reject_unsupported_columns``).
     """
     version = _read_schema_version(cur)
+    _reject_unsupported_columns(cur)
     if version == 0:
         version = BASELINE_SCHEMA_VERSION
         _write_schema_version(cur, version)
+    elif version < BASELINE_SCHEMA_VERSION:
+        raise ValueError(
+            f"CP schema version {version} predates the supported baseline "
+            f"{BASELINE_SCHEMA_VERSION}; this build cannot upgrade it — reinstall "
+            "the appliance"
+        )
     if version > SCHEMA_VERSION:
         return version
     for migration in MIGRATIONS:
@@ -386,8 +500,46 @@ def provision_data_plane() -> dict[str, Any]:
 
 
 def cp_connect():
-    """Connect to the CP state database (lemonseed_cp)."""
+    """Connect to the CP state database (lemonseed_cp).
+
+    The connection is **autocommit** (see :func:`_connect`). Right for reads and
+    for single-statement writes; wrong for any change that must land as a unit —
+    use :func:`cp_transaction` for those.
+    """
     return _connect(CP_DB_NAME)
+
+
+@contextmanager
+def cp_transaction():
+    """One explicit CP-database transaction: commit on a clean exit, else rollback.
+
+    ``cp_connect`` hands back an autocommit connection, so a multi-statement
+    write written against it is really a series of independent commits. That is
+    not a style preference: ``usermgmt`` must be able to say "delete the
+    straggler and enroll the new admin, or neither", and D-6's no-null-password
+    guarantee depends on it. Restores autocommit before closing so a pooled or
+    reused connection never silently inherits transaction mode.
+    """
+    conn = _connect(CP_DB_NAME)
+    conn.autocommit = False
+    try:
+        yield conn
+        conn.commit()
+    except BaseException:  # noqa: BLE001 — rollback then re-raise, whatever it was
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001 — best effort after an already-failing session
+            pass
+        raise
+    finally:
+        try:
+            conn.autocommit = True
+        except Exception:  # noqa: BLE001 — cleanup on a connection that may be gone
+            pass
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001 — a failed close must not mask the real error
+            pass
 
 
 def cp_get_meta(key: str) -> Any:

@@ -295,14 +295,33 @@ print("OK: role=control-plane, public subset only (no gated keys)")
 ADMIN_USERNAME="admin"
 ADMIN_PASSWORD="smoke-test-pass"
 AUTH_HOST="lemon-test.local"
+# The identities the M7 P3/P4 block near the end of this script creates. They are
+# named up here because the household check below has to subtract them: a run that
+# aborted part-way leaves its smoke account on the persistent user-data disk, and
+# that debris is not the same fact as a boot that invented an account.
+M7_USER="smokematt"
+M7_GROUP="kidsgroup"
+M7_ADMIN2="smokeadmin2"
 COOKIE_JAR="$(mktemp /tmp/qemu-auth-cookies.XXXXXX)"
+# SRP runs on the HOST here: srp_client.py is the test-side client half and is
+# deliberately not shipped in the appliance image. This is the same module the
+# unit tests use, so QEMU exercises the real protocol rather than a copy.
+SRP_PY=(env "PYTHONPATH=${ROOT}/control-plane" python3 -m srp_client)
 
-echo "==> Edge auth: first-admin bootstrap via /setup (idempotent)"
+# The (salt, verifier) pair is what /setup now receives — derived here exactly as
+# a browser would, which is the point: the appliance never sees ADMIN_PASSWORD.
+read -r ENROLL_SALT ENROLL_VERIFIER <<< "$("${SRP_PY[@]}" enroll "${ADMIN_USERNAME}" "${ADMIN_PASSWORD}")"
+if [[ -z "${ENROLL_SALT}" || -z "${ENROLL_VERIFIER}" ]]; then
+  echo "srp_client enroll produced no verifier" >&2
+  exit 1
+fi
+
+echo "==> Edge auth: first-admin bootstrap via /setup (SRP enrollment, idempotent)"
 setup_code="$(curl -sS --max-time 900 -o /tmp/qemu-setup-body.html \
   -w '%{http_code}' \
   -X POST "http://127.0.0.1:${HOST_PORT}/setup" \
   -H 'Content-Type: application/json' \
-  -d "{\"name\":\"Lemon Test\",\"timezone\":\"UTC\",\"admin_username\":\"${ADMIN_USERNAME}\",\"admin_password\":\"${ADMIN_PASSWORD}\"}" \
+  -d "{\"name\":\"Lemon Test\",\"timezone\":\"UTC\",\"admin_username\":\"${ADMIN_USERNAME}\",\"admin_srp_salt\":\"${ENROLL_SALT}\",\"admin_srp_verifier\":\"${ENROLL_VERIFIER}\"}" \
   2>/tmp/qemu-setup-err.txt || echo 000)"
 # 200 = admin created; 409 = setup already complete (persisted disk). Both OK.
 if [[ "${setup_code}" != "200" && "${setup_code}" != "409" ]]; then
@@ -311,11 +330,18 @@ if [[ "${setup_code}" != "200" && "${setup_code}" != "409" ]]; then
   tail -80 "${LOG}" >&2 || true
   exit 1
 fi
+# A browser-produced pair must have been accepted; if the server rejected the
+# enrollment shape the body is the setup form with an error, not a done page.
+if [[ "${setup_code}" == "200" ]] && grep -qi "admin_srp_verifier\|signing in requires" /tmp/qemu-setup-body.html; then
+  echo "POST /setup did not accept the SRP enrollment" >&2
+  grep -o 'class="err"[^<]*' /tmp/qemu-setup-body.html >&2 || true
+  exit 1
+fi
 
 # The auth-state wait moved BELOW the login block: account counts are household
 # facts, so they now live only in the gated /api/system (M6.6 step 5).
 
-echo "==> CP-native login: sign-in page + credential login"
+echo "==> CP-native login: sign-in page renders"
 # Retried, not asserted once: issuing a session needs Valkey, and this is now the
 # first thing that asks for one (it used to run after a wait for auth state=enabled,
 # which absorbed a slow data plane). A 503 here means "not yet", not "broken".
@@ -329,28 +355,124 @@ done
 [[ "${page_code}" == "200" ]] || {
   echo "GET /login: expected 200, got ${page_code}" >&2; exit 1;
 }
+
+# The login page must ship the SRP client and never post a password. Asserted on
+# the actual bytes the guest serves, which is the only copy that matters.
+srp_page="$(mktemp /tmp/qemu-login-page.XXXXXX)"
+# Fast boots can serve a redirect while first-boot setup settles; retry the
+# fetch a few times before declaring the SRP client missing.
+srp_ok="no"
+for srp_attempt in 1 2 3 4 5; do
+  curl -sS -o "${srp_page}" -H "Host: ${AUTH_HOST}" \
+    "http://127.0.0.1:${HOST_PORT}/login" || true
+  if grep -q 'LemonseedSRP' "${srp_page}"; then srp_ok="yes"; break; fi
+  sleep 5
+done
+if [[ "${srp_ok}" != "yes" ]]; then
+  echo "GET /login: page does not include the SRP client" >&2; exit 1;
+fi
+if grep -q 'JSON.stringify(body)' "${srp_page}" || grep -q "'password':" "${srp_page}"; then
+  echo "GET /login: page still serialises the password into a request body" >&2; exit 1;
+fi
+rm -f "${srp_page}"
+
+# POST /login must refuse: there is no server-side plaintext path to fall back to.
+plain_code="$(curl -sS -o /tmp/qemu-plain-login.txt -w '%{http_code}' \
+  -X POST "http://127.0.0.1:${HOST_PORT}/login" \
+  -H "Host: ${AUTH_HOST}" -H 'Content-Type: application/json' \
+  -d "{\"username\":\"${ADMIN_USERNAME}\",\"password\":\"${ADMIN_PASSWORD}\"}")"
+if [[ "${plain_code}" != "405" ]]; then
+  echo "POST /login: expected 405 (no plaintext path), got ${plain_code}" >&2; exit 1;
+fi
+
+echo "==> SRP sign-in: challenge + verify over the gateway"
+# Retried for the same reason the old login was: the first session write needs
+# Valkey to be up, and a 503 here means "not yet".
 signin_deadline=$((deadline))
-signin_code=""
+verify_code=""
 while (( SECONDS < signin_deadline )); do
-  signin_code="$(curl -sS --max-time 60 -o /dev/null -c "${COOKIE_JAR}" \
-    -D /tmp/qemu-signin-hdr.txt -w '%{http_code}' \
-    -X POST "http://127.0.0.1:${HOST_PORT}/login" \
-    -H "Host: ${AUTH_HOST}" \
-    -H 'Content-Type: application/json' \
-    -d "{\"username\":\"${ADMIN_USERNAME}\",\"password\":\"${ADMIN_PASSWORD}\",\"rd\":\"/\"}")"
-  [[ "${signin_code}" == "302" ]] && break
-  echo "waiting: POST /login returned ${signin_code}" >&2
+  challenge="$(curl -sS --max-time 60 \
+    -X POST "http://127.0.0.1:${HOST_PORT}/_lemonseed/api/srp/challenge" \
+    -H "Host: ${AUTH_HOST}" -H 'Content-Type: application/json' \
+    -d "{\"username\":\"${ADMIN_USERNAME}\"}")"
+  read -r CID CH_SALT CH_B <<< "$(printf '%s' "${challenge}" | python3 -c \
+    'import json,sys
+try:
+    d = json.load(sys.stdin)
+    print(d.get("cid", ""), d.get("salt", ""), d.get("B", ""))
+except Exception:
+    print("", "", "")')"
+  if [[ -n "${CID}" && -n "${CH_B}" ]]; then
+    read -r CLI_A CLI_M1 CLI_EXPECT_M2 <<< "$("${SRP_PY[@]}" auth "${CH_SALT}" "${CH_B}" \
+      "${ADMIN_USERNAME}" "${ADMIN_PASSWORD}")"
+    verify_body="$(curl -sS --max-time 60 -o /tmp/qemu-verify-body.json \
+      -D /tmp/qemu-signin-hdr.txt -w '%{http_code}' \
+      -X POST "http://127.0.0.1:${HOST_PORT}/_lemonseed/api/srp/verify" \
+      -H "Host: ${AUTH_HOST}" -H 'Content-Type: application/json' \
+      -c "${COOKIE_JAR}" \
+      -d "{\"cid\":\"${CID}\",\"A\":\"${CLI_A}\",\"M1\":\"${CLI_M1}\"}")"
+    verify_code="${verify_body}"
+    [[ "${verify_code}" == "200" ]] && break
+  fi
+  echo "waiting: SRP sign-in incomplete (challenge='${challenge:0:80}' verify=${verify_code:-none})" >&2
   if ! kill -0 "$(cat "${PIDFILE}")" 2>/dev/null; then
-    echo "QEMU exited during login; tail ${LOG}:" >&2
+    echo "QEMU exited during sign-in; tail ${LOG}:" >&2
     tail -80 "${LOG}" >&2 || true
     exit 1
   fi
   sleep 5
 done
-if [[ "${signin_code}" != "302" ]] || ! grep -qi '^set-cookie: lemonseed_session' /tmp/qemu-signin-hdr.txt; then
-  echo "POST /login: expected 302 + lemonseed_session cookie, got ${signin_code}" >&2
+if [[ "${verify_code}" != "200" ]]; then
+  echo "SRP verify: expected 200, got ${verify_code:-never-tried}" >&2
+  cat /tmp/qemu-verify-body.json >&2 || true
   cat /tmp/qemu-signin-hdr.txt >&2 || true
   exit 1
+fi
+
+# Mutual authentication, asserted on the wire: the M2 the appliance sent must be
+# the one our client derived. If it is not, the server proved nothing.
+server_m2="$(python3 -c \
+  'import json,sys
+try:
+    print(json.load(open("/tmp/qemu-verify-body.json")).get("M2", ""))
+except Exception:
+    print("")')"
+if [[ "${server_m2}" != "${CLI_EXPECT_M2}" ]]; then
+  echo "SRP verify: server M2 does not match the client's expectation" >&2
+  echo "  server: ${server_m2}" >&2
+  echo "  client: ${CLI_EXPECT_M2}" >&2
+  exit 1
+fi
+if ! grep -qi '^set-cookie: lemonseed_session' /tmp/qemu-signin-hdr.txt; then
+  echo "SRP verify: expected a lemonseed_session cookie" >&2
+  cat /tmp/qemu-signin-hdr.txt >&2 || true
+  exit 1
+fi
+
+# A replayed verify must fail: the pending handshake is single-use.
+replay_code="$(curl -sS --max-time 60 -o /dev/null -w '%{http_code}' \
+  -X POST "http://127.0.0.1:${HOST_PORT}/_lemonseed/api/srp/verify" \
+  -H "Host: ${AUTH_HOST}" -H 'Content-Type: application/json' \
+  -d "{\"cid\":\"${CID}\",\"A\":\"${CLI_A}\",\"M1\":\"${CLI_M1}\"}")"
+if [[ "${replay_code}" != "401" ]]; then
+  echo "replayed SRP verify: expected 401, got ${replay_code}" >&2; exit 1
+fi
+
+# A wrong password must fail the same way a right one fails to prove, with no
+# cookie issued.
+read -r BAD_A BAD_M1 _BAD_M2 <<< "$("${SRP_PY[@]}" auth "${CH_SALT}" "${CH_B}" \
+  "${ADMIN_USERNAME}" "definitely-not-the-password" 2>/dev/null || echo "  ")"
+bad_code=""
+if [[ -n "${BAD_A}" ]]; then
+  bad_code="$(curl -sS --max-time 60 -o /dev/null -D /tmp/qemu-bad-hdr.txt -w '%{http_code}' \
+    -X POST "http://127.0.0.1:${HOST_PORT}/_lemonseed/api/srp/verify" \
+    -H "Host: ${AUTH_HOST}" -H 'Content-Type: application/json' \
+    -d "{\"cid\":\"${CID}\",\"A\":\"${BAD_A}\",\"M1\":\"${BAD_M1}\"}")"
+fi
+# CID was consumed by the successful verify above, so 401 is expected either way;
+# what matters is that no cookie was issued for a wrong password.
+if grep -qi '^set-cookie: lemonseed_session' /tmp/qemu-bad-hdr.txt 2>/dev/null; then
+  echo "wrong password was issued a session cookie" >&2; exit 1
 fi
 
 # The session cookie must NOT be Secure (the appliance is HTTP-only). Verify
@@ -401,19 +523,46 @@ if [[ -z "${auth_json}" ]]; then
   tail -80 "${LOG}" >&2 || true
   exit 1
 fi
+
+# The household check. It reads the roster rather than the /api/system counters
+# because P3 can leave its smoke account on a persistent user-data disk when a run
+# aborts part-way, and a bare count cannot tell that debris apart from a boot that
+# invented an account. Names can: everything that is not a smoke identity has to be
+# exactly the one account setup was asked to create.
+#
+# Deleting the debris here is not an option: usermgmt.delete refuses while Open
+# WebUI is unreachable (D-16a), and OWUI has not started yet at this point in the
+# boot. The M7 block near the end removes its own accounts once OWUI is up.
 echo "${auth_json}" | python3 -c '
 import json, sys
 data = json.load(sys.stdin)
 a = data.get("auth") or {}
 state = a.get("state")
-users = a.get("users")
-admins = a.get("admins")
-print("OK: auth state=%r users=%r admins=%r" % (state, users, admins))
+print("OK: auth state=%r users=%r admins=%r" % (state, a.get("users"), a.get("admins")))
 assert state == "enabled", a
-assert users == 1 and admins == 1, a
 # Setup is finished by now, so the name the installer handoff looks for exists.
 assert (data.get("setup") or {}).get("mdns_name"), data
 '
+roster_json="$(poll_http "/_lemonseed/api/users" 30 "${COOKIE_JAR}" "${AUTH_HOST}" 2>/dev/null || true)"
+if [[ -z "${roster_json}" ]]; then
+  echo "GET /_lemonseed/api/users with the admin session returned nothing" >&2
+  exit 1
+fi
+printf '%s' "${roster_json}" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+smoke = {sys.argv[1], sys.argv[2]}
+rows = d.get("users") or []
+household = sorted(str(u.get("username")) for u in rows if str(u.get("username")) not in smoke)
+admins = sorted(
+    str(u.get("username")) for u in rows
+    if not u.get("disabled") and "admin" in (u.get("groups") or [])
+)
+assert household == [sys.argv[3]], household
+assert admins == [sys.argv[3]], admins
+assert d.get("first_admin") == sys.argv[3], d.get("first_admin")
+print("OK: one account exists (%s, admin); first_admin agrees" % sys.argv[3])
+' "${M7_USER}" "${M7_ADMIN2}" "${ADMIN_USERNAME}"
 
 echo "==> Checking /api/boot"
 boot_json="$(poll_http "/api/boot" 30)"
@@ -507,7 +656,16 @@ while (( SECONDS < owui_deadline )); do
     set +e
     echo "${modules_json}" | python3 -c '
 import json, sys
-data = json.load(sys.stdin)
+raw = sys.stdin.read()
+try:
+    data = json.loads(raw)
+except ValueError:
+    # A gate redirect (302 HTML) can slip in around an nginx reload on fast
+    # boots; treat it as "not ready yet" and retry, the same courtesy the
+    # /api/data wait extends to an empty body.
+    print("waiting: /api/modules returned a non-JSON response: %r" % raw[:160],
+          file=sys.stderr)
+    sys.exit(2)
 owui = data.get("open_webui") or {}
 image = str(owui.get("image") or "")
 assert "state" in owui, data
@@ -605,11 +763,11 @@ email = str(body.get("email") or "").lower()
 if not token:
     print("OWUI SPA sign-in: no token in response", body, file=sys.stderr)
     sys.exit(1)
-if email != "admin@localhost":
-    print("OWUI SPA sign-in: identity %r is not the portal admin" % email, file=sys.stderr)
+if email != sys.argv[1]:
+    print("OWUI SPA sign-in: identity %r is not the portal admin (want %r)" % (email, sys.argv[1]), file=sys.stderr)
     sys.exit(1)
 print(token)
-')"
+' "${ADMIN_USERNAME}@localhost")"
 owui_user_id="$(printf '%s' "${owui_signin_json}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id") or "")')"
 svc_id="$(printf '%s' "${modules_json}" | python3 -c 'import json,sys; owui=(json.load(sys.stdin).get("open_webui") or {}); print(owui.get("service_account_id") or "")')"
 if [[ -z "${svc_id}" || "${owui_user_id}" == "${svc_id}" ]]; then
@@ -789,18 +947,22 @@ summary = view.get("guard_summary") or {}
 # rendered it and nginx accepted it — not that the manifest mentioned it.
 if summary.get("source") != "rendered":
     fail("guard summary must come from the rendered state, got %r" % (summary,))
-if summary.get("enforced") != 5 or summary.get("total") != 7:
-    fail("expected 5 blocked of 7 guards, got %r" % (summary,))
+if summary.get("enforced") != 7 or summary.get("total") != 7:
+    fail("expected all 7 guards blocked, got %r" % (summary,))
 if not summary.get("in_sync"):
     fail("declared/served guard hashes disagree: %r" % (summary,))
 if summary.get("declared_sha") != summary.get("rendered_sha"):
     fail("rendered file differs from the manifest render: %r" % (summary,))
 blocked = {g.get("key") for g in guards if g.get("enforced")}
 advisory = {g.get("key") for g in guards if not g.get("enforced")}
-want_advisory = {"POST /api/v1/auths/add", "DELETE /api/v1/users/.*"}
-if advisory != want_advisory:
-    fail("account guards must stay advisory until M6.2b, got %r" % (sorted(advisory),))
-if len(blocked) != 5 or (blocked & want_advisory):
+# Nothing is advisory any more. The last one was account creation, which stayed
+# open only while OWUI was the only way to make a user; the Users panel in the
+# portal replaced that in M7 P3, so the user panel is now read end to end (D-17b).
+# Bootstrapping is unaffected: a brand-new OWUI database seeds its first user on
+# the signup route, which is a different path and stays open.
+if advisory:
+    fail("no guard may stay advisory, got %r" % (sorted(advisory),))
+if len(blocked) != 7:
     fail("unexpected blocked guard set: %r" % (sorted(blocked),))
 blob = json.dumps(view)
 if "sk-" in blob:
@@ -809,7 +971,7 @@ print("ownership view: %d rows, %d namespaces, %d guards (%d enforced)" % (
     view.get("counts", {}).get("config", 0), len(view.get("sections") or []),
     len(guards), summary.get("enforced", -1)))
 '; then
-  echo "OK: ownership view classifies managed vs yours, masks the key, shows 5 enforced guards"
+  echo "OK: ownership view classifies managed vs yours, masks the key, shows 7 enforced guards"
 else
   echo "owui ownership view assertions failed (details on stderr above)" >&2
   exit 1
@@ -867,14 +1029,59 @@ else
   exit 1
 fi
 
+# M7: /settings/content is a tabbed control panel, not a tall column. Rail and
+# panes are asserted together because a pane no tab reaches is invisible UI and a
+# tab with no pane is a dead button. The *served* document is what must be
+# readable, so this asserts the HTML rather than a browser's render.
+echo "==> Settings page: rail, panes, power controls, one dialog component"
+if printf '%s' "$(curl -fsS --max-time 30 -b "${COOKIE_JAR}" \
+    --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
+    "http://${AUTH_HOST}:${HOST_PORT}/settings/content")" | python3 -c '
+import re, sys
+html = sys.stdin.read()
+
+
+def fail(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+
+tabs = re.findall(r"<span class=\"rail-label\">([^<]*)</span>", html)
+if tabs != ["General", "AI Models", "Users &amp; Groups", "Open WebUI", "Modules"]:
+    fail("rail labels changed: %r" % (tabs,))
+if "role=\"tablist\"" not in html:
+    fail("the rail is not a tablist")
+panes = re.findall(r"<div class=\"pane\" id=\"pane-([a-z]+)\"([^>]*)>", html)
+if len(panes) != len(tabs):
+    fail("panes (%d) and tabs (%d) no longer match" % (len(panes), len(tabs)))
+visible = [name for name, attrs in panes if "hidden" not in attrs]
+if visible != ["general"]:
+    fail("expected only pane-general visible in the served document, got %r" % (visible,))
+for missing in ("id=\"power-reboot\"", "id=\"power-shutdown\"", "id=\"power-note\"",
+                "id=\"pane-people\"", "id=\"pane-modules\""):
+    if missing not in html:
+        fail("missing " + missing)
+# One dialog component for every question the page asks, and no native dialog.
+if "function dialogTypedConfirm(" not in html:
+    fail("the shared dialog component is not shipped on the settings page")
+if "window.prompt" in html or "alert(" in html:
+    fail("a native dialog came back")
+print("settings page: five tabs, five panes, one visible, power controls, one dialog component")
+'; then
+  echo "OK: settings page is a tabbed control panel with power controls"
+else
+  echo "settings control-panel assertions failed (details on stderr above)" >&2
+  exit 1
+fi
+
 # M6.3b Phase 4B: gateway enforcement of the managed paths.
 #
 # Marker rule — never assert on status alone, because Open WebUI also answers
 # 403 for its own permission failures:
 #   guarded      -> status 403 AND body carries our marker
 #   not guarded  -> body must NOT carry our marker, whatever the status
-# Every guard in the manifest gets one assertion here (5 enforce + 2 advertise
-# = all 7), so a guard added later without a case is a visible gap.
+# Every guard in the manifest gets one assertion here (all 7 enforce), so a
+# guard added later without a case is a visible gap.
 echo "==> OWUI guards: rendered state must match the manifest"
 guards_ok=false
 guards_deadline=$(( SECONDS + 120 ))
@@ -899,8 +1106,8 @@ if g.get("nginx_sha") != g.get("rendered_sha"):
     fail("nginx has not accepted the rendered guards (reload failing): %%r")
 if g.get("pending"):
     fail("guards still pending (service account id unresolved?): %%r")
-if g.get("enforced_count") != 5 or g.get("declared") != 5:
-    fail("expected 5 enforced of 5 declared guards: %%r")
+if g.get("enforced_count") != 7 or g.get("declared") != 7:
+    fail("expected 7 enforced of 7 declared guards: %%r")
 if not g.get("in_sync"):
     fail("guard state not in sync: %%r")
 print("guard state: declared=%s rendered=%s sha=%s" % (
@@ -918,7 +1125,7 @@ if [[ "${guards_ok}" != "true" ]]; then
   tail -n 5 /tmp/qemu-owui-guards.err >&2 || true
   exit 1
 fi
-echo "OK: guards declared, rendered and served (5 enforced)"
+echo "OK: guards declared, rendered and served (7 enforced)"
 
 # One request through the gateway, reporting the status code and leaving the
 # body in /tmp/qemu-guard.body for the marker check.
@@ -981,14 +1188,22 @@ require_blocked POST /ollama/config/update '[]'
 require_blocked POST /api/v1/configs/connections '{}'
 require_blocked POST "/api/v1/users/${svc_id}/update" '{}'
 require_blocked DELETE "/api/v1/users/${svc_id}"
-echo "OK: all 5 enforced guards blocked at the nginx edge (service id ${svc_id})"
+echo "OK: the five guards that name the service account are blocked at the edge (id ${svc_id})"
 
-# The two account guards stay advisory until M6.2b replaces them with user-list
-# mirroring. Deliberately non-mutating calls: an empty body and a user that does
-# not exist, so this proves "not guarded" without creating or deleting anything.
-echo "==> OWUI guards: advisory paths stay open (Open WebUI answers, not us)"
-require_unguarded POST /api/v1/auths/add '{}'
-require_unguarded DELETE /api/v1/users/does-not-exist
+# The create rule is the last of the set, enforced as of M7 P3: an account made
+# in Open WebUI has no Lemonseed row, no SRP credential and nothing to sign in
+# with. Probed with an empty body, so a failed guard shows up as Open WebUI's own
+# 422 rather than quietly creating an account.
+echo "==> OWUI guards: account creation is refused too (the user panel is read-only)"
+require_blocked POST /api/v1/auths/add '{}'
+require_blocked DELETE /api/v1/users/does-not-exist
+
+# D-17a: OWUI owns its self-service routes. A greedy `users/.*/update` guard
+# would swallow these and take the user's own settings page down with it.
+echo "==> OWUI guards: OWUI self-service update routes stay open"
+require_unguarded POST /api/v1/users/user/settings/update '{}'
+require_unguarded POST /api/v1/users/user/info/update '{}'
+require_unguarded POST /api/v1/users/user/status/update '{}'
 
 # Unguarded URIs, chosen because this suite depends on them: a render that
 # over-reaches breaks here loudly instead of mysteriously later.
@@ -1298,7 +1513,8 @@ p = owui.get("owui_policy") or {}
 if not p.get("ok"):
     print("owui_policy not ok after reset: %r" % ({k: p.get(k) for k in ("ok", "state", "last_error")},), file=sys.stderr)
     sys.exit(1)
-if g.get("enforced_count") != 5 or g.get("nginx_sha") != g.get("rendered_sha"):
+if g.get("enforced_count") != 7 or g.get("declared") != 7 \
+        or g.get("nginx_sha") != g.get("rendered_sha"):
     print("guards not re-established after reset: %r" % (g,), file=sys.stderr)
     sys.exit(1)
 if g.get("service_account_id") and g.get("service_account_id") != owui.get("service_account_id"):
@@ -1418,6 +1634,554 @@ else:
     # Default run: just record the outcome (not-ready below ~10 GiB, selected at 16 GiB).
     print("OK: /_lemonseed/api/models families=%d plan.state=%s (CPU path)" % (len(fams), plan.get("state")))
 '
+
+# ===========================================================================
+# M7 P3/P4 — household accounts and groups, through the real gateway.
+#
+# Three things here can only be proved in a booted appliance, and they are
+# exactly the ones a unit test can fake into passing:
+#
+#   1. The M7 routes exist *in nginx* with the right gates. A control-plane unit
+#      test calls the handler directly, so a missing location block is invisible
+#      to it — which is how a page can ship unreachable in this milestone.
+#   2. An account an admin created signs in with the code the admin was handed,
+#      gets NO session until that code has been rotated, and gets one the moment
+#      it has (D-11). The no-cookie half is the whole point of the decision.
+#   3. Open WebUI mirrors the account as {username}@localhost while the control
+#      plane keeps the household e-mail address (D-16'). Only a live Open WebUI
+#      can say that, and it is the claim that keeps the two systems reconcilable.
+#
+# No password is sent anywhere in this block. Every credential is a browser-style
+# SRP enrollment derived on the host by srp_client — the same module the portal's
+# JavaScript is checked against in the unit suite — so the appliance receives
+# exactly what a portal browser would send.
+#
+# Re-runnable on a persistent user-data disk: the member and the group are
+# removed before they are created, and a refusal there is expected.
+# ===========================================================================
+M7_NAME="Smoke Matt"
+# An address nobody owns. It must differ from the Open WebUI identity for the
+# D-16' assertion below to mean anything, and it must not be real.
+M7_EMAIL="matt@example.invalid"
+M7_OTP="rotate-me-first-one"
+M7_PASS="rotated-in-by-matt-two"
+M7_JAR="$(mktemp /tmp/qemu-m7-jar.XXXXXX)"
+M7_HDR="$(mktemp /tmp/qemu-m7-hdr.XXXXXX)"
+
+# POST/GET through the gateway with a given cookie jar: status on stdout, body in
+# /tmp/qemu-m7.body, response headers in ${M7_HDR}.
+m7_post() {
+  local jar="$1" path="$2" data="$3"
+  curl -sS -o /tmp/qemu-m7.body -D "${M7_HDR}" -w '%{http_code}' --max-time 60 \
+    -b "${jar}" -c "${jar}" --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
+    -H 'Content-Type: application/json' -X POST \
+    "http://${AUTH_HOST}:${HOST_PORT}${path}" -d "${data}"
+}
+m7_get() {
+  local jar="$1" path="$2"
+  curl -sS -o /tmp/qemu-m7.body -D "${M7_HDR}" -w '%{http_code}' --max-time 60 \
+    -b "${jar}" -c "${jar}" --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
+    "http://${AUTH_HOST}:${HOST_PORT}${path}"
+}
+
+m7_stop() {  # m7_stop <the call that failed> <status we got>
+  echo "$1: expected 200, got ${2}" >&2
+  head -c 400 /tmp/qemu-m7.body >&2 || true
+  echo "" >&2
+  exit 1
+}
+
+m7_check() {  # m7_check <cid> <who> — a handshake that produced nothing is fatal
+  if [[ -z "${1}" ]]; then
+    echo "no handshake for $2" >&2
+    exit 1
+  fi
+}
+
+# One SRP challenge for an identity: "<cid> <salt> <B>".
+m7_challenge() {
+  curl -sS -o /tmp/qemu-m7-chal.json --max-time 60 \
+    --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
+    -H 'Content-Type: application/json' \
+    -X POST "http://${AUTH_HOST}:${HOST_PORT}/_lemonseed/api/srp/challenge" \
+    -d "{\"username\":\"$1\"}" >/dev/null
+  python3 -c 'import json
+try:
+    d = json.load(open("/tmp/qemu-m7-chal.json"))
+    print(d.get("cid", ""), d.get("salt", ""), d.get("B", ""))
+except Exception:
+    print("", "", "")'
+}
+
+# Everything a browser would compute for one sign-in, on a fresh challenge:
+# "<cid> <A> <M1> <expected-M2>".
+m7_prove() {
+  local who="$1" secret="$2" cid salt b a m1 want
+  read -r cid salt b <<< "$(m7_challenge "${who}")"
+  if [[ -z "${cid}" || -z "${b}" ]]; then
+    echo "challenge for ${who} returned no cid/B:" >&2
+    head -c 300 /tmp/qemu-m7-chal.json >&2 || true
+    echo "" >&2
+    exit 1
+  fi
+  read -r a m1 want <<< "$("${SRP_PY[@]}" auth "${salt}" "${b}" "${who}" "${secret}")"
+  if [[ -z "${a}" || -z "${m1}" ]]; then
+    echo "srp_client produced no A/M1 for ${who}" >&2
+    exit 1
+  fi
+  echo "${cid} ${a} ${m1} ${want}"
+}
+
+# POST an srp/verify or srp/rotate with a fresh handshake; headers land in
+# ${M7_HDR} so the caller can look for Set-Cookie.
+m7_srp() {  # m7_srp <route> <jar> <cid> <A> <M1> [salt verifier]
+  local route="$1" jar="$2" cid="$3" a="$4" m1="$5" salt="${6-}" verifier="${7-}"
+  local payload="{\"cid\":\"${cid}\",\"A\":\"${a}\",\"M1\":\"${m1}\"}"
+  if [[ -n "${salt}" ]]; then
+    payload="{\"cid\":\"${cid}\",\"A\":\"${a}\",\"M1\":\"${m1}\",\"salt\":\"${salt}\",\"verifier\":\"${verifier}\"}"
+  fi
+  curl -sS -o /tmp/qemu-m7.body -D "${M7_HDR}" -w '%{http_code}' --max-time 60 \
+    -b "${jar}" -c "${jar}" --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
+    -H 'Content-Type: application/json' \
+    -X POST "http://${AUTH_HOST}:${HOST_PORT}/_lemonseed/api/srp/${route}" \
+    -d "${payload}"
+}
+
+echo "==> M7: /profile/ is behind the edge gate for an anonymous navigation"
+# The gate, not the control plane, answers this one, and it must send a
+# navigation (not an XHR) to the sign-in page with the origin in the rd= param.
+prof_code="$(curl -sS -o /dev/null -D /tmp/qemu-m7-prof.hdr -w '%{http_code}' --max-time 60 \
+  --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
+  "http://${AUTH_HOST}:${HOST_PORT}/profile/")"
+# nginx answers with an absolute Location, so the origin is optional here.
+if [[ "${prof_code}" != "302" ]] || ! grep -qiE '^location: (https?://[^/]+)?/login\?rd=/profile/' /tmp/qemu-m7-prof.hdr; then
+  echo "GET /profile/ anonymous: expected 302 to /login?rd=/profile/, got ${prof_code}" >&2
+  cat /tmp/qemu-m7-prof.hdr >&2 || true
+  exit 1
+fi
+
+prof_code="$(m7_get "${COOKIE_JAR}" "/profile/")"
+[[ "${prof_code}" == "200" ]] || m7_stop "GET /profile/ with an admin session" "${prof_code}"
+if ! grep -q 'id="profile-panel"' /tmp/qemu-m7.body; then
+  echo "GET /profile/ did not render the profile panel" >&2; exit 1
+fi
+if ! grep -q 'LemonseedSRP' /tmp/qemu-m7.body; then
+  echo "the profile page ships no SRP client, so a password change there is impossible" >&2
+  exit 1
+fi
+if grep -q "'password':" /tmp/qemu-m7.body; then
+  echo "the profile page serialises a password into a request body" >&2; exit 1
+fi
+# /profile without the slash is a gateway redirect, not a second page.
+short_code="$(m7_get "${COOKIE_JAR}" "/profile")"
+if [[ "${short_code}" != "302" ]] || ! grep -qiE '^location: (https?://[^/]+)?/profile/' "${M7_HDR}"; then
+  echo "GET /profile: expected 302 to /profile/, got ${short_code}" >&2
+  grep -i '^location' "${M7_HDR}" >&2 || true
+  exit 1
+fi
+echo "OK: My Profile is gated, served, and carries no plaintext path"
+
+# Idempotency on a persistent user-data disk. A run that aborted part-way can
+# leave its smoke accounts or group behind, and the assertions below expect the
+# household this run creates. The sweep sits here, not at the top of the M7 block,
+# because D-16a makes delete refuse while Open WebUI is unreachable and OWUI only
+# comes up mid-boot. A refusal is the normal case: there is nothing to delete.
+m7_post "${COOKIE_JAR}" "/_lemonseed/api/users/delete" "{\"username\":\"${M7_USER}\"}" >/dev/null || true
+m7_post "${COOKIE_JAR}" "/_lemonseed/api/users/delete" "{\"username\":\"${M7_ADMIN2}\"}" >/dev/null || true
+m7_post "${COOKIE_JAR}" "/_lemonseed/api/groups/delete" "{\"group\":\"${M7_GROUP}\"}" >/dev/null || true
+
+echo "==> M7: GET /_lemonseed/api/users (admin) has the roster and the delete guard"
+users_json="$(poll_http "/_lemonseed/api/users" 20 "${COOKIE_JAR}" "${AUTH_HOST}" 2>/dev/null || true)"
+if [[ -z "${users_json}" ]]; then
+  echo "GET /_lemonseed/api/users with an admin session returned nothing" >&2
+  exit 1
+fi
+FIRST_ADMIN="$(printf '%s' "${users_json}" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+names = [str(u.get("username")) for u in d.get("users") or []]
+groups = {str(g.get("name")) for g in d.get("groups") or []}
+assert names == [sys.argv[1]], names
+assert "admin" in groups and "users" in groups, groups
+assert d.get("first_admin") == sys.argv[1], d.get("first_admin")
+# Sign-in data must never ride along on a list endpoint.
+for u in d.get("users") or []:
+    assert "srp_verifier" not in u and "srp_salt" not in u, sorted(u)
+print(d["first_admin"])
+' "${ADMIN_USERNAME}")"
+echo "OK: roster, system groups and first_admin=${FIRST_ADMIN}; no verifier in the payload"
+
+echo "==> M7: an admin creates a member from a browser-derived verifier"
+read -r M7_SALT M7_VERIFIER <<< "$("${SRP_PY[@]}" enroll "${M7_USER}" "${M7_OTP}")"
+create_json="$(python3 -c 'import json, sys
+print(json.dumps({
+    "username": sys.argv[1],
+    "display_name": sys.argv[2],
+    "email": sys.argv[3],
+    "is_admin": False,
+    "salt": sys.argv[4],
+    "verifier": sys.argv[5],
+}))' "${M7_USER}" "${M7_NAME}" "${M7_EMAIL}" "${M7_SALT}" "${M7_VERIFIER}")"
+create_code="$(m7_post "${COOKIE_JAR}" "/_lemonseed/api/users/create" "${create_json}")"
+[[ "${create_code}" == "200" ]] || m7_stop "POST /_lemonseed/api/users/create" "${create_code}"
+python3 -c '
+import json, sys
+d = json.load(open("/tmp/qemu-m7.body"))
+u = d.get("user") or {}
+assert u.get("username") == sys.argv[1], u
+assert u.get("email") == sys.argv[2], u
+assert u.get("groups") == ["users"], u
+assert u.get("password_reset_required") is True, u
+assert u.get("owui_id"), "Open WebUI did not mirror the new account: %r" % (d.get("owui"),)
+assert (d.get("owui") or {}).get("ok") is True, d.get("owui")
+print("OK: member created, must-change-password is set, Open WebUI id %s" % u["owui_id"])
+' "${M7_USER}" "${M7_EMAIL}"
+
+echo "==> M7 D-11: the one-time code proves itself and still issues NO session"
+read -r M7_CID M7_A M7_M1 M7_WANT <<< "$(m7_prove "${M7_USER}" "${M7_OTP}")"
+m7_check "${M7_CID}" "${M7_USER} with the one-time code"
+verify_code="$(m7_srp verify "${M7_JAR}" "${M7_CID}" "${M7_A}" "${M7_M1}")"
+[[ "${verify_code}" == "200" ]] || m7_stop "SRP verify with the one-time code" "${verify_code}"
+python3 -c '
+import json, sys
+d = json.load(open("/tmp/qemu-m7.body"))
+assert d.get("rotate_required") is True, d
+assert d.get("M2") == sys.argv[1], "the appliance did not prove knowledge of the code"
+assert not d.get("target"), d
+print("OK: M2 agrees and the answer is rotate-required, not a portal")
+' "${M7_WANT}"
+if grep -qi '^set-cookie: lemonseed_session' "${M7_HDR}"; then
+  echo "an unrotated one-time account was issued a session cookie" >&2
+  cat "${M7_HDR}" >&2 || true
+  exit 1
+fi
+if grep -qi 'lemonseed_session' "${M7_JAR}"; then
+  echo "an unrotated one-time account left a cookie in the jar" >&2; exit 1
+fi
+echo "OK: no cookie for an account that has not chosen its own password"
+
+echo "==> M7 D-5/D-11: rotating the code issues the session and clears the flag"
+read -r NEW_SALT NEW_VERIFIER <<< "$("${SRP_PY[@]}" enroll "${M7_USER}" "${M7_PASS}")"
+read -r ROT_CID ROT_A ROT_M1 ROT_WANT <<< "$(m7_prove "${M7_USER}" "${M7_OTP}")"
+m7_check "${ROT_CID}" "${M7_USER} for rotation"
+rotate_code="$(m7_srp rotate "${M7_JAR}" "${ROT_CID}" "${ROT_A}" "${ROT_M1}" "${NEW_SALT}" "${NEW_VERIFIER}")"
+[[ "${rotate_code}" == "200" ]] || m7_stop "POST /_lemonseed/api/srp/rotate" "${rotate_code}"
+python3 -c '
+import json, sys
+d = json.load(open("/tmp/qemu-m7.body"))
+assert d.get("password_changed") is True, d
+assert d.get("M2") == sys.argv[1], "the appliance did not prove the old password first"
+print("OK: rotation proved the old code before replacing it")
+' "${ROT_WANT}"
+if ! grep -qi '^set-cookie: lemonseed_session' "${M7_HDR}"; then
+  echo "rotation did not issue a session cookie" >&2
+  cat "${M7_HDR}" >&2 || true
+  exit 1
+fi
+
+echo "==> M7: the new password signs in normally (the rotated verifier is the live one)"
+read -r C2 A2 M12 W2 <<< "$(m7_prove "${M7_USER}" "${M7_PASS}")"
+m7_check "${C2}" "${M7_USER} with the chosen password"
+verify_code="$(m7_srp verify "${M7_JAR}" "${C2}" "${A2}" "${M12}")"
+[[ "${verify_code}" == "200" ]] || m7_stop "SRP verify after rotation" "${verify_code}"
+python3 -c '
+import json, sys
+d = json.load(open("/tmp/qemu-m7.body"))
+assert not d.get("rotate_required"), d
+assert d.get("M2") == sys.argv[1], d
+print("OK: second sign-in with the chosen password, no rotation demanded")
+' "${W2}"
+
+echo "==> M7 D-16': Open WebUI mirrors the member as {username}@localhost"
+m7_owui_email="$(curl -sS --max-time 60 -b "${M7_JAR}" -c "${M7_JAR}" \
+  --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
+  -H 'Content-Type: application/json' -X POST \
+  "http://${AUTH_HOST}:${HOST_PORT}/api/v1/auths/signin" \
+  -d '{"email":"ignored@trusted-header.ignored","password":"trusted-header-signin-ignores-body"}' \
+  | python3 -c 'import json,sys; print((json.load(sys.stdin) or {}).get("email") or "")' || true)"
+if [[ "${m7_owui_email}" != "${M7_USER}@localhost" ]]; then
+  echo "Open WebUI signed the member in as '${m7_owui_email}', want '${M7_USER}@localhost'" >&2
+  exit 1
+fi
+# ... while the control plane still holds the household address. Two different
+# answers, both correct, and the only way to see the split is to ask both.
+users_json="$(poll_http "/_lemonseed/api/users" 20 "${COOKIE_JAR}" "${AUTH_HOST}" 2>/dev/null || true)"
+printf '%s' "${users_json}" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+rows = {str(u.get("username")): u for u in d.get("users") or []}
+me = rows.get(sys.argv[1]) or {}
+assert me.get("email") == sys.argv[2], me
+assert me.get("password_reset_required") is False, me
+print("OK: OWUI identity %s@localhost, control-plane e-mail %s" % (sys.argv[1], me["email"]))
+' "${M7_USER}" "${M7_EMAIL}"
+
+echo "==> M7 P4: group create, JSONB attribute with validation, membership"
+code="$(m7_post "${COOKIE_JAR}" "/_lemonseed/api/groups/create" "{\"group\":\"${M7_GROUP}\"}")"
+[[ "${code}" == "200" ]] || m7_stop "POST /_lemonseed/api/groups/create" "${code}"
+code="$(m7_post "${COOKIE_JAR}" "/_lemonseed/api/groups/attribute" \
+  "{\"group\":\"${M7_GROUP}\",\"key\":\"content_filter\",\"value\":true}")"
+[[ "${code}" == "200" ]] || m7_stop "POST /_lemonseed/api/groups/attribute" "${code}"
+# The value is validated, not merely stored: a typo now is not a mystery later.
+code="$(m7_post "${COOKIE_JAR}" "/_lemonseed/api/groups/attribute" \
+  "{\"group\":\"${M7_GROUP}\",\"key\":\"content_filter\",\"value\":\"yes\"}")"
+if [[ "${code}" != "400" ]]; then
+  echo "a non-boolean content_filter was accepted with ${code}, expected 400" >&2
+  head -c 300 /tmp/qemu-m7.body >&2 || true
+  echo "" >&2
+  exit 1
+fi
+code="$(m7_post "${COOKIE_JAR}" "/_lemonseed/api/groups/attribute" \
+  "{\"group\":\"${M7_GROUP}\",\"key\":\"not_a_real_key\",\"value\":true}")"
+if [[ "${code}" != "400" ]]; then
+  echo "an unknown attribute key was accepted with ${code}, expected 400" >&2; exit 1
+fi
+code="$(m7_post "${COOKIE_JAR}" "/_lemonseed/api/groups/member" \
+  "{\"group\":\"${M7_GROUP}\",\"username\":\"${M7_USER}\",\"add\":true}")"
+[[ "${code}" == "200" ]] || m7_stop "POST /_lemonseed/api/groups/member" "${code}"
+users_json="$(poll_http "/_lemonseed/api/users" 20 "${COOKIE_JAR}" "${AUTH_HOST}" 2>/dev/null || true)"
+printf '%s' "${users_json}" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+rows = {str(u.get("username")): u for u in d.get("users") or []}
+assert sys.argv[1] in (rows.get(sys.argv[2]) or {}).get("groups", []), rows.get(sys.argv[2])
+group = {str(g.get("name")): g for g in d.get("groups") or []}[sys.argv[1]]
+assert (group.get("attributes") or {}).get("content_filter") is True, group
+assert sys.argv[2] in (group.get("members") or []), group
+assert group.get("system") is False, group
+print("OK: group %s carries the JSONB attribute and the roster" % sys.argv[1])
+' "${M7_GROUP}" "${M7_USER}"
+echo "OK: groups created, attributed, membership recorded"
+
+echo "==> M7: a member is refused the admin surfaces and keeps their own profile"
+code="$(m7_get "${M7_JAR}" "/_lemonseed/api/users")"
+if [[ "${code}" != "403" ]]; then
+  echo "a member read the account roster: expected 403, got ${code}" >&2
+  head -c 300 /tmp/qemu-m7.body >&2 || true
+  echo "" >&2
+  exit 1
+fi
+code="$(m7_get "${M7_JAR}" "/_lemonseed/api/audit")"
+if [[ "${code}" != "403" ]]; then
+  echo "a member read the audit log: expected 403, got ${code}" >&2; exit 1
+fi
+code="$(m7_get "${M7_JAR}" "/profile/")"
+[[ "${code}" == "200" ]] || m7_stop "GET /profile/ as a member" "${code}"
+if grep -q 'id="acct-people"' /tmp/qemu-m7.body; then
+  echo "a member's profile page carries the admin Users panel" >&2; exit 1
+fi
+# Which model answers is the one admin setting a member may read (it explains what
+# they are talking to); the page must not offer a way to change it for everyone.
+if ! grep -q 'id="profile-model"' /tmp/qemu-m7.body; then
+  echo "a member's profile page does not say which chat model is in use" >&2; exit 1
+fi
+if grep -q 'id="model-picker"' /tmp/qemu-m7.body; then
+  echo "a member's profile page offers to change the model" >&2; exit 1
+fi
+code="$(m7_post "${M7_JAR}" "/_lemonseed/api/profile" '{"display_name":"Matt S."}')"
+[[ "${code}" == "200" ]] || m7_stop "POST /_lemonseed/api/profile as a member" "${code}"
+python3 -c '
+import json
+d = json.load(open("/tmp/qemu-m7.body"))
+# The write answers with its own shape (state + owui_error), not a user row.
+assert d.get("state") == "ready", d
+assert not d.get("owui_error"), "Open WebUI kept the old name: %r" % d["owui_error"]
+'
+# ... and read it back through the endpoint the My Profile page actually uses.
+code="$(m7_get "${M7_JAR}" "/_lemonseed/api/profile")"
+[[ "${code}" == "200" ]] || m7_stop "GET /_lemonseed/api/profile as a member" "${code}"
+python3 -c '
+import json
+d = json.load(open("/tmp/qemu-m7.body"))
+assert (d.get("user") or {}).get("display_name") == "Matt S.", d
+print("OK: member gates closed, own profile editable")
+'
+
+echo "==> M7: the input guards answer 400 with a sentence, not a stack trace"
+# Reserved system name. The username is checked before the verifier is parsed, so
+# dummy sign-in data is enough to reach the guard.
+code="$(m7_post "${COOKIE_JAR}" "/_lemonseed/api/users/create" \
+  '{"username":"root","display_name":"No","email":"root@example.invalid","salt":"aa","verifier":"bb"}')"
+if [[ "${code}" != "400" ]]; then
+  echo "creating an account named 'root': expected 400, got ${code}" >&2
+  head -c 300 /tmp/qemu-m7.body >&2 || true
+  echo "" >&2
+  exit 1
+fi
+# Case is folded, not merely accepted: 'SMOKEMATT' is the account that exists,
+# reported in the form the appliance stores it in. The sign-in data must be a real
+# enrollment here (unlike the reserved-name case above): the duplicate check is the
+# thing under test, so nothing else may fail first.
+read -r DUP_SALT DUP_VERIFIER <<< "$("${SRP_PY[@]}" enroll "${M7_USER}" "duplicate-attempt-three")"
+if [[ -z "${DUP_SALT}" || -z "${DUP_VERIFIER}" ]]; then
+  echo "srp_client produced no enrollment for the duplicate attempt" >&2
+  exit 1
+fi
+code="$(m7_post "${COOKIE_JAR}" "/_lemonseed/api/users/create" \
+  "{\"username\":\"SMOKEMATT\",\"display_name\":\"No\",\"email\":\"x@example.invalid\",\"salt\":\"${DUP_SALT}\",\"verifier\":\"${DUP_VERIFIER}\"}")"
+if [[ "${code}" != "400" ]] || ! grep -q "${M7_USER}" /tmp/qemu-m7.body; then
+  echo "an upper-case duplicate was not normalised: got ${code}, body:" >&2
+  head -c 300 /tmp/qemu-m7.body >&2 || true
+  echo "" >&2
+  exit 1
+fi
+echo "OK: reserved names refused, usernames case-folded"
+
+echo "==> M7 D-16a: deleting the member takes the Open WebUI mirror with it"
+code="$(m7_post "${COOKIE_JAR}" "/_lemonseed/api/users/delete" "{\"username\":\"${M7_USER}\"}")"
+if [[ "${code}" != "200" ]]; then
+  echo "deleting the member: expected 200, got ${code}" >&2
+  head -c 400 /tmp/qemu-m7.body >&2 || true
+  echo "" >&2
+  exit 1
+fi
+users_json="$(poll_http "/_lemonseed/api/users" 20 "${COOKIE_JAR}" "${AUTH_HOST}" 2>/dev/null || true)"
+printf '%s' "${users_json}" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+names = [str(u.get("username")) for u in d.get("users") or []]
+assert sys.argv[1] not in names, names
+assert names == [sys.argv[2]], names
+group = {str(g.get("name")): g for g in (d.get("groups") or [])}.get(sys.argv[3]) or {}
+# The group outlives its members by design; what must not survive is the row
+# joining a person who no longer exists to it.
+assert sys.argv[1] not in (group.get("members") or []), group
+print("OK: %r is gone from the roster and from %r, which still exists" % (sys.argv[1], sys.argv[3]))
+' "${M7_USER}" "${ADMIN_USERNAME}" "${M7_GROUP}"
+# An account that is gone must not complete a handshake. The challenge still
+# answers (that is the anti-enumeration design), so the assertion belongs on
+# verify: 401, and no cookie under any circumstances.
+read -r C3 A3 M3 _W3 <<< "$(m7_prove "${M7_USER}" "${M7_PASS}")"
+m7_check "${C3}" "the deleted ${M7_USER}"
+dead_code="$(m7_srp verify "${M7_JAR}" "${C3}" "${A3}" "${M3}")"
+if [[ "${dead_code}" != "401" ]]; then
+  echo "verify for a deleted account: expected 401, got ${dead_code}" >&2; exit 1
+fi
+if grep -qi '^set-cookie: lemonseed_session' "${M7_HDR}"; then
+  echo "a deleted account was issued a session cookie" >&2; exit 1
+fi
+# And the cookie the member was already holding must not outlive the account.
+# Session validation re-reads the user row, so deleting is also a sign-out; the
+# gate answers a navigation with a redirect and an XHR with a 401, never a 200.
+# The gate's per-session verify micro-cache (gateway.nix) bounds propagation to
+# a few seconds, so poll rather than demand it on the first try.
+dead=""
+for _ in $(seq 1 15); do
+  code="$(m7_get "${M7_JAR}" "/_lemonseed/api/profile")"
+  if [[ "${code}" == "302" || "${code}" == "401" ]]; then dead=1; break; fi
+  sleep 1
+done
+if [[ -z "${dead}" ]]; then
+  echo "a deleted account still had a working session (GET /_lemonseed/api/profile -> ${code})" >&2
+  exit 1
+fi
+echo "OK: the account, its group membership, its sign-in and its sessions are gone"
+
+echo "==> M7 D-2.2/D-22: nobody can delete their own account, or the first admin"
+# Guard one: an admin cannot do this to itself, whoever the target is.
+code="$(m7_post "${COOKIE_JAR}" "/_lemonseed/api/users/delete" "{\"username\":\"${FIRST_ADMIN}\"}")"
+if [[ "${code}" != "400" ]] || ! grep -qi "itself" /tmp/qemu-m7.body; then
+  echo "an admin deleted their own account: expected 400 mentioning itself, got ${code}" >&2
+  head -c 300 /tmp/qemu-m7.body >&2 || true
+  echo "" >&2
+  exit 1
+fi
+echo "  refused: $(head -c 120 /tmp/qemu-m7.body)"
+
+# Guard two needs a *second* admin as the actor, because the self-action guard
+# fires first and would otherwise hide it. This also exercises the only path to a
+# second administrator: create, forced rotation, sign in.
+M7_ADMIN2_JAR="$(mktemp /tmp/qemu-m7-admin2.XXXXXX)"
+m7_post "${COOKIE_JAR}" "/_lemonseed/api/users/delete" "{\"username\":\"${M7_ADMIN2}\"}" >/dev/null || true
+read -r A2_SALT A2_VERIFIER <<< "$("${SRP_PY[@]}" enroll "${M7_ADMIN2}" "${M7_OTP}")"
+admin2_json="$(python3 -c 'import json, sys
+print(json.dumps({
+    "username": sys.argv[1], "display_name": "Second Admin", "email": "",
+    "is_admin": True, "salt": sys.argv[2], "verifier": sys.argv[3],
+}))' "${M7_ADMIN2}" "${A2_SALT}" "${A2_VERIFIER}")"
+code="$(m7_post "${COOKIE_JAR}" "/_lemonseed/api/users/create" "${admin2_json}")"
+[[ "${code}" == "200" ]] || m7_stop "creating a second admin" "${code}"
+users_json="$(poll_http "/_lemonseed/api/users" 20 "${COOKIE_JAR}" "${AUTH_HOST}" 2>/dev/null || true)"
+printf '%s' "${users_json}" | python3 -c '
+import json, sys
+rows = {str(u.get("username")): u for u in (json.load(sys.stdin).get("users") or [])}
+assert "admin" in (rows.get(sys.argv[1]) or {}).get("groups", []), rows.get(sys.argv[1])
+print("OK: %r was created with the admin group" % sys.argv[1])
+' "${M7_ADMIN2}"
+# It arrives holding a credential the first admin knows, so it must rotate before
+# it can hold a session (D-11) — the same rule as any other created account.
+read -r AC AA AM AW <<< "$(m7_prove "${M7_ADMIN2}" "${M7_OTP}")"
+m7_check "${AC}" "${M7_ADMIN2}"
+code="$(m7_srp verify "${M7_ADMIN2_JAR}" "${AC}" "${AA}" "${AM}")"
+if [[ "${code}" != "200" ]] || ! grep -q 'rotate_required' /tmp/qemu-m7.body; then
+  echo "a new second admin was not forced to rotate: got ${code}" >&2
+  head -c 300 /tmp/qemu-m7.body >&2 || true
+  echo "" >&2
+  exit 1
+fi
+if grep -qi '^set-cookie: lemonseed_session' "${M7_HDR}"; then
+  echo "an unrotated second admin was issued a session cookie" >&2; exit 1
+fi
+read -r A2_SALT2 A2_VER2 <<< "$("${SRP_PY[@]}" enroll "${M7_ADMIN2}" "${M7_PASS}")"
+read -r BC BA BM BW <<< "$(m7_prove "${M7_ADMIN2}" "${M7_OTP}")"
+m7_check "${BC}" "${M7_ADMIN2} for rotation"
+code="$(m7_srp rotate "${M7_ADMIN2_JAR}" "${BC}" "${BA}" "${BM}" "${A2_SALT2}" "${A2_VER2}")"
+[[ "${code}" == "200" ]] || m7_stop "rotating the second admin's code" "${code}"
+# Now the second admin asks for the first admin to be deleted. Same route, same
+# status, and the sentence is the D-22 one rather than the self-action one.
+code="$(m7_post "${M7_ADMIN2_JAR}" "/_lemonseed/api/users/delete" "{\"username\":\"${FIRST_ADMIN}\"}")"
+if [[ "${code}" != "400" ]] || ! grep -qi "first admin" /tmp/qemu-m7.body; then
+  echo "a second admin was allowed to delete the first: got ${code}" >&2
+  head -c 300 /tmp/qemu-m7.body >&2 || true
+  echo "" >&2
+  exit 1
+fi
+echo "  refused: $(head -c 140 /tmp/qemu-m7.body)"
+# A second admin is deletable, though: the guard protects the first-admin row, not
+# the admin group.
+code="$(m7_post "${COOKIE_JAR}" "/_lemonseed/api/users/delete" "{\"username\":\"${M7_ADMIN2}\"}")"
+[[ "${code}" == "200" ]] || m7_stop "deleting the second admin" "${code}"
+users_json="$(poll_http "/_lemonseed/api/users" 20 "${COOKIE_JAR}" "${AUTH_HOST}" 2>/dev/null || true)"
+printf '%s' "${users_json}" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+names = [str(u.get("username")) for u in d.get("users") or []]
+assert names == [sys.argv[1]], names
+assert d.get("first_admin") == sys.argv[1], d.get("first_admin")
+print("OK: the appliance is back to one admin, and first_admin never moved")
+' "${FIRST_ADMIN}"
+
+echo "==> M7: the audit log says who did what, including the refusal"
+# The actor comes from the session, not the request body, so the two names below
+# cannot be the same by accident: everything the admin did is theirs, and the one
+# thing the member did for themselves is the member's. A log that could not tell
+# those apart would not be worth reading.
+audit_json="$(poll_http "/_lemonseed/api/audit?limit=200" 20 "${COOKIE_JAR}" "${AUTH_HOST}" 2>/dev/null || true)"
+if [[ -z "${audit_json}" ]]; then
+  echo "GET /_lemonseed/api/audit with an admin session returned nothing" >&2; exit 1
+fi
+printf '%s' "${audit_json}" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+member, group, admin = sys.argv[1], sys.argv[2], sys.argv[3]
+seen = {}
+for e in d.get("events") or []:
+    seen.setdefault((str(e.get("action")), str(e.get("target"))), set()).add(str(e.get("actor")))
+want = {
+    ("user.create", member): {admin},
+    ("user.delete", member): {admin},
+    ("group.create", group): {admin},
+    ("group.member_add", member): {admin},
+    # Self-service: the member rotated their own code and edited their own name.
+    ("user.password_rotated", member): {member},
+    ("user.rename", member): {member},
+}
+for key, actors in want.items():
+    assert key in seen, "missing audit row %r; have %r" % (key, sorted(seen))
+    assert actors <= seen[key], "%r actors %r, want %r" % (key, seen[key], actors)
+assert int(d.get("retention_days") or 0) > 0, d
+print("OK: %d rows kept; admin actions and self-service actions carry different authors" % len(d.get("events") or []))
+' "${M7_USER}" "${M7_GROUP}" "${ADMIN_USERNAME}"
 
 echo "==> Open endpoints stay open (unauthenticated)"
 for p in /healthz /api/status; do

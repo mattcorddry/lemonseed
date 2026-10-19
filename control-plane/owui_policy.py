@@ -53,7 +53,7 @@ COLLECTION_MODES = frozenset({"selective_management", "full_management"})
 CADENCES = frozenset({"at_boot", "on_upgrade", "manual"})
 GUARD_MODES = frozenset({"advertise", "enforce"})
 HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
-USER_SCOPES = frozenset({"membership", "is_admin"})
+USER_SCOPES = frozenset({"membership", "is_admin", "name"})
 # %NAME% tokens the validator accepts. Both names resolve to the CP service
 # account's OWUI id (DESIGN uses %CP_OWUI_ID% in guards, the plan doc uses
 # %SERVICE_ACCOUNT_ID% in entities; they are the same value on purpose).
@@ -746,17 +746,43 @@ def _response_items(data: Any, wrapper_key: str) -> Optional[list]:
     return None
 
 
+def _has_public_read_grant(grants: Any) -> bool:
+    """True when an ``access_grants`` list carries the wildcard public read.
+
+    The list shape (v0.11.0) is owner-only when empty, so absence of the
+    wildcard — not the presence of anything — is the drift signal.
+    """
+    if not isinstance(grants, list):
+        return False
+    return any(
+        isinstance(grant, dict)
+        and grant.get("principal_type") == "user"
+        and grant.get("principal_id") == "*"
+        and grant.get("permission") == "read"
+        for grant in grants
+    )
+
+
 class ModelsHandler:
     """OWUI admin models, owned by CP-chosen id (never server UUIDs)."""
 
     kind = "models"
+
+    # OWUI v0.11.0 access model: a resource is public exactly when its grant
+    # list carries this wildcard (``user:*`` read). An empty list is
+    # owner-only, which is what OWUI's model editor defaults new entries to —
+    # and what hid the chat model from every non-admin on bare metal.
+    PUBLIC_READ_GRANT = {
+        "principal_type": "user", "principal_id": "*", "permission": "read"
+    }
 
     def validate(self, mode: str, config: dict[str, Any]) -> dict[str, Any]:
         _require_keys(
             "models",
             config,
             {"own_by": str, "own_ids": list, "reserved_name_regex": str},
-            allowed={"own_by", "own_ids", "reserved_name_regex", "definitions"},
+            allowed={"own_by", "own_ids", "reserved_name_regex", "definitions",
+                     "ensure_public"},
         )
         if mode not in COLLECTION_MODES:
             raise ValueError(f"models: mode must be one of {sorted(COLLECTION_MODES)}")
@@ -765,6 +791,8 @@ class ModelsHandler:
         own_ids = config["own_ids"]
         if not all(isinstance(i, str) and i for i in own_ids):
             raise ValueError("models: own_ids must be a list of non-empty strings")
+        if not isinstance(config.get("ensure_public", False), bool):
+            raise ValueError("models: ensure_public must be a boolean")
         try:
             compiled = re.compile(config["reserved_name_regex"], re.IGNORECASE)
         except re.error as exc:
@@ -827,19 +855,32 @@ class ModelsHandler:
             return client.call(
                 "models.update", json_body={"id": action.entity_id, **(action.payload or {})}
             )
+        if action.op == "access":
+            # v0.11.0's access-only write, which never touches params/meta and
+            # backfills the minimal entry a non-preset model may not have yet.
+            return client.call(
+                "models.access_update",
+                json_body={"id": action.entity_id, **(action.payload or {})},
+            )
         if action.op in ("sweep", "delete"):
             return client.call("models.delete", json_body={"id": action.entity_id})
         raise PolicyError(f"models: unsupported op {action.op!r}")
 
 
 class UsersHandler:
-    """OWUI accounts mirroring the CP user list (membership + is_admin).
+    """OWUI accounts mirroring the CP user list (membership, is_admin, name).
 
-    Keyed by email (lower-cased) so adoption-by-email is free. The service
-    account is filtered out of ``observe`` (never_touch): the planner never
-    sees it, and its admin role is re-asserted by sign-in (Phase 1). The
-    loop NEVER deletes accounts (DESIGN rule) — deletion lives in the
-    Phase-4 portal member handler.
+    Keyed by OWUI's own ``id`` wherever the CP holds one (``users.owui_id``,
+    D-18), falling back to the lower-cased identity email for accounts whose id
+    we never captured — so an out-of-band rename or email edit in OWUI cannot
+    orphan a CP row into a duplicate create. Both sides build keys with the
+    same rule (``_key``), which is what makes that fallback safe.
+
+    The service account is filtered out of ``observe`` (never_touch): the
+    planner never sees it, and its admin role is re-asserted by sign-in
+    (Phase 1). The loop NEVER deletes accounts (DESIGN rule) — deletion lives
+    in the portal member handler, which deletes the OWUI row in the same
+    action as the CP row (D-16a).
     """
 
     kind = "users"
@@ -875,6 +916,29 @@ class UsersHandler:
                     ids.add(str(value))
         return ids
 
+    @staticmethod
+    def _key(owui_id: str, email: str) -> str:
+        """The one keying rule: OWUI's id where we hold it, else identity email.
+
+        Ids are UUIDs and identity emails always carry ``@``, so the two key
+        spaces cannot collide.
+        """
+        return owui_id or email
+
+    @staticmethod
+    def _known_ids(ctx: ResolverContext) -> set[str]:
+        """OWUI ids the CP actually holds (``users.owui_id``).
+
+        An empty ``owui_id`` means "we never captured it", which is *not* the
+        same as "there is no OWUI account" (D-16'); those rows key by email and
+        must match an existing OWUI row rather than minting a duplicate.
+        """
+        return {
+            str(user.get("owui_id") or "")
+            for user in ctx.cp_users
+            if str(user.get("owui_id") or "")
+        }
+
     def observe(
         self, client: Any, spec: EntitySpec, ctx: ResolverContext
     ) -> dict[str, dict]:
@@ -886,15 +950,20 @@ class UsersHandler:
         if items is None:
             raise PolicyError("users.all: unexpected response shape")
         protected = self._protected_ids(spec, ctx)
+        known = self._known_ids(ctx)
         out: dict[str, dict] = {}
         for item in items:
             if not isinstance(item, dict) or not item.get("id"):
                 continue
-            if str(item["id"]) in protected:
+            # Retain OWUI's id: it is the handle users.update needs and the
+            # preferred mirror key (D-18), not just the never_touch filter.
+            owui_id = str(item["id"])
+            if owui_id in protected:
                 continue
             email = str(item.get("email") or "").lower()
-            if email:
-                out[email] = item
+            key = self._key(owui_id if owui_id in known else "", email)
+            if key:
+                out[key] = item
         return out
 
     def desired(self, spec: EntitySpec, ctx: ResolverContext) -> dict[str, dict]:
@@ -905,10 +974,17 @@ class UsersHandler:
                 # simply absent from intent (their OWUI account surfaces as
                 # drift, deletion stays a portal action).
                 continue
+            # auth.owui_identities() emits the DERIVED identity email
+            # (owui_email(username)), never users.email — D-16'. Keeping the
+            # mirror on a derived string is what lets email stay unmanaged
+            # while the key moves to owui_id.
             email = str(user.get("email") or "").lower()
             if not email:
                 continue
-            out[email] = {
+            owui_id = str(user.get("owui_id") or "")
+            # Deliberately no owui_id inside the payload: it is a join key, not
+            # an OWUI field, and create/update bodies must carry intent only.
+            out[self._key(owui_id, email)] = {
                 "email": email,
                 "name": str(user.get("name") or email.split("@", 1)[0]),
                 "is_admin": bool(user.get("is_admin")),
@@ -916,15 +992,26 @@ class UsersHandler:
         return out
 
     def changes(self, spec: EntitySpec, desired: dict, observed: dict) -> Optional[dict]:
-        if "is_admin" not in spec.config.get("scope", []):
-            return None
-        want = "admin" if desired.get("is_admin") else "user"
-        # Pending/paused accounts heal at their next sign-in (trusted headers).
+        # Pending/paused accounts heal at their next sign-in (trusted headers),
+        # and writing them has 404'd on UX before — so they are left alone.
         if observed.get("role") in ("pending", "paused"):
             return None
-        if observed.get("role") != want:
-            return {"role": want}
-        return None
+        scope = spec.config.get("scope", [])
+        payload: dict[str, Any] = {}
+        if "is_admin" in scope:
+            want = "admin" if desired.get("is_admin") else "user"
+            if observed.get("role") != want:
+                payload["role"] = want
+        if "name" in scope:
+            # D-17a: name selects nothing, so drift here is cosmetic — but it
+            # must still converge, because OWUI reads the trusted name header
+            # only when it CREATES an account (auths.py:734-741), so a CP-side
+            # rename would otherwise be permanent drift.
+            want_name = str(desired.get("name") or "")
+            if want_name and str(observed.get("name") or "") != want_name:
+                payload["name"] = want_name
+        # Never a password: users.update would bcrypt-hash one (D-17 finding 2).
+        return payload or None
 
     def reserved(self, spec: EntitySpec, observed: dict) -> bool:
         return False
@@ -1006,6 +1093,16 @@ def _mask_nested(value: Any) -> Any:
     return value
 
 
+def mask_detail(detail: Any) -> Any:
+    """Display-safe copy of an arbitrary nested payload (USERS-AND-GROUPS.md D-37).
+
+    The audit log reuses this rather than keeping its own redaction list: the
+    failure mode of an audit trail is faithfully recording the secret someone
+    pasted into a field, and two policies is how one of them drifts.
+    """
+    return _mask_nested(detail)
+
+
 def mask_setting(key: str, value: Any, spec: Any = None) -> Any:
     """Display-safe form of one config value.
 
@@ -1034,10 +1131,11 @@ def masked_report_entry(entry: "ReportEntry", manifest: Any = None) -> dict[str,
     data = entry.as_dict()
     kind, sep, _rest = entry.key.partition(":")
     if sep and kind in _PERSON_ENTITY_KINDS:
-        # Entity drift mirrors a person's attributes (e-mail is the users join
-        # key) and the drift snapshot is member-visible: report the state, not
-        # the mirrored values. The key keeps the id operators need to find the
-        # row; member-visible ids are an accepted surface of the appliance.
+        # Entity drift mirrors a person's attributes (the users key is OWUI's id
+        # where the CP holds one, else the identity email — D-18) and the drift
+        # snapshot is member-visible: report the state, not the mirrored values.
+        # The key keeps the id operators need to find the row; member-visible
+        # ids are an accepted surface of the appliance.
         data["found"] = MASK
         data["want"] = MASK
         return data
@@ -1251,6 +1349,43 @@ def plan(
                      "the reconcile loop never deletes accounts",
             ))
 
+    # -- model visibility (bare-metal review) -----------------------------------
+    # The OWUI model editor defaults a new entry to owner-only access, which
+    # hid the chat model from every non-admin. Model choice is a global,
+    # admin-managed setting, so every model entry the box carries is public:
+    # exactly one wildcard read grant, written through OWUI's access/update
+    # route. Foreign unreserved entries are otherwise never touched, so this
+    # is the one place their access is asserted; a swept entry is skipped
+    # because it is about to be deleted.
+    models_spec = manifest.entities.get("models")
+    if models_spec is not None and models_spec.config.get("ensure_public"):
+        models_handler = ENTITY_KINDS["models"]
+        public_grants = [dict(models_handler.PUBLIC_READ_GRANT)]
+        observed_models = observed_entities.get("models", {})
+        for entity_id in sorted(observed_models):
+            have = observed_models[entity_id]
+            if models_handler.reserved(models_spec, have):
+                continue
+            if _has_public_read_grant(have.get("access_grants")):
+                continue
+            fires = _cadence_fires(None, triggers)
+            report_key = f"models:access:{entity_id}"
+            entries.append(ReportEntry(
+                key=report_key, mode=models_spec.mode, cadence=None,
+                state="to_fix" if fires else "pending",
+                found=have.get("name"),
+                note="owner-only access; granting public read",
+            ))
+            if fires:
+                actions.append(Action(
+                    kind="entity", op="access", target=report_key,
+                    payload={"access_grants": public_grants},
+                    before=have.get("access_grants"), after=public_grants,
+                    why="model entries are public on a Lemonseed appliance",
+                    mode=models_spec.mode, entity_kind="models",
+                    entity_id=entity_id, report_key=report_key,
+                ))
+
     return PlanResult(actions=actions, entries=entries)
 
 
@@ -1395,6 +1530,16 @@ def _set_status(**fields: Any) -> None:
 
 def _utcnow_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+def reconcile_in_flight() -> bool:
+    """True while a reconcile is writing to Open WebUI.
+
+    The power controls ask this before rebooting the box: a reboot between
+    "drop the old config row" and "write the new one" leaves the managed
+    settings half-applied. Reads ``Lock.locked()``, so asking never blocks.
+    """
+    return _reconcile_lock.locked()
 
 
 def reconcile(port: int, triggers: frozenset[str], deps: ReconcileDeps) -> dict[str, Any]:

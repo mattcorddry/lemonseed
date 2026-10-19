@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import audit
 from db import pg_isready, provision_data_plane
 from image_pins import digest_ref, tag_ref
 
@@ -422,6 +423,10 @@ def supervise_data_once() -> None:
     _supervise_one(
         VALKEY_CONTAINER, VALKEY_IMAGE_KEY, "valkey", 6379, _valkey_run_args
     )
+    # Audit retention rides here rather than on the module policy tick: that one
+    # only runs when Open WebUI is up, and rows have to stop accumulating on a
+    # box that never installs a module at all.
+    audit.maybe_sweep()
 
 
 def ensure_data_worker() -> None:

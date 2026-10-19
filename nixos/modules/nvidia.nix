@@ -36,6 +36,38 @@ in
       branch = "production";
     };
 
+    # Only load the NVIDIA modules when the hardware is present (see the
+    # matching AMD rule in amd-gpu.nix): PCI class 03 (display/3D) with
+    # vendor 10de = NVIDIA. Without it, boxes with only an AMD GPU load the
+    # NVIDIA stack at boot and lemond's probe then loops "NVRM: No NVIDIA
+    # GPU found" every second, blowing out the dmesg ring buffer.
+    # (nvidia_uvm is pulled in eagerly by the upstream nixpkgs module; a lone
+    # boot-time error line on AMD-only boxes is acceptable.)
+    services.udev.extraRules = ''
+      ACTION=="add", SUBSYSTEM=="pci", ENV{MODALIAS}=="pci:v000010ded*bc03sc*i*", RUN+="${pkgs.kmod}/bin/modprobe nvidia"
+    '';
+
+    # Upstream (open driver) loads nvidia_uvm eagerly at boot — headless boxes
+    # included — which pulls `nvidia` in on AMD-only machines (kernel taint,
+    # "NVRM: No NVIDIA GPU found", and lemond's short probe loop). Our udev
+    # rule below loads `nvidia` only when the hardware is present, and
+    # upstream's `softdep nvidia post: nvidia-uvm` then brings uvm along, so
+    # the eager load only ever hurts. A list option cannot drop one element,
+    # so restate the merged list (storage.nix: dm-mod/btrfs; nginx: tls; NixOS
+    # defaults: the rest) without it — keep this in step when anything new
+    # adds boot.kernelModules.
+    boot.kernelModules = lib.mkForce [
+      "atkbd"
+      "br_netfilter"
+      "bridge"
+      "btrfs"
+      "dm-mod"
+      "loop"
+      "tls"
+      "veth"
+      "xt_nat"
+    ];
+
     # lemond probes PCI and will need /dev/nvidia* once CUDA backends land.
     users.users.lemonseed-lemond.extraGroups = [
       "video"

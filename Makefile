@@ -128,7 +128,7 @@ test:
 	"$(ROOT)/scripts/run-unit-tests.sh"
 
 # Ruff comes from nixpkgs, not from the appliance: the control-plane interpreter
-# on the box stays stdlib + psycopg2/bcrypt/requests/lemonade-sdk. Rules live in
+# on the box stays stdlib + psycopg2/requests/lemonade-sdk. Rules live in
 # ruff.toml. Deliberately *not* wired into `make test`, which must stay offline
 # and hypervisor-free.
 lint:

@@ -102,6 +102,13 @@ input, select {
   display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
   padding: 0.55rem 1rem; border-bottom: 1px solid var(--line);
   background: rgba(15, 28, 24, 0.92); backdrop-filter: blur(8px);
+  /* ``backdrop-filter`` forces a stacking context, so the account popover's
+     ``z-index: 30`` is trapped here and cannot outrank ``.frame-wrap``'s iframe
+     (``z-index: 1``) — the bar is a non-positioned block, and positioned
+     descendants paint above non-positioned ones, which is why the popover came
+     out from behind the chat frame clipped. Stacking the bar itself is the only
+     way to lift its subtree; the value just has to clear the frame's ``auto``. */
+  position: relative; z-index: 5;
 }
 .app-bar .brand-logo {
   display: block; width: 1.75rem; height: 1.75rem; margin: 0;
@@ -141,18 +148,19 @@ input, select {
 .app-bar .gear {
   color: var(--muted); text-decoration: none; font-size: 1.15rem;
   line-height: 1; padding: 0.25rem 0.45rem; border-radius: 8px;
+  position: relative;
 }
 .app-bar .gear:hover, .app-bar .gear.active { color: var(--accent); }
+/* P5: a newer version exists. Admin news — the dot rides the settings gear
+   until the update is installed, and only the panel can clear it. */
+.app-bar .gear.update-dot::after {
+  content: ""; position: absolute; top: 0; right: 0;
+  width: 8px; height: 8px; border-radius: 50%; background: var(--bad);
+}
 .app-bar a {
   color: var(--muted); text-decoration: none; font-size: 0.9rem; font-weight: 600;
 }
 .app-bar a:hover { color: var(--accent); }
-.embed-shell {
-  max-width: 42rem; margin: 0 auto; padding: 1.5rem 1rem 2.5rem;
-}
-.embed-shell h1 {
-  margin: 0 0 1rem; font-size: clamp(1.5rem, 5vw, 2rem); letter-spacing: -0.02em;
-}
 .frame-wrap iframe.hidden {
   visibility: hidden;
   pointer-events: none;
@@ -290,6 +298,21 @@ input, select {
 }
 .panel h3.subhead:first-of-type { margin-top: 4px; }
 .owui-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 14px 0 0; }
+/* These rows (Chat controls, Power) held bare <button>s, which this theme never
+   styled, so they painted in the browser's own grey. `.btn` is not the answer
+   here: it is one-button-per-form (width:100%), which in a flex row puts every
+   button on its own line. */
+.owui-actions button {
+  display: inline-flex; align-items: center; gap: 0.45rem;
+  padding: 0.55rem 0.95rem; border: 1px solid var(--line); border-radius: 999px;
+  background: transparent; color: var(--ink);
+  font: inherit; font-size: 0.9rem; font-weight: 600; cursor: pointer;
+}
+.owui-actions button:hover { border-color: var(--accent); color: var(--accent); }
+.owui-actions button.danger { border-color: rgba(255, 143, 138, 0.5); color: #ffc4ba; }
+.owui-actions button.danger:hover { border-color: #ff9a8a; color: #ffd8d3; }
+.owui-actions button[disabled] { opacity: 0.45; cursor: not-allowed; }
+.owui-actions svg { flex: 0 0 auto; }
 .owui-hint { color: var(--muted); font-size: 0.8rem; margin: 10px 0 0; line-height: 1.5; }
 /* Reset progress is the one state in this panel the admin must not miss: the
    chat interface is offline while it runs. Rendered as a banner, not a hint. */
@@ -300,3 +323,205 @@ input, select {
 }
 .owui-status.bad { border-left-color: #ff9a8a; }
 .owui-status[hidden] { display: none; }
+
+/* M7: the one sub-line a Users/Groups table row needs — flags under the
+   username, group names under the display name. Row actions have their own rules
+   with the tables below; the code box is a dialog now, so the panel keeps only
+   the type style for the code itself. */
+.acct-sub {
+  display: block; color: var(--muted); font-size: 0.78rem;
+  font-weight: 400; margin-top: 4px;
+}
+.otp-code {
+  font-family: ui-monospace, monospace; font-size: 1.35rem; letter-spacing: 0.12em;
+  margin: 0 0 10px; user-select: all;
+}
+.rotate-fields { margin-top: 14px; }
+
+/* M7 P3: My Profile and the account popover.
+   The profile panel is a section inside .frame-wrap, which is sized for
+   absolutely-positioned iframes; it needs to scroll on its own or a short
+   window clips the change-password form off the bottom. */
+.profile-panel {
+  position: absolute; inset: 0; overflow-y: auto;
+  max-width: 620px; margin: 0 auto; box-sizing: border-box;
+}
+@media (min-width: 700px) { .profile-panel { inset: 12px 0 0; } }
+
+.pop-wrap { position: relative; display: inline-flex; }
+.app-bar .gear svg { display: block; }
+/* The trigger is a <button>; without the reset it inherits the UA's bevel and
+   sits visibly lower than the gear beside it. */
+button.gear {
+  background: none; border: 0; font: inherit; cursor: pointer;
+}
+.popover {
+  position: absolute; top: calc(100% + 8px); right: 0; z-index: 30;
+  display: flex; flex-direction: column; gap: 2px; min-width: 190px;
+  padding: 8px; border: 1px solid var(--line); border-radius: 12px;
+  background: #0f1c18; box-shadow: 0 12px 28px rgba(0,0,0,0.45);
+}
+.popover[hidden] { display: none; }
+.pop-name { font-weight: 600; padding: 6px 8px 0; }
+.pop-user { color: var(--muted); font-size: 0.8rem; padding: 0 8px 6px; }
+.popover a, .popover button {
+  text-align: left; padding: 7px 8px; border-radius: 8px;
+  color: var(--ink); text-decoration: none; font-size: 0.88rem;
+  background: none; border: 0; font-family: inherit; cursor: pointer;
+}
+.popover a:hover, .popover button:hover { background: rgba(255,255,255,0.07); color: var(--accent); }
+
+/* --- M7: the settings control panel (rail + panes) ---------------------------
+ * The rail lives *inside* the /settings/content document rather than in the
+ * portal shell. The shell's nav is the top bar, and the chat view is an Open
+ * WebUI iframe that already owns a left rail of its own; a rail at the shell
+ * level would stack two auto-hiding rails side by side. Nothing outside this
+ * document needs these rules.
+ */
+.settings-app {
+  display: grid;
+  grid-template-columns: minmax(10.5rem, 24%) minmax(0, 1fr);
+  gap: 1.25rem;
+  align-items: start;
+  max-width: 78rem;
+  margin: 0 auto;
+  padding: 1.5rem 1.25rem 2.5rem;
+}
+.settings-rail {
+  position: sticky; top: 1rem;
+  display: flex; flex-direction: column; gap: 3px;
+}
+/* The rail starts at the grid top, but every .panel carries margin-top, so the
+   first controls box sat below the rail's first item and the two columns read
+   as misaligned (bare-metal review). Panels after the first keep their margin:
+   that is the visual separation between Users / Groups / Recent changes. */
+.settings-panes .panel:first-child { margin-top: 0; }
+.rail-item {
+  display: flex; align-items: center; gap: 0.6rem;
+  width: 100%; padding: 0.6rem 0.8rem;
+  border: 0; border-radius: 10px;
+  background: transparent; color: var(--muted);
+  font: inherit; font-size: 0.94rem; text-align: left;
+  /* A title that wraps makes every row a different height and the rail reads
+     as broken; the grid column is wide enough for the longest label. */
+  white-space: nowrap;
+  cursor: pointer;
+}
+.rail-item:hover { background: rgba(255,255,255,0.06); color: var(--ink); }
+.rail-item[aria-selected="true"] {
+  background: var(--accent); color: var(--accent-ink); font-weight: 600;
+}
+.rail-item svg { display: block; flex: 0 0 auto; }
+/* min-width:0 so a long user name in a table widens the pane instead of the
+   grid column, which would push the rail off the screen. */
+.settings-panes { min-width: 0; }
+.pane[hidden] { display: none; }
+
+/* Short/narrow viewports: the rail becomes a horizontal icon strip. The labels
+   are the first thing to go, because at that width the icons carry it. */
+@media (max-width: 720px) {
+  .settings-app { display: block; padding: 1rem 0.85rem 2rem; }
+  .settings-rail {
+    position: static; flex-direction: row; overflow-x: auto; margin-bottom: 0.75rem;
+    padding: 4px; border: 1px solid var(--line); border-radius: 12px;
+  }
+  .rail-item { flex: 1 0 auto; justify-content: center; }
+  .rail-item .rail-label { display: none; }
+}
+
+/* --- M7: the one dialog box --------------------------------------------------
+ * Replaces window.prompt/confirm/alert. See DIALOG_JS in stub.py for why.
+ */
+.dialog-mask {
+  position: fixed; inset: 0; z-index: 60;
+  display: flex; align-items: flex-start; justify-content: center;
+  padding: clamp(0.75rem, 4vh, 3rem) 1rem;
+  background: rgba(4, 10, 8, 0.62); overflow-y: auto;
+}
+.dialog {
+  width: 100%; max-width: 32rem;
+  padding: 1.1rem 1.2rem 1.2rem;
+  border: 1px solid var(--line); border-radius: 16px;
+  background: #10201b; box-shadow: 0 18px 44px rgba(0, 0, 0, 0.55);
+}
+.dialog h2 {
+  margin: 0 0 0.5rem; font-size: 1.05rem; letter-spacing: -0.01em;
+  color: var(--ink); text-transform: none;
+}
+/* Hashes in failure messages are one long token; let them break instead of
+   pushing the box past the window (bare-metal review, BM-4). */
+.dialog-copy, .dialog-scroll { overflow-wrap: anywhere; }
+.dialog-copy { color: var(--muted); font-size: 0.92rem; line-height: 1.5; margin: 0 0 0.5rem; }
+.dialog-actions {
+  display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: flex-end;
+  margin-top: 1.15rem;
+}
+.dialog-actions .btn { margin-top: 0; width: auto; padding: 0.6rem 1.1rem; font-size: 0.92rem; }
+.btn.danger { background: var(--bad); color: #2b0d0d; }
+.btn.ghost { background: transparent; border: 1px solid var(--line); color: var(--ink); }
+.btn.ghost:hover { border-color: var(--accent); color: var(--accent); }
+.btn[disabled] { opacity: 0.45; cursor: not-allowed; }
+/* A dialog you can scroll the page behind is a dialog you will lose. */
+html.dialog-open body { overflow: hidden; }
+/* A roster is the one thing that must never break the box it is in: cap it and
+   let it scroll rather than growing the dialog past the window. */
+.dialog-scroll { max-height: 38vh; overflow-y: auto; margin: 0 0 0.25rem; }
+
+/* --- M7: the Users & Groups tables ------------------------------------------
+ * Bare-metal review: accounts were status rows, because they were copied from
+ * the panels above them. Accounts and groups are lists of things you act on, so
+ * they are tables: one row each, columns that line up, actions on the right.
+ */
+.table-wrap { overflow-x: auto; }
+table.grid { width: 100%; border-collapse: collapse; }
+table.grid th, table.grid td {
+  text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line);
+  font-size: 0.92rem; vertical-align: top;
+}
+table.grid th {
+  color: var(--muted); font-size: 0.72rem; font-weight: 600;
+  letter-spacing: 0.08em; text-transform: uppercase;
+}
+table.grid tbody tr:last-child td { border-bottom: 0; }
+/* The actions column takes only what it needs; the text columns get the rest and
+   wrap, which is what keeps one long display name from widening the pane. */
+table.grid th.col-actions, table.grid td.col-actions {
+  width: 1%; text-align: right; white-space: nowrap;
+}
+td.col-user { font-weight: 600; }
+td.col-email { color: var(--muted); }
+/* Row actions are glyphs, so each one carries a text label for the screen reader
+   and a title for the mouse. A disabled one explains itself in that title. */
+.icon-btn {
+  display: inline-flex; align-items: center; gap: 0.35rem;
+  margin-left: 6px; padding: 6px 8px;
+  border: 1px solid var(--line); border-radius: 9px;
+  background: transparent; color: var(--muted); font: inherit; font-size: 0.8rem;
+  cursor: pointer;
+}
+.icon-btn:hover { border-color: var(--accent); color: var(--accent); }
+.icon-btn.danger:hover { border-color: #ff9a8a; color: #ffc4ba; }
+.icon-btn[disabled] { opacity: 0.35; cursor: not-allowed; }
+.icon-btn[disabled]:hover { border-color: var(--line); color: var(--muted); }
+/* An icon-only control still needs a name; it just should not take room. */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+/* A dialog form is "Title | control", one per row, matching the mockup the panel
+   was designed against. Labels never sit on top of their own input, so the two
+   columns line down the box. */
+.dialog-field {
+  display: grid; grid-template-columns: minmax(6.5rem, 38%) minmax(0, 1fr);
+  align-items: center; gap: 0.75rem; margin: 0 0 0.65rem;
+}
+.dialog-field label { color: var(--muted); font-size: 0.86rem; }
+.dialog-field input[readonly] { color: var(--muted); border-style: dashed; }
+.dialog-field + .owui-hint { margin: -0.3rem 0 0.8rem; }
+.dialog-check {
+  display: flex; align-items: center; gap: 0.55rem;
+  margin: 0 0 0.6rem; font-size: 0.92rem; color: var(--ink);
+}
+.dialog-check input { width: auto; margin: 0; flex: 0 0 auto; }
+.dialog-check[title] { cursor: help; }
+.dialog-check input[disabled] + span { color: var(--muted); }

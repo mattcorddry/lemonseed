@@ -80,20 +80,28 @@ class _FakeCursor:
     context manager so ``with conn.cursor() as cur`` works unchanged.
     """
 
-    def __init__(self, version: Optional[int] = None) -> None:
+    def __init__(
+        self, version: Optional[int] = None, legacy_column: Optional[str] = None
+    ) -> None:
         self.version = version
         self.statements: list[str] = []
         self._probe_pending = False
+        self._shape_pending = False
+        # Non-None stands in for a pre-M7 column still present in ``users``.
+        self.legacy_column = legacy_column
 
     def execute(self, sql: str, params: object = None) -> None:
         self.statements.append(sql)
         self._probe_pending = "FROM cp_meta WHERE key = 'schema_version'" in sql
+        self._shape_pending = "FROM information_schema.columns" in sql
         if "INSERT INTO cp_meta" in sql and "schema_version" in sql:
             self.version = json.loads(params[0])  # type: ignore[index]
 
     def fetchone(self):
         if self._probe_pending:
             return None if self.version is None else (self.version,)
+        if self._shape_pending:
+            return (self.legacy_column,) if self.legacy_column else None
         return None
 
     def __enter__(self) -> "_FakeCursor":
@@ -120,36 +128,117 @@ class SchemaMigrationTests(unittest.TestCase):
     """
 
     def test_fresh_database_reaches_current_version(self) -> None:
+        """A brand-new CP database ends up at ``SCHEMA_VERSION`` with one DDL pass.
+
+        Driven through ``_apply_cp_schema`` (create tables, then migrate) because
+        the baseline rewrite moved most columns into ``_create_cp_tables``;
+        asserting on ``migrate_cp_schema`` alone would no longer see them.
+        """
         cur = _FakeCursor(None)
-        self.assertEqual(db.migrate_cp_schema(cur), db.SCHEMA_VERSION)
+        conn = mock.MagicMock()
+        conn.cursor.return_value = cur
+        self.assertEqual(db._apply_cp_schema(conn), db.SCHEMA_VERSION)
         self.assertEqual(cur.version, db.SCHEMA_VERSION)
         joined = " ".join(cur.ddl())
         self.assertIn("token_generation", joined)
         self.assertIn("last_login", joined)
+        self.assertIn("srp_salt", joined)
+        self.assertIn("srp_verifier", joined)
+        self.assertIn("group_attributes", joined)
+        self.assertIn("audit_log", joined)
+        # D-29: the baseline rewrite is what lets a *new* database have no
+        # password column at all. A migration may never drop it, but the shape
+        # we create is ours to write, and nothing reads it since bcrypt left.
+        self.assertNotIn("password_hash", joined)
 
     def test_database_at_current_version_runs_no_ddl(self) -> None:
         cur = _FakeCursor(db.SCHEMA_VERSION)
         self.assertEqual(db.migrate_cp_schema(cur), db.SCHEMA_VERSION)
         self.assertEqual(cur.ddl(), [])
+        # The shape check must still run here. This no-op path is exactly where a
+        # box carrying a legacy column sits, so a stamp-only guard would miss it.
+        self.assertTrue(
+            any("information_schema.columns" in s for s in cur.statements),
+            "column shape was not verified on the up-to-date path",
+        )
 
     def test_upgrade_from_baseline_adds_only_the_new_columns(self) -> None:
+        """Exact DDL, on purpose.
+
+        Enumerating the statements rather than pattern-matching means an extra
+        or reordered `ALTER` fails here. Appending a migration therefore means
+        appending its statements here too, which is the intended friction: DDL
+        that reaches a deployed box should be visible in a diff. Multi-line
+        `CREATE TABLE` text is compared with whitespace collapsed, so
+        re-indenting SQL does not fail the test while adding or dropping a
+        statement does.
+        """
         cur = _FakeCursor(db.BASELINE_SCHEMA_VERSION)
         self.assertEqual(db.migrate_cp_schema(cur), db.SCHEMA_VERSION)
         self.assertEqual(
-            cur.ddl(),
+            [" ".join(sql.split()) for sql in cur.ddl()],
             [
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS token_generation"
-                " INTEGER NOT NULL DEFAULT 0",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS"
+                " password_reset_required BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS owui_id TEXT",
+                "CREATE UNIQUE INDEX IF NOT EXISTS users_owui_id_key"
+                " ON users (owui_id) WHERE owui_id IS NOT NULL",
+                "ALTER TABLE groups ADD COLUMN IF NOT EXISTS system"
+                " BOOLEAN NOT NULL DEFAULT FALSE",
+                "CREATE TABLE IF NOT EXISTS group_attributes ( group_name TEXT"
+                " NOT NULL REFERENCES groups (name), key TEXT NOT NULL,"
+                " value JSONB NOT NULL, PRIMARY KEY (group_name, key) )",
+                # No foreign keys: an audit trail that vanishes with the account
+                # it describes is not an audit trail.
+                "CREATE TABLE IF NOT EXISTS audit_log ( id BIGSERIAL PRIMARY"
+                " KEY, at TIMESTAMPTZ NOT NULL DEFAULT NOW(), actor TEXT NOT"
+                " NULL, target TEXT NOT NULL DEFAULT '', action TEXT NOT NULL,"
+                " detail JSONB )",
             ],
         )
 
+    def test_a_database_older_than_the_baseline_raises(self) -> None:
+        """Silent under-migration is the failure mode to avoid.
+
+        v4/v5 were folded into the baseline and deleted (D-29), so a database
+        stamped below it has no path forward. Skipping the missing steps would
+        leave columns absent with nothing reported; the runner must raise, and
+        provision_data_plane turns that into a {"state": "error"} report.
+        """
+        cur = _FakeCursor(db.BASELINE_SCHEMA_VERSION - 1)
+        with self.assertRaises(ValueError) as ctx:
+            db.migrate_cp_schema(cur)
+        self.assertIn("reinstall", str(ctx.exception))
+        self.assertEqual(cur.ddl(), [])
+
+    def test_a_pre_m7_password_hash_column_raises(self) -> None:
+        """The version stamp is a proxy; the legacy column is the hazard.
+
+        A box that already ran the v6 step is stamped current and still has the
+        NOT NULL bcrypt column, which no additive migration may drop. Without
+        this the symptom is a not-null violation on ``usermgmt`` INSERT that
+        points at nothing the operator can act on.
+        """
+        cur = _FakeCursor(db.SCHEMA_VERSION, legacy_column="password_hash")
+        with self.assertRaises(ValueError) as ctx:
+            db.migrate_cp_schema(cur)
+        self.assertIn("users.password_hash", str(ctx.exception))
+        self.assertIn("reinstall", str(ctx.exception))
+        self.assertEqual(cur.ddl(), [])
+
     def test_each_migration_runs_once_even_if_applied_twice(self) -> None:
+        # Derived, not hardcoded: the property under test is "the second run adds
+        # nothing", and counting against a single run states that directly.
+        single = _FakeCursor(None)
+        db.migrate_cp_schema(single)
+        expected = len([s for s in single.ddl() if s.startswith("ALTER TABLE")])
+        self.assertGreater(expected, 0, "no ALTERs to prove idempotence about")
+
         cur = _FakeCursor(None)
         db.migrate_cp_schema(cur)
         db.migrate_cp_schema(cur)
         alters = [s for s in cur.ddl() if s.startswith("ALTER TABLE")]
-        self.assertEqual(len(alters), 2)  # both columns, not each twice
+        self.assertEqual(len(alters), expected)
 
     def test_a_newer_database_than_the_control_plane_is_tolerated(self) -> None:
         """A/B rollback must not brick the appliance."""
@@ -193,6 +282,69 @@ class SchemaMigrationTests(unittest.TestCase):
         conn.cursor.return_value = cur
         self.assertEqual(db._apply_cp_schema(conn), db.SCHEMA_VERSION)
         create.assert_called_once_with(conn)
+
+
+class CpTransactionTests(unittest.TestCase):
+    """``cp_transaction`` is what makes "one atomic account change" true.
+
+    ``cp_connect`` returns an **autocommit** connection. Any multi-statement write
+    written against it is really a series of independent commits, which would
+    silently break the guarantee that a half-applied account change cannot exist
+    (USERS-AND-GROUPS.md D-6). These tests pin the four behaviours that matter.
+    """
+
+    def _conn(self) -> mock.MagicMock:
+        conn = mock.MagicMock()
+        conn.autocommit = True
+        return conn
+
+    def test_transaction_mode_is_on_inside_and_restored_after(self) -> None:
+        conn = self._conn()
+        seen: list[bool] = []
+        with mock.patch.object(db, "_connect", return_value=conn):
+            with db.cp_transaction() as got:
+                seen.append(got.autocommit)
+                self.assertIs(got, conn)
+            seen.append(conn.autocommit)
+        self.assertEqual(seen, [False, True])
+
+    def test_clean_exit_commits_once(self) -> None:
+        conn = self._conn()
+        with mock.patch.object(db, "_connect", return_value=conn):
+            with db.cp_transaction() as cur:
+                cur.execute("INSERT INTO users (username) VALUES (%s)", ("a",))
+        conn.commit.assert_called_once()
+        conn.rollback.assert_not_called()
+        conn.close.assert_called_once()
+
+    def test_error_rolls_back_and_still_raises(self) -> None:
+        """The rollback is the whole point; swallowing the error would be worse."""
+        conn = self._conn()
+        with mock.patch.object(db, "_connect", return_value=conn):
+            with self.assertRaises(RuntimeError):
+                with db.cp_transaction():
+                    raise RuntimeError("the guarded update matched nothing")
+        conn.rollback.assert_called_once()
+        conn.commit.assert_not_called()
+        conn.close.assert_called_once()
+
+    def test_a_failing_rollback_cannot_hide_the_original_error(self) -> None:
+        conn = self._conn()
+        conn.rollback.side_effect = RuntimeError("connection already gone")
+        with mock.patch.object(db, "_connect", return_value=conn):
+            with self.assertRaises(ValueError):
+                with db.cp_transaction():
+                    raise ValueError("the real reason")
+
+    def test_a_failing_close_cannot_hide_the_original_error(self) -> None:
+        """Cleanup on a dead connection is allowed to fail quietly."""
+        conn = self._conn()
+        conn.rollback.side_effect = RuntimeError("gone")
+        conn.close.side_effect = RuntimeError("also gone")
+        with mock.patch.object(db, "_connect", return_value=conn):
+            with self.assertRaises(ValueError):
+                with db.cp_transaction():
+                    raise ValueError("the real reason")
 
 
 class OwuiConfigResetTests(unittest.TestCase):

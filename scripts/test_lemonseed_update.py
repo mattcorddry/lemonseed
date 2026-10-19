@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import subprocess
 import sys
@@ -88,6 +90,42 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaises(artifacts.ArtifactError):
                 artifacts.acquire_artifacts(download_dir=dest, directory=str(src))
 
+    def test_main_exits_nonzero_on_checksum_failure(self) -> None:
+        """A corrupt artifact must leave main() at exit 1 — the control plane
+        turns that into the failed job state the panel's Retry/Cancel answers
+        (bare-metal review, BM-4: a truncated push left the checksum failing
+        forever until the file was re-fetched)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src"
+            src.mkdir()
+            body = b"SQUASH" + b"\0" * 4096
+            manifest = {
+                "version": "bad",
+                "artifacts": {
+                    "vmlinuz": {"path": "vmlinuz"},
+                    "initrd.img": {"path": "initrd.img"},
+                    "root.squashfs": {"path": "root.squashfs", "sha256": "ff" * 32},
+                },
+            }
+            (src / "vmlinuz").write_bytes(b"kernel")
+            (src / "initrd.img").write_bytes(b"initrd")
+            (src / "root.squashfs").write_bytes(body)
+            (src / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            err = io.StringIO()
+            # Slot plumbing is mocked so the assertion stays on the checksum:
+            # the failure must come from the artifact, not the A/B preflight.
+            # The download dir is pointed at the temp tree so the run never
+            # touches /var/lib/lemonseed as a non-root user.
+            dl = Path(tmp) / "dl"
+            with mock.patch.object(update.os, "geteuid", return_value=0), \
+                    mock.patch.object(update, "preflight"), \
+                    mock.patch.object(update, "current_slot", return_value="a"), \
+                    mock.patch.object(update, "inactive_slot", return_value="b"), \
+                    mock.patch.object(update, "DOWNLOAD_DIR", dl), \
+                    contextlib.redirect_stderr(err):
+                self.assertEqual(update.main(["apply", "--dir", str(src)]), 1)
+            self.assertIn("Checksum mismatch for root.squashfs", err.getvalue())
+
 
 class UpdateLogicTests(unittest.TestCase):
     def test_inactive_slot(self) -> None:
@@ -124,6 +162,31 @@ class UpdateLogicTests(unittest.TestCase):
             instance.is_file.return_value = True
             instance.read_text.return_value = "console=tty0 lemonseed.slot=b root=fstab"
             self.assertEqual(update.cmdline_slot(), "b")
+
+    def test_preflight_refuses_an_unknowable_slot(self) -> None:
+        """No lemonseed.slot and no boot_default: 'the inactive slot' is a
+        guess, and a wrong guess overwrites the running root."""
+        with mock.patch.object(update, "cmdline_slot", return_value=None), mock.patch.object(
+            update, "ab_status", return_value={}
+        ), mock.patch.object(update, "ATTEMPT_FILE", Path("/nonexistent/attempt.json")):
+            with self.assertRaises(update.UpdateError) as ctx:
+                update.preflight(force=False)
+            self.assertIn("slot is active", str(ctx.exception))
+
+    def test_preflight_refuses_a_leftover_attempt_record(self) -> None:
+        """An arm-time record nobody cleared means a previous attempt never
+        landed; bare apply would stack a second attempt on top of it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            attempt = Path(tmp) / "update-attempt.json"
+            attempt.write_text("{}", encoding="utf-8")
+            with mock.patch.object(update, "cmdline_slot", return_value="a"), mock.patch.object(
+                update, "ab_status", return_value={"boot_default": "a"}
+            ), mock.patch.object(update, "ATTEMPT_FILE", attempt):
+                with self.assertRaises(update.UpdateError) as ctx:
+                    update.preflight(force=False)
+                self.assertIn("cancel", str(ctx.exception))
+                # --force is the operator's escape hatch, as the message says.
+                update.preflight(force=True)
 
 
 class UpdateApplyTests(unittest.TestCase):
@@ -177,6 +240,11 @@ class UpdateApplyTests(unittest.TestCase):
 
             (root / "esp-part").write_bytes(b"fat")
 
+            # The updater refuses to arm a slot when no grub.cfg template
+            # exists (bare-metal review); give it the real one.
+            template = root / "grub.cfg.template"
+            template.write_text("set default=0\n", encoding="utf-8")
+
             def fake_run(cmd, check=True, text=True, stdout=None, stderr=None):
                 if cmd[:1] == ["blockdev"] and "--getsize64" in cmd:
                     path = Path(cmd[-1])
@@ -202,6 +270,12 @@ class UpdateApplyTests(unittest.TestCase):
             ), mock.patch.object(
                 update, "require_root"
             ), mock.patch.object(
+                update, "GRUB_CFG", template
+            ), mock.patch.object(
+                update, "GRUB_CFG_FALLBACK", root / "no-such-fallback.cfg"
+            ), mock.patch.object(
+                update, "ATTEMPT_FILE", root / "update-attempt.json"
+            ), mock.patch.object(
                 artifacts.subprocess,
                 "check_output",
                 side_effect=lambda cmd, text=True: str(Path(cmd[-1]).stat().st_size),
@@ -216,6 +290,99 @@ class UpdateApplyTests(unittest.TestCase):
                 )
                 self.assertEqual((root / "once").read_text(encoding="utf-8"), "b")
                 self.assertTrue(root_a.read_bytes().startswith(b"OLD-A"))
+                # The ESP grub.cfg came from the template, and the failed-update
+                # detector's input was written at arm time.
+                self.assertEqual(
+                    (esp_dir / "grub" / "grub.cfg").read_text(encoding="utf-8"),
+                    "set default=0\n",
+                )
+                attempt = json.loads((root / "update-attempt.json").read_text(encoding="utf-8"))
+                self.assertEqual(attempt["intended_version"], "u1")
+                self.assertEqual(attempt["target_slot"], "b")
+                self.assertIn("attempted_at", attempt)
+
+    def test_apply_refuses_the_version_already_running(self) -> None:
+        """Reinstalling the running version is not an update; refuse it with
+        the reason rather than silently rewriting the slot (BM-3, --force
+        remains the CLI override)."""
+        with mock.patch.object(update, "require_root"), mock.patch.object(
+            update, "preflight"
+        ), mock.patch.object(update, "current_slot", return_value="a"), mock.patch.object(
+            update, "acquire_artifacts", return_value=({}, "2026.02", {})
+        ), mock.patch.object(update, "running_version", return_value="2026.02"):
+            with self.assertRaises(update.UpdateError) as ctx:
+                update.cmd_apply(None, None, reboot=False, force=False)
+            self.assertIn("already running", str(ctx.exception))
+
+    def test_apply_announces_finish_and_grace_before_reboot(self) -> None:
+        """The panel polls every 2s; without a 100% line and a short grace the
+        reboot outruns the poll and the dialog freezes at the last write
+        percent (bare-metal review, BM-4)."""
+        finished: list[str] = []
+        slept: list[float] = []
+        reboots: list[list[str]] = []
+        files = {
+            "vmlinuz": Path("/nonexistent/vmlinuz"),
+            "initrd.img": Path("/nonexistent/initrd.img"),
+            "root.squashfs": Path("/nonexistent/root.squashfs"),
+        }
+        err = io.StringIO()
+        with mock.patch.object(update, "require_root"), \
+                mock.patch.object(update, "preflight"), \
+                mock.patch.object(update, "current_slot", return_value="a"), \
+                mock.patch.object(update, "inactive_slot", return_value="b"), \
+                mock.patch.object(update, "acquire_artifacts",
+                                  return_value=(files, "v9", {})), \
+                mock.patch.object(update, "running_version", return_value="v8"), \
+                mock.patch.object(update, "write_inactive_slot"), \
+                mock.patch.object(update, "record_attempt"), \
+                mock.patch.object(update, "REBOOT_GRACE_S", 0.05), \
+                mock.patch.object(update, "run",
+                                  side_effect=lambda cmd, **k: reboots.append(cmd)), \
+                mock.patch.object(update.time, "sleep",
+                                  side_effect=lambda s: slept.append(s)):
+            with contextlib.redirect_stdout(err):
+                self.assertEqual(update.cmd_apply(url=None, directory=None,
+                                                  reboot=True, force=False), 0)
+        finished = [ln for ln in err.getvalue().splitlines() if "100%" in ln]
+        self.assertTrue(any("Update finished" in ln for ln in finished), err.getvalue())
+        self.assertEqual(slept, [0.05])
+        self.assertEqual(reboots, [["systemctl", "reboot"]])
+
+
+class UpdateCheckTests(unittest.TestCase):
+    def test_check_reports_and_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            latest_file = Path(tmp) / "latest-update.json"
+            with mock.patch.object(
+                update,
+                "fetch_manifest",
+                return_value=({"version": "test.02"}, "http://base/"),
+            ), mock.patch.object(update, "running_version", return_value="test.01"), mock.patch.object(
+                update, "LATEST_FILE", latest_file
+            ):
+                rc = update.cmd_check(None, record=True)
+                self.assertEqual(rc, 0)
+            self.assertTrue(latest_file.is_file())
+            record = json.loads(latest_file.read_text(encoding="utf-8"))
+            self.assertEqual(record["latest"], "test.02")
+            self.assertEqual(record["running"], "test.01")
+            self.assertIn("checked_at", record)
+
+    def test_cancel_clears_the_attempt_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            attempt = Path(tmp) / "update-attempt.json"
+            attempt.write_text("{}", encoding="utf-8")
+            esp_dir = Path(tmp) / "esp"
+            (esp_dir / "grub").mkdir(parents=True)
+            (esp_dir / "grub" / "grubenv").write_bytes(b"env")
+            with mock.patch.object(update, "ATTEMPT_FILE", attempt), mock.patch.object(
+                update, "ESP_MOUNT", esp_dir
+            ), mock.patch.object(update, "ensure_esp_mounted", return_value=esp_dir), mock.patch.object(
+                update, "umount_esp"
+            ), mock.patch.object(update, "run"), mock.patch.object(update, "require_root"):
+                update.cmd_cancel()
+            self.assertFalse(attempt.exists())
 
 
 if __name__ == "__main__":

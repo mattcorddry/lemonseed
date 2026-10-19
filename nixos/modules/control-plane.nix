@@ -5,14 +5,20 @@
 let
   cpSrc = ../../control-plane;
   bootSrc = ../../boot;
+  # The SYSTEM panel's update job and failed-update detector spawn the same
+  # updater the CLI and the weekly timer use (packaged once, see packages/).
+  lemonseedUpdate = import ../packages/lemonseed-update.nix { inherit pkgs lib; };
   cpRoot = pkgs.runCommand "lemonseed-control-plane-src" { } ''
     mkdir -p "$out/catalog" "$out/static/brand"
     cp ${cpSrc}/stub.py ${cpSrc}/hardware.py ${cpSrc}/catalog.py ${cpSrc}/chat_ready.py \
        ${cpSrc}/db.py ${cpSrc}/data_services.py ${cpSrc}/modules.py ${cpSrc}/auth.py \
-       ${cpSrc}/sessions.py ${cpSrc}/model_store.py ${cpSrc}/lemond_client.py \
+       ${cpSrc}/sessions.py ${cpSrc}/srp.py ${cpSrc}/audit.py ${cpSrc}/usermgmt.py \
+       ${cpSrc}/model_store.py ${cpSrc}/lemond_client.py ${cpSrc}/updates.py \
+       ${cpSrc}/journal.py \
        ${cpSrc}/owui_client.py \
        ${cpSrc}/owui_policy.py ${cpSrc}/owui_portal.py ${cpSrc}/owui-policy.json \
-       ${cpSrc}/image_pins.py ${cpSrc}/container-images.json "$out/"
+       ${cpSrc}/image_pins.py ${cpSrc}/container-images.json \
+       ${cpSrc}/words-en_US.txt "$out/"
     cp ${cpSrc}/catalog/models.json "$out/catalog/"
     cp -r ${cpSrc}/static/brand/. "$out/static/brand/"
     # GRUB template for the A/B updater to refresh on the ESP (the installed
@@ -23,7 +29,9 @@ let
 
   # `redis` is the Valkey client for the M6.6 session store (sessions.py). Keep
   # this list runtime-only; test dependencies belong in scripts/run-unit-tests.sh.
-  pythonEnv = pkgs.python3.withPackages (ps: [ ps.psycopg2 ps.bcrypt ps.requests ps.redis lemonadePythonSdk ]);
+  # There is deliberately no `bcrypt`: sign-in is SRP-6a (srp.py), so the CP
+  # neither stores nor verifies a password hash (DESIGN.md §3.3).
+  pythonEnv = pkgs.python3.withPackages (ps: [ ps.psycopg2 ps.requests ps.redis lemonadePythonSdk ]);
 
   controlPlane = pkgs.writeShellApplication {
     name = "appliance-control-plane";
@@ -39,6 +47,7 @@ let
       pkgs.util-linux
       pkgs.pciutils
       lemonadePackage
+      lemonseedUpdate
     ]
     ++ lib.optionals config.lemonseed.nvidia.enable [
       config.hardware.nvidia.package.bin

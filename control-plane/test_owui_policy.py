@@ -107,8 +107,9 @@ def users_spec(scope: Optional[list[str]] = None) -> owui_policy.EntitySpec:
     config = handler.validate(
         "full_management",
         {
+            # Mirrors the shipped manifest's scope (D-18: name joined the set).
             "source": "cp.users",
-            "scope": scope or ["membership", "is_admin"],
+            "scope": scope or ["membership", "is_admin", "name"],
             "never_touch": ["%SERVICE_ACCOUNT_ID%"],
         },
     )
@@ -179,26 +180,51 @@ class TestManifest(unittest.TestCase):
                 "POST /api/v1/configs/connections",
                 "POST /openai/config/update",
                 "POST /ollama/config/update",
-                "POST /api/v1/users/%CP_OWUI_ID%/update",
+                # D-17b: OWUI's user panel is read-only. One path regex covers
+                # every account's email/role/password edit (it is the only route
+                # that can change any of the three), and the delete rule covers
+                # every account; the CP account keeps its own rule because its
+                # denial copy reads differently. The update id segment is
+                # ``[^/]+``, not ``.*``: the greedy form also swallows Open
+                # WebUI's self-service writes under the same prefix, which D-17a
+                # says it owns.
+                "POST /api/v1/users/[^/]+/update",
+                "DELETE /api/v1/users/.*",
                 "DELETE /api/v1/users/%CP_OWUI_ID%",
+                # D-17b, finished by M7 P3: creating an account in Open WebUI is
+                # refused too, now that the portal's People panel is the way to
+                # do it. Nothing in the OWUI user panel can mutate anything.
+                "POST /api/v1/auths/add",
             },
         )
-        self.assertEqual(
-            advertised, {"POST /api/v1/auths/add", "DELETE /api/v1/users/.*"}
-        )
-        # The account guards are advisory only until M6.2b exists, and the reason
-        # has to say so — otherwise a reader cannot tell "not yet" from "never".
+        # No guard is advisory. Each one was flipped when the thing that made it
+        # safe arrived, so an advisory guard here now has to name what it waits
+        # for, or a reader cannot tell "not yet" from "never".
+        self.assertEqual(advertised, set())
+        # Any guard still advisory has to say what it waits for. None is today:
+        # the create rule was the last one, and M7 P3's People panel retired the
+        # wait (D-17b).
         for spec in manifest.guards:
             if spec.mode == "advertise":
-                self.assertIn("M6.2b", spec.reason, spec.path)
+                self.assertIn("until", spec.reason.lower(), spec.path)
         # Every guard ships UI copy that is safe to interpolate into the nginx
         # denial body.
         for spec in manifest.guards:
             self.assertTrue(spec.hint, f"{spec.path} has no hint")
             self.assertTrue(owui_policy._GUARD_HINT_RE.match(spec.hint), spec.path)
         for logical in ("config.export", "config.import", "models.export", "users.all",
-                        "users.create", "apikey.create", "app.version"):
+                        "users.create", "users.update", "users.delete",
+                        "apikey.create", "app.version"):
             self.assertIn(logical, manifest.api)
+        # Every api entry widens the CP key's allowed_endpoints, so an unused
+        # entry is dead attack surface. The six groups.* routes were deleted
+        # (PLAN.md Q4): group membership rides on X-Forwarded-Groups, never on
+        # an OWUI write.
+        self.assertFalse([name for name in manifest.api if name.startswith("groups.")])
+        self.assertFalse([route for route in manifest.api.values() if "/groups" in route])
+        # D-18: the mirror manages the display name too (email stays unmanaged).
+        self.assertEqual(manifest.entities["users"].config["scope"],
+                         ["membership", "is_admin", "name"])
 
     def test_in_tree_manifest_matches_appliance_intent(self) -> None:
         """Values cross-checked against the Phase-2 env-effective set (§8)."""
@@ -416,6 +442,7 @@ class TestManifest(unittest.TestCase):
 
 class TestGuardRenderer(unittest.TestCase):
     ID = "0f9a1b2c-3d4e-5f60-7182-93a4b5c6d7e8"
+    OTHER_ID = "1a1a1a1a-2b2b-3c3c-4d4d-5e5e5e5e5e5e"
 
     def render(self, *guards: owui_policy.GuardSpec, placeholders: Optional[dict] = None):
         return owui_policy.render_guards(
@@ -547,6 +574,62 @@ class TestGuardRenderer(unittest.TestCase):
         self.assertEqual(after.enforced, ("POST /openai/config/update",))
         # Down to zero enforce guards, the file is empty rather than commented out.
         self.assertEqual(self.render(guard(mode="advertise")).text, "")
+
+    def test_in_tree_manifest_blocks_the_admin_user_routes(self) -> None:
+        """Render the *shipped* manifest and match real request lines against it.
+
+        What nginx evaluates is not the manifest string but the anchored pattern
+        the renderer builds from it, so the D-17b read-only user panel is proven
+        here by matching request lines, not by reading JSON.
+        """
+        render = owui_policy.render_guards(
+            owui_policy.load_manifest(),
+            {"CP_OWUI_ID": self.ID, "SERVICE_ACCOUNT_ID": self.OTHER_ID},
+        )
+        self.assertEqual(render.pending, ())
+        self.assertIn("POST /api/v1/users/[^/]+/update", render.enforced)
+        self.assertIn("DELETE /api/v1/users/.*", render.enforced)
+        self.assertIn("DELETE /api/v1/users/%CP_OWUI_ID%", render.enforced)
+        # The last of them, as of M7 P3: nothing in the OWUI user panel can write.
+        self.assertIn("POST /api/v1/auths/add", render.enforced)
+
+        patterns = [
+            re.compile(pattern)
+            for pattern in re.findall(
+                r'^if \(\$request ~ "(\^.*)"\) \{', render.text, re.MULTILINE
+            )
+        ]
+        self.assertEqual(len(patterns), len(render.enforced))
+
+        def blocked(request: str) -> bool:
+            # ``~`` is an unanchored PCRE search; the patterns carry their own ^.
+            return any(pattern.search(request) for pattern in patterns)
+
+        target = "11111111-2222-4444-8888-555555555555"
+        # Every admin user update: e-mail, role and password all travel here.
+        self.assertTrue(blocked(f"POST /api/v1/users/{target}/update HTTP/1.1"))
+        self.assertTrue(blocked(f"POST /api/v1/users/{self.ID}/update HTTP/1.1"))
+        self.assertTrue(blocked(f"POST /api/v1/users/{target}/update?x=1 HTTP/1.1"))
+        # ...and deleting any account, including the CP's own.
+        self.assertTrue(blocked(f"DELETE /api/v1/users/{target} HTTP/1.1"))
+        self.assertTrue(blocked(f"DELETE /api/v1/users/{self.ID} HTTP/1.1"))
+        # The end anchor still holds: a path that merely starts with a guarded
+        # route is not the guarded route, and the sibling routes under the same
+        # prefixes — self-service password change, the API-key routes, first-run
+        # signup and trusted-header sign-in — are untouched.
+        self.assertFalse(blocked(f"POST /api/v1/users/{target}/update/profile HTTP/1.1"))
+        self.assertTrue(blocked("POST /api/v1/auths/add HTTP/1.1"))
+        self.assertFalse(blocked("POST /api/v1/auths/update/password HTTP/1.1"))
+        # The id segment is matched with ``[^/]+`` rather than ``.*`` because
+        # Open WebUI's own self-service writes sit under the same prefix
+        # ("/api/v1/users/user/settings/update", ".../user/status/update",
+        # ".../user/info/update"). D-17a says the module owns avatar, bio,
+        # timezone and settings, so guarding them would be a silent feature loss
+        # nobody asked for — and every real user id is a slash-free UUID, so
+        # nothing is given up in coverage.
+        self.assertFalse(blocked("POST /api/v1/users/user/info/update HTTP/1.1"))
+        self.assertFalse(blocked("POST /api/v1/users/user/settings/update HTTP/1.1"))
+        self.assertFalse(blocked("POST /api/v1/users/user/status/update HTTP/1.1"))
 
     def test_backslash_in_path_is_rejected(self) -> None:
         """nginx strips backslashes inside quoted config strings, so \\. and \\?
@@ -842,17 +925,77 @@ class TestPlanner(unittest.TestCase):
 
     def test_users_role_drift_pushes_update(self) -> None:
         want = {"email": "ana@lemonseed.local", "name": "Ana", "is_admin": False}
-        have = {"id": "u-1", "email": "ana@lemonseed.local", "role": "admin"}
+        have = {"id": "u-1", "email": "ana@lemonseed.local", "role": "admin",
+                "name": "Ana"}
         result = self._users_plan({"ana@lemonseed.local": want},
                                   {"ana@lemonseed.local": have})
         self.assertEqual(result.actions[0].op, "update")
         self.assertEqual(result.actions[0].payload, {"role": "user"})
+
+    def test_users_rename_pushes_name_only(self) -> None:
+        # A CP-side rename has to converge: OWUI reads the trusted name header
+        # only when it creates the account, so nothing else fixes it (D-17a).
+        want = {"email": "ana@lemonseed.local", "name": "Ana Maria", "is_admin": False}
+        have = {"id": "u-1", "email": "ana@lemonseed.local", "role": "user",
+                "name": "Ana"}
+        result = self._users_plan({"ana@lemonseed.local": want},
+                                  {"ana@lemonseed.local": have})
+        self.assertEqual(result.actions[0].op, "update")
+        self.assertEqual(result.actions[0].payload, {"name": "Ana Maria"})
+
+    def test_users_keyed_by_owui_id_updates_rather_than_creates(self) -> None:
+        # D-18: both sides carry CP-known owui_id keys, so the planner matches
+        # the row even though its email differs from what we intended.
+        want = {"email": "ana@localhost", "name": "Ana", "is_admin": True}
+        have = {"id": "u-1", "email": "ana@localhost", "role": "user",
+                "name": "Ana"}
+        result = self._users_plan({"u-1": want}, {"u-1": have})
+        self.assertEqual([a.op for a in result.actions], ["update"])
+        self.assertEqual(result.actions[0].payload, {"role": "admin"})
+        self.assertEqual(result.actions[0].entity_id, "u-1")
+
+    def test_users_unknown_id_matches_by_email_and_never_creates(self) -> None:
+        # owui_id unknown (empty) => key is the identity email, which must meet
+        # the observed row at that email instead of minting a duplicate.
+        want = {"email": "ana@localhost", "name": "Ana", "is_admin": False}
+        have = {"id": "u-9", "email": "ana@localhost", "role": "user",
+                "name": "Ana"}
+        result = self._users_plan({"ana@localhost": want},
+                                  {"ana@localhost": have})
+        self.assertEqual(result.actions, [])
+        self.assertEqual([e.state for e in result.entries], ["ok"])
 
     def test_users_in_owui_not_in_cp_is_drift_never_delete(self) -> None:
         have = {"id": "u-9", "email": "ghost@lemonseed.local", "role": "user"}
         result = self._users_plan({}, {"ghost@lemonseed.local": have})
         self.assertEqual(result.actions, [])
         self.assertEqual(result.entries[0].state, "drift")
+
+    def test_users_loop_never_emits_a_delete(self) -> None:
+        # Extra observed rows, an unknown-id desired row and a stale-id desired
+        # row, all in one tick: the planner may create/update/report drift, but
+        # it must never plan a delete or a sweep (DESIGN rule; D-16a keeps
+        # deletion in the portal handler).
+        observed = {
+            "u-1": {"id": "u-1", "email": "ana@localhost", "role": "user",
+                    "name": "Ana"},
+            "u-9": {"id": "u-9", "email": "ghost@localhost", "role": "admin",
+                    "name": "Ghost"},
+        }
+        desired = {
+            "u-1": {"email": "ana@localhost", "name": "Ana", "is_admin": True},
+            "bob@localhost": {"email": "bob@localhost", "name": "Bob",
+                              "is_admin": False},
+            "u-gone": {"email": "gone@localhost", "name": "Gone", "is_admin": False},
+        }
+        for triggers in (BOOT_TRIGGERS, AUDIT_TRIGGERS):
+            result = self._users_plan(desired, observed, triggers=triggers)
+            self.assertNotIn("delete", [a.op for a in result.actions])
+            self.assertNotIn("sweep", [a.op for a in result.actions])
+        self.assertEqual(
+            sorted((a.op, a.entity_id) for a in self._users_plan(desired, observed).actions),
+            [("create", "bob@localhost"), ("create", "u-gone"), ("update", "u-1")],
+        )
 
     def test_users_audit_tick_suppresses_writes(self) -> None:
         want = {"email": "ana@lemonseed.local", "name": "Ana", "is_admin": False}
@@ -993,6 +1136,36 @@ class TestUsersHandler(unittest.TestCase):
             self.handler.observe(client, self.spec, owui_policy.ResolverContext())
         self.assertIn("unexpected response shape", str(caught.exception))
 
+    def test_observe_keys_by_owui_id_when_the_cp_holds_it(self) -> None:
+        # D-18: the id is retained, not just used to filter never_touch. u-1 is
+        # a CP-owned account (its owui_id is in cp_users); u-2 is not, so it
+        # stays email-keyed and reads as drift.
+        client = _FakeClient({"users.all": {"users": [
+            {"id": "svc-1", "email": "lemonseed-cp@localhost", "role": "admin"},
+            {"id": "u-1", "email": "ana@localhost", "role": "user"},
+            {"id": "u-2", "email": "ghost@localhost", "role": "user"},
+        ], "total": 3}})
+        ctx = owui_policy.ResolverContext(
+            placeholders={"SERVICE_ACCOUNT_ID": "svc-1"},
+            cp_users=[{"email": "ana@localhost", "name": "Ana", "is_admin": False,
+                       "owui_id": "u-1"}],
+        )
+        observed = self.handler.observe(client, self.spec, ctx)
+        self.assertEqual(set(observed), {"u-1", "ghost@localhost"})
+        self.assertEqual(observed["u-1"]["id"], "u-1")
+
+    def test_observe_falls_back_to_email_when_id_is_unknown(self) -> None:
+        # owui_id "" means "we never captured it", not "no account exists":
+        # the row must key by email so it matches instead of being re-created.
+        client = _FakeClient({"users.all": {"users": [
+            {"id": "u-9", "email": "ana@localhost", "role": "user"},
+        ], "total": 1}})
+        ctx = owui_policy.ResolverContext(cp_users=[
+            {"email": "ana@localhost", "name": "Ana", "is_admin": False, "owui_id": ""},
+        ])
+        observed = self.handler.observe(client, self.spec, ctx)
+        self.assertEqual(set(observed), {"ana@localhost"})
+
     def test_desired_skips_disabled_and_normalizes(self) -> None:
         ctx = owui_policy.ResolverContext(cp_users=[
             {"email": "Bob@Lemonseed.Local", "name": "Bob", "is_admin": True,
@@ -1004,20 +1177,63 @@ class TestUsersHandler(unittest.TestCase):
         self.assertEqual(set(desired), {"bob@lemonseed.local"})
         self.assertTrue(desired["bob@lemonseed.local"]["is_admin"])
 
-    def test_changes_only_role(self) -> None:
+    def test_desired_keys_by_owui_id_but_never_sends_it(self) -> None:
+        # Key = owui_id; the payload stays intent-only (no id, no password).
+        ctx = owui_policy.ResolverContext(cp_users=[
+            {"email": "ana@localhost", "name": "Ana", "is_admin": False,
+             "owui_id": "7d1e-a"},
+            {"email": "bob@localhost", "name": "Bob", "is_admin": False,
+             "owui_id": ""},
+        ])
+        desired = self.handler.desired(self.spec, ctx)
+        self.assertEqual(set(desired), {"7d1e-a", "bob@localhost"})
+        self.assertEqual(desired["7d1e-a"]["email"], "ana@localhost")
+        self.assertEqual(set(desired["7d1e-a"]), {"email", "name", "is_admin"})
+
+    def test_changes_emits_role_and_name_diffs(self) -> None:
         want = {"email": "a@x", "name": "A", "is_admin": False}
-        self.assertIsNone(self.handler.changes(self.spec, want,
-                                               {"id": "u", "email": "a@x", "role": "user",
-                                                "name": "Renamed By User"}))
-        self.assertEqual(self.handler.changes(self.spec, want,
-                                              {"id": "u", "email": "a@x", "role": "admin"}),
+        in_sync = {"id": "u", "email": "a@x", "role": "user", "name": "A"}
+        self.assertIsNone(self.handler.changes(self.spec, want, in_sync))
+        self.assertEqual(self.handler.changes(self.spec, want, {**in_sync, "role": "admin"}),
                          {"role": "user"})
-        # Pending accounts sync role at trusted sign-in; pushing now 404s on UX.
+        # A rename made on the CP side must converge (D-18).
+        self.assertEqual(
+            self.handler.changes(self.spec, want,
+                                 {**in_sync, "name": "Renamed By User"}),
+            {"name": "A"},
+        )
+        self.assertEqual(
+            self.handler.changes(self.spec, want,
+                                 {**in_sync, "role": "admin", "name": "Old"}),
+            {"role": "user", "name": "A"},
+        )
+        # An empty desired name is "we do not know it", never "blank their name".
+        self.assertIsNone(self.handler.changes(self.spec, {**want, "name": ""},
+                                               {**in_sync, "name": "Renamed By User"}))
+        # Pending accounts sync at trusted sign-in; pushing now 404s on UX.
         self.assertIsNone(self.handler.changes(self.spec, want,
-                                               {"id": "u", "email": "a@x", "role": "pending"}))
+                                               {"id": "u", "email": "a@x",
+                                                "role": "pending", "name": "Old"}))
+        # Scope decides each field: no is_admin, no role diff; no name, no name
+        # diff (the shipped manifest scopes both).
+        self.assertEqual(
+            self.handler.changes(users_spec(scope=["membership", "name"]), want,
+                                 {**in_sync, "role": "admin", "name": "Old"}),
+            {"name": "A"},
+        )
+        self.assertEqual(
+            self.handler.changes(users_spec(scope=["membership", "is_admin"]), want,
+                                 {**in_sync, "role": "admin", "name": "Old"}),
+            {"role": "user"},
+        )
         narrow = users_spec(scope=["membership"])
         self.assertIsNone(self.handler.changes(narrow, want,
-                                               {"id": "u", "email": "a@x", "role": "admin"}))
+                                               {"id": "u", "email": "a@x",
+                                                "role": "admin", "name": "Old"}))
+        # A diff is never a password: users.update would happily bcrypt one.
+        self.assertNotIn("password",
+                         self.handler.changes(self.spec, want, {**in_sync, "role": "admin"})
+                         or {})
 
     def test_apply_create_and_update_never_delete(self) -> None:
         client = _FakeClient()
@@ -1031,10 +1247,15 @@ class TestUsersHandler(unittest.TestCase):
         self.assertEqual(body["role"], "admin")
         self.assertTrue(body["password"])  # unusable random, never handed out
         update = owui_policy.Action(
-            kind="entity", op="update", target="users:a@x", payload={"role": "user"},
+            kind="entity", op="update", target="users:a@x",
+            payload={"role": "user", "name": "A"},
             before={"id": "u-1"}, entity_kind="users", entity_id="a@x")
         self.handler.apply(client, update)
         self.assertEqual(client.calls[1]["path_params"], {"user_id": "u-1"})
+        # The update body carries exactly the drifted fields -- never a password,
+        # which users.update would hash and store (D-17 finding 2).
+        self.assertEqual(client.calls[1]["json_body"], {"role": "user", "name": "A"})
+        self.assertNotIn("password", client.calls[1]["json_body"])
         delete = owui_policy.Action(kind="entity", op="delete", target="users:a@x",
                                     entity_kind="users", entity_id="a@x")
         with self.assertRaises(owui_policy.PolicyError):
@@ -1243,6 +1464,49 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(fake.user_updates, [])
         self.assertEqual(fake.mints, 1)  # persisted key reused; no re-mint
 
+    def test_private_model_becomes_public_and_stays_there(self) -> None:
+        # Bare-metal review: the OWUI model editor defaults an entry to
+        # owner-only access, which hid the chat model from every non-admin.
+        fake = FakeOwui(models=[{"id": "m-1", "name": "Lemonade 8B",
+                                 "access_grants": []}])
+        state = owui_policy.reconcile(18080, self.BOOT, self._deps(fake))
+        self.assertTrue(state["ok"], state.get("last_error"))
+        self.assertEqual(fake.model_access_updates, [("m-1", [
+            {"principal_type": "user", "principal_id": "*", "permission": "read"},
+        ])])
+        entry = next(e for e in state["drift"]["entries"]
+                     if e["key"] == "models:access:m-1")
+        self.assertEqual(entry["state"], "fixed")
+        # Second run: the wildcard grant is present, so nothing writes.
+        fake.model_access_updates.clear()
+        state2 = owui_policy.reconcile(18080, self.BOOT, self._deps(fake))
+        self.assertTrue(state2["ok"], state2.get("last_error"))
+        self.assertEqual(fake.model_access_updates, [])
+        self.assertFalse(any(e["key"].startswith("models:access:")
+                             for e in state2["drift"]["entries"]))
+
+    def test_public_model_and_sweep_target_are_left_alone(self) -> None:
+        fake = FakeOwui(models=[
+            {"id": "m-pub", "name": "Lemonade 8B", "access_grants": [
+                {"principal_type": "user", "principal_id": "*",
+                 "permission": "read"},
+            ]},
+            {"id": "m-res", "name": "Lemonseed Knockoff"},
+        ])
+        state = owui_policy.reconcile(18080, self.BOOT, self._deps(fake))
+        self.assertTrue(state["ok"], state.get("last_error"))
+        self.assertEqual(fake.model_access_updates, [])
+        self.assertEqual(fake.model_deletes, ["m-res"])  # swept, never granted
+
+    def test_audit_tick_reports_a_private_model_but_never_writes(self) -> None:
+        fake = FakeOwui(models=[{"id": "m-1", "name": "Lemonade 8B",
+                                 "access_grants": []}])
+        state = owui_policy.reconcile(18080, frozenset(), self._deps(fake))
+        self.assertEqual(fake.model_access_updates, [])
+        entry = next(e for e in state["drift"]["entries"]
+                     if e["key"] == "models:access:m-1")
+        self.assertEqual(entry["state"], "pending")
+
     def test_out_of_band_drift_fixes_at_next_boot(self) -> None:
         fake = FakeOwui()
         owui_policy.reconcile(18080, self.BOOT, self._deps(fake))
@@ -1301,6 +1565,125 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(roles["ana@lemonseed.local"], "admin")   # elevated
         self.assertEqual(roles["bob@lemonseed.local"], "user")    # demoted
         self.assertEqual(roles["lemonseed-cp@localhost"], "admin")  # untouched
+
+    def test_reconcile_matches_accounts_by_owui_id(self) -> None:
+        # D-18 end to end: the CP holds u-a/u-b, and OWUI's rows carry emails
+        # an admin edited by hand. Matching on id still converges, and nothing
+        # is created twice (the D-15 duplicate-account class stays shut).
+        fake = FakeOwui(users=[
+            {"id": "svc-1", "email": "lemonseed-cp@localhost", "role": "admin"},
+            {"id": "u-a", "email": "ana@edited.example", "role": "user",
+             "name": "Ana"},
+            {"id": "u-b", "email": "bob@edited.example", "role": "admin",
+             "name": "Bob"},
+        ])
+        deps = self._deps(fake, cp_users=[
+            {"email": "ana@localhost", "name": "Ana", "is_admin": True,
+             "disabled": False, "owui_id": "u-a"},
+            {"email": "bob@localhost", "name": "Bob", "is_admin": False,
+             "disabled": False, "owui_id": "u-b"},
+        ])
+        state = owui_policy.reconcile(18080, self.BOOT, deps)
+        self.assertTrue(state["ok"], state.get("last_error"))
+        self.assertEqual(fake.user_creates, [])
+        self.assertEqual(len(fake.users), 3)  # nothing added, nothing removed
+        roles = {u["id"]: u["role"] for u in fake.users}
+        self.assertEqual(roles["u-a"], "admin")   # elevated by id, not by email
+        self.assertEqual(roles["u-b"], "user")    # demoted
+
+    def test_reconcile_unknown_owui_id_matches_by_email_not_duplicates(self) -> None:
+        # owui_id unknown (the create path could not reach OWUI): the row must
+        # meet the existing account at its identity email instead of minting a
+        # second one, which OWUI would reject with EMAIL_TAKEN anyway.
+        fake = FakeOwui(users=[
+            {"id": "svc-1", "email": "lemonseed-cp@localhost", "role": "admin"},
+            {"id": "u-a", "email": "ana@lemonseed.local", "role": "user",
+             "name": "Ana"},
+        ])
+        deps = self._deps(fake, cp_users=[
+            {"email": "ana@lemonseed.local", "name": "Ana", "is_admin": True,
+             "disabled": False, "owui_id": ""},
+        ])
+        state = owui_policy.reconcile(18080, self.BOOT, deps)
+        self.assertTrue(state["ok"], state.get("last_error"))
+        self.assertEqual(fake.user_creates, [])
+        self.assertEqual(len(fake.users), 2)
+        self.assertEqual([u["role"] for u in fake.users if u["id"] == "u-a"], ["admin"])
+
+    def test_reconcile_display_name_rename_converges_and_is_idempotent(self) -> None:
+        fake = FakeOwui(users=[
+            {"id": "svc-1", "email": "lemonseed-cp@localhost", "role": "admin"},
+            {"id": "u-a", "email": "ana@localhost", "role": "admin", "name": "Ana"},
+        ])
+        deps = self._deps(fake, cp_users=[
+            {"email": "ana@localhost", "name": "Ana Maria", "is_admin": True,
+             "disabled": False, "owui_id": "u-a"},
+        ])
+        state = owui_policy.reconcile(18080, self.BOOT, deps)
+        self.assertTrue(state["ok"], state.get("last_error"))
+        # Exactly the rename: never an email, never a password.
+        self.assertEqual(fake.user_updates, [("u-a", {"name": "Ana Maria"})])
+        fake.user_updates.clear()
+        owui_policy.reconcile(18080, self.BOOT, deps)
+        self.assertEqual(fake.user_updates, [])
+
+    def test_reconcile_never_deletes_an_account(self) -> None:
+        # One row owned by id, one foreign row, one unknown-id desired row: no
+        # tick, whatever its triggers, may remove an OWUI account (DESIGN rule;
+        # deletion is the portal handler's job — D-16a).
+        fake = FakeOwui(users=[
+            {"id": "svc-1", "email": "lemonseed-cp@localhost", "role": "admin"},
+            {"id": "u-a", "email": "ana@localhost", "role": "user", "name": "Ana"},
+            {"id": "u-x", "email": "ghost@localhost", "role": "user", "name": "Ghost"},
+        ])
+        deps = self._deps(fake, cp_users=[
+            {"email": "ana@localhost", "name": "Ana", "is_admin": True,
+             "disabled": False, "owui_id": "u-a"},
+            {"email": "bob@localhost", "name": "Bob", "is_admin": False,
+             "disabled": False, "owui_id": ""},
+        ])
+        boot = owui_policy.reconcile(18080, self.BOOT, deps)
+        self.assertTrue(boot["ok"], boot.get("last_error"))
+        ids = [u["id"] for u in fake.users]
+        self.assertIn("u-x", ids)        # the foreign account survives
+        self.assertIn("svc-1", ids)      # so does the service account
+        self.assertIn("bob@localhost", [u["email"] for u in fake.users])
+        self.assertEqual(len(ids), 4)    # exactly one create (bob), no removals
+        owui_policy.reconcile(18080, frozenset(), deps)
+        self.assertEqual([u["id"] for u in fake.users], ids)  # audit tick: no writes
+        drift_keys = {e["key"] for e in boot["drift"]["entries"]
+                      if e["state"] == "drift"}
+        self.assertEqual(drift_keys, {"users:ghost@localhost"})
+
+    def test_reconcile_stale_owui_id_reports_instead_of_deleting(self) -> None:
+        # The CP holds an id OWUI no longer has while a row sits at that email
+        # (deleted and re-created by hand, say). The loop cannot update a row it
+        # cannot find, so it attempts the create; real OWUI answers EMAIL_TAKEN,
+        # which surfaces as a failed action — it must never be "fixed" by
+        # deleting anyone.
+        class EmailTakenOwui(FakeOwui):
+            """Real OWUI refuses a second row at a taken email (users.py)."""
+
+            def call(self, name, *, path_params=None, json_body=None, **kwargs):
+                if name == "users.create":
+                    return {"ok": False, "status": 400, "data": None,
+                            "error": "EMAIL_TAKEN"}
+                return super().call(name, path_params=path_params,
+                                    json_body=json_body, **kwargs)
+
+        fake = EmailTakenOwui(users=[
+            {"id": "svc-1", "email": "lemonseed-cp@localhost", "role": "admin"},
+            {"id": "u-9", "email": "ana@localhost", "role": "user", "name": "Ana"},
+        ])
+
+        deps = self._deps(fake, cp_users=[
+            {"email": "ana@localhost", "name": "Ana", "is_admin": True,
+             "disabled": False, "owui_id": "u-gone"},
+        ])
+        state = owui_policy.reconcile(18080, self.BOOT, deps)
+        self.assertFalse(state["ok"])              # drift is reported, not hidden
+        self.assertIn("EMAIL_TAKEN", state["last_error"])
+        self.assertEqual(len(fake.users), 2)       # nothing deleted, nothing added
 
     def test_foreign_owui_account_is_drift_not_delete(self) -> None:
         fake = FakeOwui(users=[
@@ -1507,6 +1890,7 @@ class FakeOwui:
         self.imports: list[dict] = []
         self.model_creates: list[str] = []
         self.model_updates: list[str] = []
+        self.model_access_updates: list[tuple[str, list[dict]]] = []
         self.model_deletes: list[str] = []
         self.user_creates: list[str] = []
         self.user_updates: list = []
@@ -1571,6 +1955,17 @@ class FakeOwui:
                 if model.get("id") == json_body.get("id"):
                     model.update(json_body)
             self.model_updates.append(json_body.get("id"))
+            return {**ok, "data": json_body}
+        if name == "models.access_update":
+            # v0.11.0: replaces the whole grant list; backfills a minimal row
+            # for a non-preset model that has none yet.
+            grants = copy.deepcopy(json_body.get("access_grants", []))
+            row = next((m for m in self.models if m.get("id") == json_body.get("id")), None)
+            if row is None:
+                row = {"id": json_body["id"], "name": json_body["id"]}
+                self.models.append(row)
+            row["access_grants"] = grants
+            self.model_access_updates.append((json_body["id"], grants))
             return {**ok, "data": json_body}
         if name == "models.delete":
             self.models = [m for m in self.models if m.get("id") != json_body.get("id")]

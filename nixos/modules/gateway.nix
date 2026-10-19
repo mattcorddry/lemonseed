@@ -221,18 +221,29 @@ let
     proxy_hide_header Content-Security-Policy;
   '';
 
-  # Empty gate snippets until the control plane flips them after the first
-  # admin exists (same reloadable-file pattern as owui-upstream.conf).
+  # Gate snippets for nginx. /run is tmpfs, so the boot seeder restores the
+  # last-written state from user-data when it exists: otherwise every reboot
+  # began with the edge gate OPEN until the control plane's gate worker waited
+  # out Postgres and rewrote it, and a request in that window reached the CP
+  # with no forwarded groups at all — an admin's /settings/ answered a bare
+  # needs-admin JSON (bare-metal review). owui-guards.conf stays
+  # empty-seeded on purpose: the guards are re-rendered from the manifest at
+  # every boot reconcile, and a boot where the CP never ran blocks nothing.
   seedAuthGate = pkgs.writeShellApplication {
     name = "lemonseed-auth-gate-seed";
     runtimeInputs = [ pkgs.coreutils ];
     text = ''
       set -euo pipefail
       install -d -m 0755 /run/lemonseed
+      install -d -m 0755 /var/lib/lemonseed
       for f in auth-gate.conf auth-admin.conf owui-guards.conf; do
         if [[ ! -e /run/lemonseed/$f ]]; then
-          : > /run/lemonseed/$f
-          chmod 0644 /run/lemonseed/$f
+          if [[ -s /var/lib/lemonseed/$f ]] && [[ $f != owui-guards.conf ]]; then
+            install -m 0644 "/var/lib/lemonseed/$f" "/run/lemonseed/$f"
+          else
+            : > /run/lemonseed/$f
+            chmod 0644 /run/lemonseed/$f
+          fi
         fi
       done
     '';
@@ -327,10 +338,27 @@ in
     recommendedGzipSettings = true;
     # Errors already default to stderr → journald; keep explicit.
     logError = "stderr";
+    # Micro-cache for the auth subrequest (BM-4 review): every gated request
+    # runs one, so an OWUI page load (~25 API calls) at login or a single open
+    # portal tab (boot/status/chat polls) hits the CP several times a second.
+    # Lives in /run-backed /var/cache/nginx, gone at reboot.
+    proxyCachePath."lemon-auth" = {
+      enable = true;
+      keysZoneName = "lemon_auth";
+      keysZoneSize = "1m";
+      inactive = "30s";
+      maxSize = "4m";
+    };
     appendHttpConfig = ''
       include /run/lemonseed/owui-upstream.conf;
       # Access logs via syslog socket → journald (no /var/log/nginx files).
       access_log syslog:server=unix:/dev/log,nohostname,tag=nginx;
+      # The gate's identity headers overflow nginx's compiled default hash
+      # (bucket 64), and the parse-time warnings land in the compiled default
+      # error log — /var/log/nginx/error.log — not journald. Size for the
+      # headers the gate actually carries (BM-3 review).
+      proxy_headers_hash_max_size 1024;
+      proxy_headers_hash_bucket_size 128;
 
       # Top-level / → Lemonseed shell; iframe (or ?embed=1) → Open WebUI at path /.
       # OWUI is a root SPA — serving it under /chat/ makes the client router 404.
@@ -470,9 +498,84 @@ in
         proxyPass = "http://127.0.0.1:8080";
         extraConfig = "${authGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
+      # M7 P2: SRP-6a handshake phases. Deliberately open, like /login and
+      # /setup — these ARE sign-in, so gating them would be circular. Exact-match
+      # locations because locations."/" proxies to Open WebUI, not the CP, so a
+      # prefix route would 404 from the wrong service.
+      locations."= /_lemonseed/api/srp/challenge" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
+      locations."= /_lemonseed/api/srp/verify" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
+      # M7 P3: rotate your own password. Open like the handshake above — the
+      # proof it demands IS knowledge of the current password, so a session
+      # cookie would add nothing (and a forced rotation happens *before* one
+      # exists, D-11).
+      locations."= /_lemonseed/api/srp/rotate" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
+      # M7 P3/P4: identity management. /_lemonseed/ is the CP's own namespace
+      # (OWUI lives on /api/v1 and friends), so a prefix route here cannot
+      # shadow anything the module serves; nginx prefers the longest prefix,
+      # which beats locations."/".
+      locations."= /_lemonseed/api/profile" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
+      locations."= /_lemonseed/api/users" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
+      locations."/_lemonseed/api/users/" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
+      locations."/_lemonseed/api/groups/" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
+      locations."= /_lemonseed/api/audit" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
+      # Sign-in-code vocabulary (M7 P3). Admin-only, and mirrored in the CP: the
+      # gate is the piece a future edit can misconfigure.
+      locations."= /_lemonseed/api/wordlist" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
+      # Reboot / shut down (M7 P5). Admin-only at the edge and in the CP: this is
+      # the one button that takes the whole appliance away from everyone else.
+      locations."= /_lemonseed/api/power" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
+      # Update affordance (M7 P5). Admin-only: the snapshot (running vs latest,
+      # the failed-update banner), *Check now*, and the install job that reboots
+      # the appliance when it finishes (D4). The updater itself is packaged
+      # once; the CP spawns it, so no new service or port is exposed.
+      locations."= /_lemonseed/api/update" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
+      locations."= /_lemonseed/api/update/check" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
       # Internal auth_request target (never LAN-facing). The CP verifies the
       # signed session cookie and returns 200 + X-Forwarded-* headers (read via
       # auth_request_set in the gate snippet) or 401.
+      #
+      # Micro-cached per session cookie (BM-4 review): without it every gated
+      # request — each of OWUI's ~25 page-load calls, each portal poll — runs
+      # a CP round-trip. A 5s TTL bounds revocation/logout delay to the same;
+      # 401s and 503s are never cached, so invalid sessions and a down store
+      # stay fail-closed. proxy_cache_lock collapses a page-load burst into
+      # one CP verify.
       locations."= /_lemonseed/session-verify" = {
         proxyPass = "http://127.0.0.1:8080";
         extraConfig = ''
@@ -486,6 +589,11 @@ in
           proxy_read_timeout 240;
           proxy_send_timeout 240;
           proxy_connect_timeout 240;
+          proxy_cache lemon_auth;
+          # Keep in step with auth.SESSION_COOKIE (control-plane/auth.py).
+          proxy_cache_key $cookie_lemonseed_session;
+          proxy_cache_valid 200 5s;
+          proxy_cache_lock on;
         '';
       };
 
@@ -509,6 +617,17 @@ in
       };
       locations."= /settings" = {
         return = "302 /settings/";
+      };
+
+      # My Profile (M7 P3). Gated but NOT admin-gated, and that difference is the
+      # point: a household member who is not an admin has no other way to reach
+      # their own details or change their own password.
+      locations."/profile/" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
+      locations."= /profile" = {
+        return = "302 /profile/";
       };
 
       # Reserved Lemonseed JSON APIs (must win over OWUI /api/*).

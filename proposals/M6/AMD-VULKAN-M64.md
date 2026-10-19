@@ -81,8 +81,17 @@
 - [x] Single production image includes both CUDA and Vulkan closures (`llamacppBackend = "auto"`)
 - [x] QEMU smoke test green (CPU path). The QEMU profile is CPU-only, so this never exercised Vulkan; it is green on the landed profile as of the M6.3b runs.
 - [ ] **UNTESTED — no AMD hardware available.** Real-hardware validation: RX 6800 (gfx1030) — `vulkaninfo` + lemond load + chat
-- [ ] **UNTESTED — no AMD hardware available.** Real-hardware validation: Ryzen AI 385 (gfx1151 iGPU) — `vulkaninfo` + lemond load + chat
+- [x] **VALIDATED on real hardware (2026-10).** Strix Halo APU (Ryzen AI Max+ 395 class, gfx1151
+      iGPU — the 8060S) — `vulkaninfo` + lemond load + chat, end to end, no problems found. The
+      shared-memory carve-out (`ttm.pages_limit`) and GTT-sized VRAM reporting behave as designed.
 
-**Status note (2026-10):** the AMD tier-D checks above are **not** blocking M6 close-out — no AMD dGPU has been available to the project. Treat M6.4 as *implemented and unit-tested, AMD hardware unvalidated*. Coverage stops at `make test` (backend selection / planner / parsing) plus a production image that builds; the Vulkan runtime path is unexercised on real AMD silicon and should be treated as suspect until someone with a gfx1030/gfx1151 box runs tier D.
+**Status note (2026-10, corrected):** an earlier draft of this note said no AMD hardware had
+been available and treated M6.4 as wholly unvalidated. **That was wrong**: the **Strix Halo
+APU** path has been validated end to end on real hardware (see the checked item above), and
+`hardware.py` parses measured output from that silicon. What is genuinely still unrun is the
+**AMD dGPU** tier-D check — a PCIe Radeon card has never been booted on the appliance. That
+gap is tracked in `DESIGN.md` §11 (deferred platforms), not here, since this file is the
+historical design record. No *automated* test exercises Vulkan on either path: the QEMU
+profile pins `llamacppBackend = "cpu"`.
 
 

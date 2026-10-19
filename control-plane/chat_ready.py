@@ -58,6 +58,11 @@ _gave_up_lock = threading.Lock()
 # we don't finish downloading a model the user no longer wants.
 _pull_process: Optional[subprocess.Popen] = None
 _pull_lock = threading.Lock()
+# What the prepare pass is doing while it holds the prepare lock: "pull",
+# "load", or "" (planning, state writes, the readiness verify). Plain str
+# assignment is atomic, and the writer always holds the lock, so the power
+# interlock reads it without taking anything.
+_prepare_phase = ""
 # Set by cancel_active_pull so the worker can distinguish a user-initiated
 # cancellation from a genuine pull failure (and skip the retry counter).
 _pull_cancelled = threading.Event()
@@ -165,14 +170,25 @@ def chat_snapshot() -> dict[str, Any]:
     """Portal/API view of chat readiness; reconcile file state with lemond load."""
     state = read_chat_ready()
     if _reboot_pending():
-        # The box is about to reboot (GPU memory split). Show that instead of
-        # chat progress — the portal keeps polling until the box is back.
+        # The box is about to reboot. The wording depends on who queued it:
+        # the GPU memory split service names its reason; a portal reboot is
+        # just a reboot (bare-metal review — the GPU text showed for plain
+        # reboots and read as a holdover).
+        try:
+            marker = json.loads(REBOOT_PENDING_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            marker = {}
+        message = (
+            "Rebooting to apply GPU memory settings…"
+            if marker.get("reason") == "amdgpu-kernel-params"
+            else "The appliance is rebooting…"
+        )
         state = {
             "state": "rebooting",
             "progress": 0,
-            "message": "Rebooting to apply GPU memory settings…",
+            "message": message,
             "workflow": "Rebooting",
-            "task": "Rebooting to apply GPU memory settings…",
+            "task": message,
             "model_id": None,
             "display_name": None,
             "reason": None,
@@ -216,6 +232,33 @@ def _workflow_for_state(state: str) -> str:
     return "Preparing the Large Language Model"
 
 
+def in_flight_work() -> Optional[str]:
+    """A plain-language description of work a reboot would ruin, else ``None``.
+
+    Asked by the power controls before rebooting: a ``lemonade pull`` killed
+    half-way leaves a truncated weights file that the next boot will try to
+    load. Reads ``Lock.locked()``, ``Popen.poll()`` and the phase marker only,
+    so the HTTP handler that asks can never end up waiting behind the work it
+    is asking about.
+
+    The prepare lock alone is not the test (bare-metal review): the pass holds
+    it through the *readiness verify* too, which is a read — refusing to reboot
+    there made the buttons fail right after boot while the model was already
+    serving. Only the phases that write the weights volume or flip the serving
+    model are ruinable.
+    """
+    if _prepare_lock.locked():
+        if _prepare_phase == "pull":
+            return "the Large Language Model is being downloaded"
+        if _prepare_phase == "load":
+            return "the Large Language Model is being loaded"
+    with _pull_lock:
+        proc = _pull_process
+    if proc is not None and proc.poll() is None:
+        return "a model download is running"
+    return None
+
+
 def _reboot_pending() -> bool:
     """True while the kernel-params service has queued a reboot (it writes
     this marker right before `systemctl reboot`). The CP deletes it at
@@ -236,6 +279,30 @@ def _clear_reboot_pending() -> None:
 def clear_reboot_pending() -> None:
     """Drop a stale reboot marker (CP startup, tests)."""
     _clear_reboot_pending()
+
+
+def mark_reboot_pending(reason: str) -> None:
+    """Queue the "this box is on its way out" marker, then let the caller reboot.
+
+    Written by the portal's power controls exactly the way
+    ``amdgpu-kernel-params.sh`` writes it before its own reboot, so every portal
+    poll between the click and the machine disappearing reports ``rebooting``
+    instead of looking like the control plane crashed. The CP deletes the marker
+    at startup, so it cannot outlive the reboot it describes.
+
+    Failing to write it is not worth cancelling a reboot over: the worst case is
+    a progress bar that stops updating, and the person asked for the reboot.
+    """
+    payload = {
+        "state": "rebooting",
+        "reason": reason,
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    try:
+        REBOOT_PENDING_FILE.parent.mkdir(parents=True, exist_ok=True)
+        REBOOT_PENDING_FILE.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"reboot-pending: could not write marker: {exc}", flush=True)
 
 
 def _user_choice_active(hardware: dict[str, Any], model_id: str) -> bool:
@@ -547,6 +614,7 @@ def prepare_local_chat(*, force: bool = False) -> dict[str, Any]:
         # Another prepare is in flight; leave HTTP free to poll state.
         return read_chat_ready()
 
+    global _prepare_phase
     try:
         hardware = collect_hardware()
         persist_hardware(hardware)
@@ -697,6 +765,7 @@ def prepare_local_chat(*, force: bool = False) -> dict[str, Any]:
                 )
             )
             if not on_disk:
+                _prepare_phase = "pull"
                 # Guard against filling the user-data volume: verify there is room
                 # for this download before starting it. Evicts LRU models to make
                 # room (always keeping the most-recent prior model as a fallback);
@@ -746,6 +815,7 @@ def prepare_local_chat(*, force: bool = False) -> dict[str, Any]:
             )
             # A model switch must evict the previously loaded (pinned) model
             # first — lemond refuses a new pinned load while one is resident.
+            _prepare_phase = "load"
             _unload_other_models(model_id)
 
             load_backend = select_backend(hardware)
@@ -757,6 +827,7 @@ def prepare_local_chat(*, force: bool = False) -> dict[str, Any]:
                 # and re-fetches only what is missing; then retry the load once.
                 print(f"chat-ready: cached {model_id} would not load; pulling to repair", flush=True)
                 workflow = "Downloading the Large Language Model"
+                _prepare_phase = "pull"
                 write_chat_ready(
                     _progress_payload(
                         state="preparing",
@@ -778,6 +849,7 @@ def prepare_local_chat(*, force: bool = False) -> dict[str, Any]:
                     raise RuntimeError(
                         f"lemonade repair pull failed: {detail or repair.returncode}"
                     )
+                _prepare_phase = "load"
                 load = _run_lemonade(load_cmd, timeout=600)
             if load.returncode != 0:
                 detail = (load.stderr or load.stdout or "").strip()[:500]
@@ -793,6 +865,11 @@ def prepare_local_chat(*, force: bool = False) -> dict[str, Any]:
                 raise RuntimeError(
                     f"lemonade load returned success but {model_id} is not in /v1/health"
                 )
+
+            # The load command has returned and the model is serving: a reboot
+            # from here on ruins nothing, so the phase clears before the read-only
+            # verification (the fast path never sets it at all).
+            _prepare_phase = ""
 
             write_chat_ready(
                 _progress_payload(
@@ -860,6 +937,9 @@ def prepare_local_chat(*, force: bool = False) -> dict[str, Any]:
             write_chat_ready(payload)
             return payload
     finally:
+        # The interlock reads the phase while the lock is held; clearing before
+        # the release keeps a verify-phase reader from seeing a stale phase.
+        _prepare_phase = ""
         _prepare_lock.release()
 
 

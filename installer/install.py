@@ -16,7 +16,8 @@ import syslog
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,10 @@ from preflight import require_host_ready
 
 ProgressFn = Callable[..., None]
 
-IMAGE_BASE_DEFAULT = "https://lemonseed.ai/releases/stable/"
+# Internal-network channel only; see the note in scripts/lemonseed_artifacts.py.
+# The USB installer and the in-place updater must read the same channel or a
+# freshly installed box looks for releases somewhere the appliance does not.
+IMAGE_BASE_DEFAULT = "http://test.lemonseed.ai/releases/stable/"
 USER_AGENT = "lemonseed-installer/0.1"
 DOWNLOAD_DIR = Path(os.environ.get("LEMONSEED_DOWNLOAD_DIR", "/var/lib/lemonseed/download"))
 INSTALL_LOG = Path("/var/lib/lemonseed/installer.log")
@@ -53,6 +57,19 @@ def _log(level: int, msg: str) -> None:
     except OSError:
         pass
 ESP_MOUNT = Path("/run/lemonseed-install-esp")
+USER_DATA_MOUNT = Path("/run/lemonseed-install-user-data")
+# The user-data partition is only an LVM PV: the btrfs volume holding the
+# @etc/@var subvolumes is the appliance/user-data LV
+# (scripts/appliance-storage-provision.sh). "user-data" is kept as a fallback
+# key for volumes probed before the label was settled.
+USER_DATA_PARTLABELS = ("lemonseed-user-data", "user-data")
+USER_DATA_VG = "appliance"
+USER_DATA_LV = "user-data"
+# Paths inside a mounted user-data volume, i.e. the appliance's
+# /var/lib/lemonseed/reset-admin and /var/lib/lemonseed/admins.json. Their
+# readers/writers on the box are auth.RESET_MARKER_FILE and auth.ADMINS_FILE.
+RESET_MARKER_REL = Path("@var/lib/lemonseed/reset-admin")
+ADMIN_ROSTER_REL = Path("@var/lib/lemonseed/admins.json")
 LEMONSEED_ROOT = Path(os.environ.get("LEMONSEED_ROOT", "/etc/lemonseed"))
 REPART_SCRIPT = LEMONSEED_ROOT / "disk-repart.sh"
 RELEASE_SCRIPT = LEMONSEED_ROOT / "disk-release.sh"
@@ -158,6 +175,166 @@ def partition_number(part: str) -> int:
         return int(sysf.read_text(encoding="utf-8").strip())
     except (OSError, ValueError) as exc:
         raise InstallError(f"Could not determine partition number for {part}") from exc
+
+
+def _first_line(text: str | None, fallback: str) -> str:
+    for line in (text or "").splitlines():
+        if line.strip():
+            return line.strip()[:200]
+    return fallback
+
+
+def user_data_device(disk: str) -> str | None:
+    """Return the mountable node holding ``disk``'s Lemonseed user-data.
+
+    The partition alone is not mountable on a provisioned box: it is an LVM PV
+    and the btrfs volume lives on the ``appliance/user-data`` LV, so the VG is
+    activated and the LV preferred. A volume that was never provisioned has no
+    LV, and the bare partition is returned so the caller's mount fails with a
+    real message instead of a mystery.
+    """
+    parts = parts_on_disk(disk)
+    part = None
+    for label in USER_DATA_PARTLABELS:
+        if parts.get(label):
+            part = parts[label]
+            break
+    if not part:
+        return None
+    subprocess.run(["vgchange", "-ay", USER_DATA_VG], check=False, capture_output=True)
+    for lv in (f"/dev/{USER_DATA_VG}/{USER_DATA_LV}", f"/dev/mapper/{USER_DATA_VG}-{USER_DATA_LV}"):
+        if Path(lv).exists():
+            return lv
+    return part
+
+
+@contextmanager
+def mount_user_data(disk: str, read_only: bool = False) -> Iterator[Path]:
+    """Mount ``disk``'s user-data volume at USER_DATA_MOUNT and yield its root.
+
+    An existing mount on that path is reused rather than stacked, matching the
+    install-log copy in run_install. Read-only probes hand the volume back when
+    they finish so nothing is left busy before partitioning runs.
+    """
+    device = user_data_device(disk)
+    if not device:
+        raise InstallError(f"No Lemonseed user-data partition found on {disk}")
+    USER_DATA_MOUNT.mkdir(parents=True, exist_ok=True)
+    ours = not os.path.ismount(str(USER_DATA_MOUNT))
+    mode = "ro" if read_only else "rw"
+    if ours:
+        proc = subprocess.run(
+            ["mount", "-t", "btrfs", "-o", f"{mode},subvolid=5", device, str(USER_DATA_MOUNT)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise InstallError(
+                f"Could not mount {device} on {USER_DATA_MOUNT}: "
+                f"{_first_line(proc.stderr or proc.stdout, 'mount failed')}"
+            )
+    try:
+        yield USER_DATA_MOUNT
+    finally:
+        if ours:
+            subprocess.run(["umount", str(USER_DATA_MOUNT)], check=False)
+            if read_only:
+                subprocess.run(
+                    ["vgchange", "-an", USER_DATA_VG], check=False, capture_output=True
+                )
+
+
+def apply_reset_marker(disk: str, requested: bool) -> None:
+    """State the admin-reset intent on the target's user-data (D-27).
+
+    ``/var/lib/lemonseed/reset-admin`` is the file the control plane reads on
+    boot (``auth.RESET_MARKER_FILE``): while it exists the portal reopens
+    ``/setup``, and the next admin enrollment revokes admin from the accounts it
+    names. Creating it is deliberately **not** best-effort — a write that
+    quietly failed would leave a household believing a lost password had been
+    reset when it had not. Removing a stale marker stays best-effort, because
+    nothing was promised to the user in that direction.
+    """
+    if not requested:
+        try:
+            with mount_user_data(disk) as root:
+                marker = root / RESET_MARKER_REL
+                if marker.is_file():
+                    try:
+                        marker.unlink()
+                        _log(syslog.LOG_INFO, f"cleared stale admin reset marker on {disk}")
+                    except OSError as exc:
+                        _log(
+                            syslog.LOG_WARNING,
+                            f"could not clear stale admin reset marker on {disk}: {exc}",
+                        )
+        except Exception as exc:  # noqa: BLE001 — no reset asked for, never block an install
+            _log(syslog.LOG_WARNING, f"could not inspect admin reset marker on {disk}: {exc}")
+        return
+
+    try:
+        with mount_user_data(disk) as root:
+            marker = root / RESET_MARKER_REL
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("1\n", encoding="utf-8")
+    except (InstallError, OSError) as exc:
+        raise InstallError(
+            f"Lemonseed was installed, but the admin password was not reset: {exc}"
+        ) from exc
+    _log(syslog.LOG_INFO, f"admin reset marker written to {marker}")
+
+
+def parse_admin_roster(raw: str) -> list[str] | None:
+    """Admin usernames from a CP ``admins.json`` payload, or None if unreadable.
+
+    The control plane writes ``{"admins": ["alice", "bob"]}``
+    (``auth.publish_admin_roster``). Anything we cannot understand means "we do
+    not know", never an error.
+    """
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    admins = payload.get("admins")
+    if not isinstance(admins, list):
+        return None
+    return [str(name).strip() for name in admins if str(name).strip()]
+
+
+def read_admin_roster(disk: str) -> list[str] | None:
+    """Admins recorded on ``disk``'s user-data, or None when unknown.
+
+    None covers "no such file" (a box predating the roster), "cannot mount" and
+    "unparsable"; the UI then falls back to wording that names nobody instead of
+    claiming a count it did not actually read (D-28).
+    """
+    try:
+        with mount_user_data(disk, read_only=True) as root:
+            raw = (root / ADMIN_ROSTER_REL).read_text(encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 — affordance read, must never fail disk reporting
+        _log(syslog.LOG_INFO, f"no admin roster on {disk}: {exc}")
+        return None
+    return parse_admin_roster(raw)
+
+
+def attach_admin_rosters(disks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Add ``admin_usernames`` to disk details for the installer UI (D-28).
+
+    Only disks already verified as having preservable user data are probed: this
+    is the same payload that reports ``preservable_user_data``, and probing any
+    other disk would mount a volume we may be about to wipe.
+    """
+    for disk in disks:
+        probeable = (
+            bool(disk.get("eligible"))
+            and bool(disk.get("preservable_user_data"))
+            and bool(disk.get("path"))
+        )
+        disk["admin_usernames"] = read_admin_roster(disk["path"]) if probeable else None
+    return disks
 
 
 def sha256_file(path: Path) -> str:
@@ -413,7 +590,6 @@ def seed_esp(
     disk: str,
     files: dict[str, Path],
     progress: ProgressFn | None,
-    reset_admin_credentials: bool = False,
 ) -> None:
     esp = wait_part(disk, "ESP")
     ESP_MOUNT.mkdir(parents=True, exist_ok=True)
@@ -491,13 +667,6 @@ def seed_esp(
                     else "GPU memory setup deferred to first boot",
                     progress=87,
                 )
-
-        if reset_admin_credentials:
-            # Physical-access-only lockout recovery: the first-boot
-            # lemonseed-auth-reset-seed unit relocates this to user-data, and
-            # /setup then re-arms admin creation. ESP is wiped every install,
-            # so a stale marker never survives a reinstall that lacks the flag.
-            (ESP_MOUNT / "lemonseed-reset-admin").write_text("1\n", encoding="utf-8")
 
         partn = partition_number(esp)
         loader = "\\EFI\\lemonseed\\" + efi_bin.name
@@ -588,7 +757,7 @@ def run_install(
     _progress(progress, phase="write", message="Writing system image to root-a", progress=58)
     write_raw(files["root.squashfs"], root_a, progress, 58, 84)
     _progress(progress, phase="write", message="System image written", progress=85)
-    seed_esp(disk_path, files, progress, reset_admin_credentials=reset_admin_credentials)
+    seed_esp(disk_path, files, progress)
     # Flush target disk before inviting media removal — the live installer
     # root is still on that CD/USB and will vanish when it is ejected.
     _progress(
@@ -625,6 +794,15 @@ def run_install(
                         subprocess.run(["umount", str(user_data)], check=False)
     except Exception as exc:  # noqa: BLE001 — best-effort, never fail the install
         _log(syslog.LOG_WARNING, f"could not copy install log to user-data: {exc}")
+    # D-27: the marker is the only way back into a box whose admin password was
+    # lost, so spell the intent out on the volume the control plane reads. A
+    # wiped install destroys the partition table, so only preserved user data
+    # can carry it. Unlike the log copy above, a failed write fails the install
+    # — the alternative is a household that believes a reset happened.
+    if reset_admin_credentials and not preserve_user_data:
+        _log(syslog.LOG_WARNING, "admin reset requested without preserved user data; skipped")
+    if preserve_user_data:
+        apply_reset_marker(disk_path, reset_admin_credentials)
     _progress(
         progress,
         phase="await_usb",

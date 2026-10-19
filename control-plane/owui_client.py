@@ -68,6 +68,7 @@ DEFAULT_API: dict[str, str] = {
     "models.list": "GET /api/v1/models/list",
     "models.create": "POST /api/v1/models/create",
     "models.update": "POST /api/v1/models/model/update",
+    "models.access_update": "POST /api/v1/models/model/access/update",
     "models.delete": "POST /api/v1/models/model/delete",
     "models.sync": "POST /api/v1/models/sync",
     "users.all": "GET /api/v1/users/all",
@@ -349,6 +350,14 @@ class OwuiClient:
 
     def model_update(self, update: dict[str, Any]) -> dict[str, Any]:
         return self.call("models.update", json_body=update)
+
+    def model_access_update(self, model_id: str, access_grants: list[dict[str, str]]) -> dict[str, Any]:
+        """v0.11.0's access-only write: grants in, nothing else touched. It
+        also backfills the minimal entry a non-preset model may not have yet."""
+        return self.call(
+            "models.access_update",
+            json_body={"id": model_id, "access_grants": access_grants},
+        )
 
     def model_delete(self, model_id: str) -> dict[str, Any]:
         return self.call("models.delete", json_body={"id": model_id})
