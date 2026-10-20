@@ -16,11 +16,12 @@ MODE="${SIGN_MODE:-file}"
 
 case "${MODE}" in
   file)
-    # The ceremony key by default; the old gitignored test key still works via
-    # SIGN_KEY override. The public key name is recorded inside the signed
-    # metadata, so it must be a key the baked trust set actually carries.
+    # The ceremony key by default; the QEMU smoke overrides via SIGN_KEY. The
+    # public key name recorded inside the signed metadata must be a key the
+    # baked trust set actually carries, so it derives from the key's own name
+    # (release-v1.priv -> release-v1.pub) unless SIGN_PUB_NAME says otherwise.
     KEY="${SIGN_KEY:-${ROOT}/keys/release-v1.priv}"
-    PUB_NAME="${SIGN_PUB_NAME:-release-v1.pub}"
+    PUB_NAME="${SIGN_PUB_NAME:-$(basename "${KEY%.priv}").pub}"
     ;;
   pkcs11)
     echo "SIGN_MODE=pkcs11 is not wired yet (M8 P4 wires the build box); " \

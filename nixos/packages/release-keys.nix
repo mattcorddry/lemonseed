@@ -23,10 +23,6 @@ let
   # same rule the runtime verifier applies (it reads the baked release-keys.json
   # and opens listed files beside it). keysHome is '.' for the production set
   # (keys/release-keys.json) and 'qemu' for the QEMU smoke set.
-  # Key entries resolve relative to the trust manifest's own directory — the
-  # same rule the runtime verifier applies (it reads the baked release-keys.json
-  # and opens listed files beside it). The production set lives at keysDir root;
-  # the QEMU smoke set sits under keys/qemu/.
   keysHome =
     if dirOf trustFile == "." then keysDir else keysDir + "/${dirOf trustFile}";
   copyKeys = lib.concatMapStringsSep "\n" (

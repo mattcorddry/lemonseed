@@ -80,7 +80,7 @@ cat >"${OUT_DIR}/manifest.json" <<EOF
     },
     "initrd.img": {
       "path": "initrd.img",
-      "sha256": "${sha256_initrd}",
+      "sha256": "${sha256_initrd}"
     }
   },
   "signing": {

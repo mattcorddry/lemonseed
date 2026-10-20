@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import shutil
 import subprocess
+import tarfile
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -244,6 +246,24 @@ def acquire_artifacts(
             progress=8,
         )
         manifest = load_local_manifest(local)
+        if manifest.get("payload"):
+            # Sharded release set: verify parts, assemble the tar, re-verify.
+            files = assemble_payload(
+                manifest,
+                source_dir=local,
+                base_url=None,
+                download_dir=download_dir,
+                progress=progress,
+            )
+            version = str(manifest.get("version") or "local")
+            _progress(
+                progress,
+                phase="download",
+                message=f"Payload assembled (version {version})",
+                progress=45,
+                version=version,
+            )
+            return files, version, manifest
         files: dict[str, Path] = {}
         for key in ("vmlinuz", "root.squashfs", "initrd.img"):
             rel, sha = artifact_relpath(manifest, key)
@@ -269,6 +289,23 @@ def acquire_artifacts(
     )
     manifest, dir_url = fetch_manifest(base)
     version = str(manifest.get("version") or "unknown")
+    if manifest.get("payload"):
+        # Sharded release set over HTTP (or file://) — the P3 channel shape.
+        files = assemble_payload(
+            manifest,
+            source_dir=None,
+            base_url=dir_url,
+            download_dir=download_dir,
+            progress=progress,
+        )
+        _progress(
+            progress,
+            phase="download",
+            message=f"Payload assembled (version {version})",
+            progress=45,
+            version=version,
+        )
+        return files, version, manifest
     files = {}
     ranges = {
         "vmlinuz": (8, 14),
@@ -322,3 +359,261 @@ def write_raw(
             )
         outf.flush()
         os.fsync(outf.fileno())
+
+
+# --- Release payload assembly (M8 P2) -------------------------------------------------
+# A sharded release ships payload-NNN.part byte slices of one canonical tar;
+# the signed manifest carries both the chunk list and the reassembled artifacts'
+# hashes. See proposals/M8/PACKAGING.md. The tarball is never stored: the parts
+# are streamed once to hash, once to extract, so peak disk use is 1x the
+# extracted payload, under `download_dir` on /var (SSD-backed), never tmpfs.
+
+PAYLOAD_STAGING = "payload"
+PAYLOAD_PARTS = "parts"
+PAYLOAD_MARGIN_BYTES = 64 * 1024 * 1024
+
+
+class _ConcatReader:
+    """Sequential reader over the verified part files, in order.
+
+    Blocks until `size` bytes are available or global EOF, so tarfile's stream
+    reader never sees a short read at a part boundary.
+    """
+
+    def __init__(self, paths: list[Path]):
+        self._paths = paths
+        self._index = 0
+        self._handle: Any = None
+
+    def read(self, size: int = 1024 * 1024) -> bytes:
+        pieces: list[bytes] = []
+        got = 0
+        while size < 0 or got < size:
+            if self._handle is None:
+                if self._index >= len(self._paths):
+                    break
+                self._handle = self._paths[self._index].open("rb")
+                self._index += 1
+            piece = self._handle.read((size if size > 0 else 1024 * 1024) - got)
+            if not piece:
+                self._handle.close()
+                self._handle = None
+                continue
+            pieces.append(piece)
+            got += len(piece)
+        return b"".join(pieces)
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
+
+
+def _check_free_space(download_dir: Path, required: int) -> None:
+    """Refuse before downloading/assembling when /var cannot hold the payload."""
+    free = shutil.disk_usage(download_dir).free
+    need = required + PAYLOAD_MARGIN_BYTES
+    if free < need:
+        raise ArtifactError(
+            f"not enough space for payload assembly in {download_dir}: need "
+            f"{need} bytes (extracted payload + margin), {free} free — free up "
+            "space on /var and retry"
+        )
+
+
+def _copy_member(member: tarfile.TarInfo, src: Any, dest: Path, expected_sha: str) -> str:
+    """Stream one payload member to disk, hashing as it goes. Patchable in tests
+    to simulate a full staging filesystem (ENOSPC)."""
+    digest = hashlib.sha256()
+    count = 0
+    with dest.open("wb") as out:
+        for piece in iter(lambda: src.read(1024 * 1024), b""):
+            out.write(piece)
+            digest.update(piece)
+            count += len(piece)
+    if count != member.size:
+        raise ArtifactError(
+            f"payload member {member.name}: wrote {count} bytes, expected {member.size}"
+        )
+    if digest.hexdigest() != expected_sha:
+        raise ArtifactError(f"payload member {member.name} checksum mismatch after extraction")
+    return digest.hexdigest()
+
+
+def _extract_tar_members(
+    reader: _ConcatReader,
+    expected: dict[str, tuple[int, str]],
+    staging: Path,
+) -> dict[str, Path]:
+    """Stream the verified tar into staging, re-verifying every member against
+    the signed manifest's hashes (the second verification pass)."""
+    files: dict[str, Path] = {}
+    with tarfile.open(fileobj=reader, mode="r|") as tar:
+        for member in tar:
+            name = member.name[2:] if member.name.startswith("./") else member.name
+            if name not in expected:
+                raise ArtifactError(f"unexpected payload member: {member.name!r}")
+            if not member.isfile():
+                raise ArtifactError(f"unexpected non-file payload member: {member.name!r}")
+            length, sha = expected[name]
+            if member.size != length:
+                raise ArtifactError(
+                    f"payload member {name}: size {member.size}, expected {length}"
+                )
+            src = tar.extractfile(member)
+            if src is None:
+                raise ArtifactError(f"payload member {name} could not be extracted")
+            _copy_member(member, src, staging / name, sha)
+            files[name] = staging / name
+    missing = sorted(set(expected) - set(files))
+    if missing:
+        raise ArtifactError(f"payload tar is missing members: {missing}")
+    return files
+
+
+def cleanup_payload(download_dir: Path) -> None:
+    """Remove assembled staging + the verified part cache (after a successful
+    apply, or when the caller tears down). Best-effort: a failed cleanup must
+    not fail the update."""
+    for name in (PAYLOAD_STAGING, PAYLOAD_PARTS):
+        path = Path(download_dir) / name
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def assemble_payload(
+    manifest: dict[str, Any],
+    *,
+    source_dir: Path | None,
+    base_url: str | None,
+    download_dir: Path,
+    progress: ProgressFn | None = None,
+) -> dict[str, Path]:
+    """Download/verify the payload chunks, assemble the tar, extract and
+    re-verify every artifact. Returns {artifact key: staging path}.
+
+    Order is fail-closed (PACKAGING.md §4): each part is verified before it is
+    used, the assembled tar's length + sha256 are verified before anything is
+    extracted, and every extracted file is re-verified against the manifest.
+    The tarball itself is never written: two passes over the verified parts —
+    one to hash, one to extract — keep peak disk use at 1x the extracted
+    payload, under `download_dir` on /var.
+    """
+    payload = manifest.get("payload") or {}
+    chunks = payload.get("chunks") or []
+    if not chunks:
+        raise ArtifactError("payload manifest carries no chunks")
+    artifacts = manifest.get("artifacts") or {}
+
+    tar_block = payload.get("tar") or {}
+    tar_length = int(tar_block.get("length") or 0)
+    tar_sha = str(tar_block.get("sha256") or "")
+
+    # Free-space preflight: the manifest states everything needed — the
+    # extracted payload sizes — plus a fixed margin.
+    required = 0
+    for key, entry in artifacts.items():
+        length = int(entry.get("length") or 0)
+        if length <= 0:
+            raise ArtifactError(f"payload manifest artifact {key!r} has no usable length")
+        required += length
+    download_dir.mkdir(parents=True, exist_ok=True)
+    _check_free_space(download_dir, required)
+
+    staging = download_dir / PAYLOAD_STAGING
+    parts_dir = download_dir / PAYLOAD_PARTS
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # 1. Obtain + verify every part, in order. A verified part is a
+        # checkpoint: it stays in the parts cache and is never re-fetched.
+        part_paths: list[Path] = []
+        total_chunk_bytes = sum(int(c["length"]) for c in chunks)
+        done = 0
+        for index, chunk in enumerate(chunks):
+            name = str(chunk.get("name") or "")
+            if not name or name != os.path.basename(name) or not name.isascii():
+                raise ArtifactError(f"payload chunk has a non-bare/non-ASCII name: {name!r}")
+            length = int(chunk.get("length") or 0)
+            sha = str(chunk.get("sha256") or "")
+            lo = 8 + int((45 - 8) * (done / total_chunk_bytes)) if total_chunk_bytes else 8
+            hi = (
+                8 + int((45 - 8) * ((done + length) / total_chunk_bytes))
+                if total_chunk_bytes
+                else 45
+            )
+
+            if source_dir is not None:
+                part = source_dir / name
+                if not part.is_file():
+                    raise ArtifactError(f"payload part missing: {part}")
+                if part.stat().st_size != length:
+                    raise ArtifactError(
+                        f"payload part {name}: got {part.stat().st_size} bytes, expected {length}"
+                    )
+                if sha256_file(part) != sha:
+                    raise ArtifactError(f"Checksum mismatch for {name}")
+                part_paths.append(part)
+            else:
+                dest = parts_dir / name
+                # A verified part already in the cache is a checkpoint: skip it.
+                if not (dest.is_file() and dest.stat().st_size == length and sha256_file(dest) == sha):
+                    download_file(base_url + name, dest, sha, progress, lo, hi, name)
+                if dest.stat().st_size != length:
+                    raise ArtifactError(
+                        f"payload part {name}: got {dest.stat().st_size} bytes, expected {length}"
+                    )
+                part_paths.append(dest)
+            done += length
+
+        # 2. Pass 1: hash the assembled tar without writing it.
+        _progress(
+            progress,
+            phase="assemble",
+            message="Verifying assembled payload",
+            progress=45,
+        )
+        reader = _ConcatReader(part_paths)
+        digest = hashlib.sha256()
+        length = 0
+        for piece in iter(lambda: reader.read(4 * 1024 * 1024), b""):
+            digest.update(piece)
+            length += len(piece)
+        if length != tar_length or digest.hexdigest() != tar_sha:
+            raise ArtifactError(
+                f"assembled payload tar mismatch: got {length} bytes "
+                f"({digest.hexdigest()}), expected {tar_length} ({tar_sha})"
+            )
+
+        # 3. Pass 2: stream the same bytes into staging, re-verifying every
+        # member against the manifest's hashes. Nothing touches a partition
+        # before this returns.
+        expected = {
+            key: (int(entry.get("length") or 0), str(entry.get("sha256") or ""))
+            for key, entry in artifacts.items()
+        }
+        reader = _ConcatReader(part_paths)
+        try:
+            files = _extract_tar_members(reader, expected, staging)
+        finally:
+            reader.close()
+    except ArtifactError:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    except OSError as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        if exc.errno == errno.ENOSPC:
+            raise ArtifactError(
+                f"staging filesystem is full while extracting the payload: {exc} — "
+                "free up space on /var and retry"
+            ) from exc
+        raise ArtifactError(f"payload extraction failed: {exc}") from exc
+
+    _progress(
+        progress,
+        phase="assemble",
+        message="Payload verified and extracted",
+        progress=45,
+    )
+    return files

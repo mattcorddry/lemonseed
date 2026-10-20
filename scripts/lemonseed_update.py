@@ -28,6 +28,7 @@ from typing import Any
 from lemonseed_artifacts import (
     ArtifactError,
     acquire_artifacts,
+    cleanup_payload,
     fetch_manifest,
     image_base_url,
     sha256_device,
@@ -317,6 +318,9 @@ def cmd_apply(url: str | None, directory: str | None, *, reboot: bool, force: bo
     write_inactive_slot(files, target, force=force)
     # boot_once is armed; the detector's input exists only from here on.
     record_attempt(version, target)
+    # The payload is on its way to being the running system: the assembled
+    # staging and the verified part cache are no longer needed (M8 P2).
+    cleanup_payload(DOWNLOAD_DIR)
     log(f"pending boot_once={target}; reboot to try Lemonseed {version}")
     if reboot:
         # The write phase tops out at 82% and the remaining steps print no

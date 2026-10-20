@@ -161,61 +161,77 @@ else
   echo "==> /dev/kvm not usable; falling back to TCG (slow)"
 fi
 
-# --- M8 P1 signing smoke: build + serve the release sets the guest verifier
-# consumes. Three dirs off one server on 127.0.0.1:${QEMU_SIGN_PORT} (the
-# guest reaches it as 10.0.2.2):
-#   good/              correctly signed set (PASS expected)
-#   tampered-payload/  same signed manifest, one flipped root.squashfs byte
-#   tampered-manifest/ the signed manifest altered after signing
+# --- M8 P2 signing + sharding smoke: build + serve the release sets the guest
+# consumes. `good` is a full sharded release set (built by the real packer,
+# signed with the QEMU-only key); the tampered variants exercise the payload
+# hash check and the manifest signature respectively. One server on
+# 127.0.0.1:${QEMU_SIGN_PORT} (the guest reaches it as 10.0.2.2).
 SIGN_PORT="${QEMU_SIGN_PORT:-18081}"
 SIGN_DIR="${ROOT}/out/qemu-signing"
 rm -rf "${SIGN_DIR}"
 mkdir -p "${SIGN_DIR}"
-python3 - "${SIGN_DIR}" "${ROOT}/keys/qemu/qemu-release-v1.priv" <<'PYSIGN'
+# Defined before anything can fail: the EXIT trap above calls it, and the
+# smoke sets are built (and can fail) before the server starts.
+SIGN_PID=""
+cleanup_server() {
+  if [[ -n "${SIGN_PID}" ]]; then
+    kill "${SIGN_PID}" 2>/dev/null || true
+    wait "${SIGN_PID}" 2>/dev/null || true
+  fi
+}
+python3 - "${SIGN_DIR}" "${ROOT}/keys/qemu/qemu-release-v1.priv" "${ROOT}" <<'PYSIGN'
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
 priv = Path(sys.argv[2])
+root_arg = Path(sys.argv[3])
 files = {
     "vmlinuz": b"smoke-vmlinuz\n" * 1000,
     "initrd.img": b"smoke-initrd\n" * 1000,
-    "root.squashfs": b"SMOKE-SQUASHFS" + b"\0" * (1024 * 1024),
+    "root.squashfs": b"SMOKE-SQUASHFS" + (b"\0" * (512 * 1024)),
 }
+build = root / "build"
+build.mkdir(parents=True, exist_ok=True)
 manifest = {"version": "signing-smoke", "artifacts": {}}
 for name, body in files.items():
-    (root / name).write_bytes(body)
+    (build / name).write_bytes(body)
     manifest["artifacts"][name] = {
         "path": name,
         "sha256": hashlib.sha256(body).hexdigest(),
+        "length": len(body),
     }
-manifest["signing"] = {
-    "scheme": "detached-ed25519",
-    "enabled": True,
-    "public_key": "qemu-release-v1.pub",
-}
-(root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+(build / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+# The real packer: canonical tar, sharded parts, payload block, size gate.
 subprocess.run(
-    ["openssl", "pkeyutl", "-sign", "-inkey", str(priv), "-rawin",
-     "-in", str(root / "manifest.json"), "-out", str(root / "manifest.json.sig")],
-    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    [sys.executable, str(root_arg / "scripts" / "release_payload.py"), "pack",
+     "--artifacts-dir", str(build), "--out-dir", str(root / "good"),
+     "--part-bytes", "262144"],
+    check=True,
 )
-
+subprocess.run(
+    [str(root_arg / "scripts" / "sign.sh"), str(root / "good")],
+    check=True,
+    env={**os.environ, "SIGN_KEY": str(priv)},
+)
 for name in ("good", "tampered-payload", "tampered-manifest"):
     d = root / name
-    d.mkdir()
-    for f in ("manifest.json", "manifest.json.sig", "vmlinuz", "initrd.img", "root.squashfs"):
-        (d / f).write_bytes((root / f).read_bytes())
+    d.mkdir(exist_ok=True)
+    for f in ("manifest.json", "manifest.json.sig"):
+        (d / f).write_bytes((root / "good" / f).read_bytes())
+    for f in root.glob("good/payload-*.part"):
+        (d / f.name).write_bytes(f.read_bytes())
 
-# tampered-payload: flip one byte of the served root.squashfs, signature and
-# manifest untouched — the download hash check must catch it.
-payload = root / "tampered-payload" / "root.squashfs"
-raw = bytearray(payload.read_bytes())
-raw[17] ^= 0x01
-payload.write_bytes(bytes(raw))
+# tampered-payload: flip one byte inside a served part — signature and manifest
+# untouched; the part's own hash check must catch it.
+part = root / "tampered-payload" / "payload-000.part"
+raw = bytearray(part.read_bytes())
+raw[10] ^= 0x01
+part.write_bytes(bytes(raw))
 
 # tampered-manifest: alter the manifest after signing — the signature must
 # refuse before a single hash inside it is trusted.
@@ -224,13 +240,6 @@ m.write_text(m.read_text(encoding="utf-8").replace("signing-smoke", "signing-smo
 print("signing smoke sets written under", root)
 PYSIGN
 
-SIGN_PID=""
-cleanup_server() {
-  if [[ -n "${SIGN_PID}" ]]; then
-    kill "${SIGN_PID}" 2>/dev/null || true
-    wait "${SIGN_PID}" 2>/dev/null || true
-  fi
-}
 cleanup_server
 python3 -m http.server "${SIGN_PORT}" --bind 127.0.0.1 --directory "${SIGN_DIR}" >/dev/null 2>&1 &
 SIGN_PID=$!

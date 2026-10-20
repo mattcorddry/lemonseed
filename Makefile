@@ -24,7 +24,7 @@ ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 SIGN ?= 0
 DISK ?=
 
-.PHONY: help build-production build-qemu build-installer run-qemu qemu-clean clean keys \
+.PHONY: help build-production build-qemu build-installer release run-qemu qemu-clean clean keys \
 	repart-generate disk-repart grub-cfg repart-test update-test test test-qemu \
 	test-update-unit check-untracked nix-gc lint refresh-image-pins check-image-pins \
 	test-gateway
@@ -46,7 +46,7 @@ help:
 	@echo "  make disk-repart DISK=/dev/sdX DRY_RUN=1"
 	@echo "  make grub-cfg          Install boot/grub.cfg into out/grub/grub.cfg"
 	@echo "  make repart-test       Loopback systemd-repart smoke test (sudo)"
-	@echo "  make update-test       Loopback A/B updater smoke test (sudo)"
+	@echo "  make update-test       Loopback A/B updater smoke test (no root)"
 	@echo "  make test              Unit tests (no root / no hypervisor)"
 	@echo "  make lint              Ruff over control-plane/ scripts/ installer/"
 	@echo "  make test-qemu         QEMU boot + HTTP API smoke (needs build-qemu)"
@@ -59,6 +59,7 @@ help:
 	@echo "  make nix-gc            Soft Nix GC (drop stale build roots; no -d)"
 	@echo "  make clean             Remove out/"
 	@echo "  make keys              Generate local ed25519 test keys under keys/"
+	@echo "  make release           Build + pack + sign + stage a release (out/release-<version>/)"
 	@echo "  make help              Show this help (default)"
 	@echo ""
 	@echo "Variables:"
@@ -83,6 +84,9 @@ build-qemu:
 
 build-installer:
 	"$(ROOT)/scripts/package-installer.sh"
+
+release:
+	"$(ROOT)/scripts/release.sh"
 
 run-qemu:
 	@if [[ ! -f "$(ROOT)/out/latest-qemu/vmlinuz" \

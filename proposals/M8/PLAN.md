@@ -131,6 +131,19 @@ the pass and the refuse paths. **Key ceremony doc approved before key generation
 
 ## P2 — Packaging: sharded payload, installer size gate, `make release`
 
+**Status: shipped 2026-10-20.** `PACKAGING.md` approved with its decisions resolved;
+`make test` green (incl. the 13-test `test_release_payload.py` suite), `make lint` clean,
+`QEMU_API_TIMEOUT=1200 make test-qemu` PASSED — the guest consumes a real sharded set
+(`pack` + `sign.sh`, QEMU trust set) end-to-end over `--url`: signed set verifies, a
+flipped payload byte is refused at the part hash check, an altered manifest is refused at
+the signature. `VERSION=20261020.05 make release` staged a complete signed release set
+(4 payload parts incl. a 16 MiB remainder + 1.3 GiB installer ISO) and self-verified it
+with the appliance's verifier. Fixes found by the gates: the build manifest's JSON had a
+trailing comma (only `SIGN=1` parses it — `jq` refused), `web.nix` called
+`release-keys.nix` without `lib`, and the signing smoke's host block passed a `str` where
+the packer needed a `Path`. `scripts/push-image-to-website.sh` removed (D23). Design
+record: [`PACKAGING.md`](./PACKAGING.md).
+
 ### Problem
 
 GitHub caps each release asset under **2 GiB** and `root.squashfs` is ~3 GB, so

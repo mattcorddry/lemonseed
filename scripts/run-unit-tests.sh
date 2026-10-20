@@ -18,6 +18,9 @@ echo "==> installer"
 # both dirs on the ISO too — see nixos/installer/modules/web.nix).
 PYTHONPATH="${ROOT}/installer:${ROOT}/scripts" python3 -m unittest discover -s "${ROOT}/installer" -p 'test_*.py' -v
 
+echo "==> release payload"
+python3 "${ROOT}/scripts/test_release_payload.py"
+
 echo "==> gen-repart"
 python3 "${ROOT}/scripts/test_gen_repart.py"
 

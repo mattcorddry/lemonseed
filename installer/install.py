@@ -24,6 +24,7 @@ from typing import Any
 # The shared verifier ships next to the vendored pipeline on the ISO: web.nix
 # puts both the installer dir and the scripts dir on PYTHONPATH, so the
 # installer and the in-place updater never carry two verifiers (SIGNING.md §5).
+import lemonseed_artifacts
 import lemonseed_verify
 from disks import list_candidate_disks
 from lemonseed_verify import VerificationError
@@ -491,6 +492,26 @@ def acquire_artifacts(progress: ProgressFn | None) -> tuple[dict[str, Path], str
             progress=8,
         )
         manifest = load_local_manifest(local)
+        if manifest.get("payload"):
+            # Sharded release set: verify parts, assemble the tar, re-verify.
+            try:
+                files = lemonseed_artifacts.assemble_payload(
+                    manifest,
+                    source_dir=local,
+                    base_url=None,
+                    download_dir=DOWNLOAD_DIR,
+                    progress=progress,
+                )
+            except lemonseed_artifacts.ArtifactError as exc:
+                raise InstallError(str(exc)) from exc
+            _progress(
+                progress,
+                phase="download",
+                message=f"Payload assembled (version {manifest.get('version', 'unknown')})",
+                progress=45,
+                version=manifest.get("version"),
+            )
+            return files, str(manifest.get("version") or "local")
         files: dict[str, Path] = {}
         for key in ("vmlinuz", "root.squashfs", "initrd.img"):
             rel, sha = artifact_relpath(manifest, key)
@@ -515,6 +536,26 @@ def acquire_artifacts(progress: ProgressFn | None) -> tuple[dict[str, Path], str
     )
     manifest, dir_url = fetch_manifest(base)
     version = manifest.get("version", "unknown")
+    if manifest.get("payload"):
+        # Sharded release set over HTTP (or file://) — the P3 channel shape.
+        try:
+            files = lemonseed_artifacts.assemble_payload(
+                manifest,
+                source_dir=None,
+                base_url=dir_url,
+                download_dir=DOWNLOAD_DIR,
+                progress=progress,
+            )
+        except lemonseed_artifacts.ArtifactError as exc:
+            raise InstallError(str(exc)) from exc
+        _progress(
+            progress,
+            phase="download",
+            message=f"Payload assembled (version {version})",
+            progress=45,
+            version=version,
+        )
+        return files, str(version)
     files = {}
     ranges = {
         "vmlinuz": (8, 14),
@@ -799,6 +840,9 @@ def run_install(
     subprocess.run(["sync"], check=False)
     time.sleep(1)
     subprocess.run(["sync"], check=False)
+    # The payload staging and part cache served their purpose; the ISO's
+    # persistent layer is tiny, so do not leave ~3 GB behind on it.
+    lemonseed_artifacts.cleanup_payload(DOWNLOAD_DIR)
     # Preserve the install log on the target's user-data (mounted by
     # partition_disk for preserve, or freshly mounted here) so it can be
     # inspected after the first appliance boot.

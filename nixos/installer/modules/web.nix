@@ -1,6 +1,6 @@
 # Installer HTTP service on :80.
 
-{ pkgs, ... }:
+{ pkgs, lib, ... }:
 
 let
   installerRoot = ../../../installer;
@@ -10,7 +10,7 @@ let
   scriptsRoot = ../../../scripts;
   # The trust set baked into the ISO (M8 P1): release-keys.json plus the key
   # files it lists. Nothing is fetched at runtime; the ISO carries it.
-  releaseKeys = import ../../packages/release-keys.nix { inherit pkgs; keysDir = ../../../keys; };
+  releaseKeys = import ../../packages/release-keys.nix { inherit pkgs lib; keysDir = ../../../keys; };
   pythonEnv = pkgs.python3;
 
   lemonseedInstaller = pkgs.writeShellApplication {

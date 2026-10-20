@@ -85,7 +85,7 @@ Notes:
 | Command | When |
 |---------|------|
 | `make build-production` | Shipping an image / release |
-| `scripts/push-image-to-website.sh` | Only when the user asks to publish |
+| `make release` | Build + pack + sign + stage a release (`out/release-<version>/`) |
 | Hardware smoke on NVIDIA prototype | GPU/chat/OWUI iframe validation beyond QEMU |
 | `make test-update-unit` | Narrow rerun of update tests only |
 
