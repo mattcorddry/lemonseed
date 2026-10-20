@@ -1,47 +1,77 @@
 #!/usr/bin/env bash
-# Detached ed25519 signatures over artifact files + manifest.
-# Requires keys/ed25519.priv (openssl/pkey or minisign-compatible raw).
-# For M1 we use `openssl` if available, else `nix-shell`-free ssh-keygen signed via `ssh-keygen -Y`.
+# Detached ed25519 signature over manifest.json (M8 P1, D12).
+#
+# The manifest is the single root of trust: every artifact/part hash lives
+# inside the signed bytes, so only the manifest is ever signed — one root, not
+# two. The interface never changes: <dir> in, manifest.json.sig out, exit 0 =
+# signed. SIGN_MODE selects the backend so a hardware signer (PKCS#11 /
+# tap-to-sign, D15) can replace the file key without touching the pipeline.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${1:?usage: sign.sh <artifact-dir>}"
-KEY="${SIGN_KEY:-${ROOT}/keys/ed25519.priv}"
-PUB="${SIGN_PUB:-${ROOT}/keys/ed25519.pub}"
+MANIFEST="${OUT_DIR}/manifest.json"
+SIG="${MANIFEST}.sig"
+MODE="${SIGN_MODE:-file}"
 
-if [[ ! -f "${KEY}" ]]; then
-  echo "Signing key not found at ${KEY}" >&2
-  echo "Generate local test keys with: make keys" >&2
+case "${MODE}" in
+  file)
+    # The ceremony key by default; the old gitignored test key still works via
+    # SIGN_KEY override. The public key name is recorded inside the signed
+    # metadata, so it must be a key the baked trust set actually carries.
+    KEY="${SIGN_KEY:-${ROOT}/keys/release-v1.priv}"
+    PUB_NAME="${SIGN_PUB_NAME:-release-v1.pub}"
+    ;;
+  pkcs11)
+    echo "SIGN_MODE=pkcs11 is not wired yet (M8 P4 wires the build box); " \
+      "the interface is reserved" >&2
+    exit 1
+    ;;
+  *)
+    echo "Unknown SIGN_MODE '${MODE}' (expected: file)" >&2
+    exit 1
+    ;;
+esac
+
+if [[ ! -f "${MANIFEST}" ]]; then
+  echo "No manifest to sign: ${MANIFEST}" >&2
   exit 1
 fi
 
-if ! command -v openssl >/dev/null 2>&1; then
-  echo "openssl is required for SIGN=1" >&2
-  exit 1
+if [[ "${MODE}" == "file" ]]; then
+  if [[ ! -f "${KEY}" ]]; then
+    echo "Signing key not found at ${KEY}" >&2
+    echo "Run the key ceremony on the signing box (SIGNING.md §3), or point" >&2
+    echo "SIGN_KEY at an existing key." >&2
+    exit 1
+  fi
+  if ! command -v openssl >/dev/null 2>&1; then
+    echo "openssl is required for signing" >&2
+    exit 1
+  fi
 fi
 
 sign_one() {
-  local file="$1"
-  openssl pkeyutl -sign -inkey "${KEY}" -rawin -in "${file}" -out "${file}.sig"
+  openssl pkeyutl -sign -inkey "${KEY}" -rawin -in "${MANIFEST}" -out "${SIG}"
 }
 
-for name in vmlinuz root.squashfs initrd.img manifest.json; do
-  path="${OUT_DIR}/${name}"
-  if [[ -f "${path}" ]]; then
-    echo "==> Signing ${name}"
-    sign_one "${path}"
-  fi
-done
-
-# Update manifest signing metadata (best-effort rewrite).
+# Record the signing metadata inside the signed bytes, then sign exactly what
+# ships: any edit after signing breaks verification by design.
+if [[ -f "${SIG}" ]]; then
+  rm -f "${SIG}"
+fi
 if command -v jq >/dev/null 2>&1; then
   tmp="$(mktemp)"
-  jq --arg pub "$(basename "${PUB}")" \
-    '.signing.enabled = true | .signing.public_key = $pub | .signing.scheme = "detached-ed25519-openssl-pkeyutl"' \
-    "${OUT_DIR}/manifest.json" >"${tmp}"
-  mv "${tmp}" "${OUT_DIR}/manifest.json"
-  # Re-sign manifest after metadata update.
-  sign_one "${OUT_DIR}/manifest.json"
+  jq --arg pub "${PUB_NAME}" \
+    '.signing.enabled = true | .signing.scheme = "detached-ed25519" | .signing.public_key = $pub' \
+    "${MANIFEST}" >"${tmp}"
+  # mktemp creates 0600 and the manifest must stay HTTP-servable.
+  chmod 0644 "${tmp}"
+  mv "${tmp}" "${MANIFEST}"
+else
+  echo "jq not found: signing metadata not updated (manifest keeps its current signing block)" >&2
 fi
 
-echo "==> Detached signatures written alongside artifacts"
+sign_one
+echo "==> Signed ${MANIFEST} (detached ed25519, mode=${MODE})"
+echo "==> Wrote ${SIG}"

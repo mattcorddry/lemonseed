@@ -10,8 +10,13 @@ cd "${ROOT}"
 echo "==> lemonseed-update / artifacts"
 python3 "${ROOT}/scripts/test_lemonseed_update.py"
 
+echo "==> release signature verifier"
+python3 "${ROOT}/scripts/test_lemonseed_verify.py"
+
 echo "==> installer"
-PYTHONPATH="${ROOT}/installer" python3 -m unittest discover -s "${ROOT}/installer" -p 'test_*.py' -v
+# The installer imports the shared verifier from scripts/ (PYTHONPATH includes
+# both dirs on the ISO too — see nixos/installer/modules/web.nix).
+PYTHONPATH="${ROOT}/installer:${ROOT}/scripts" python3 -m unittest discover -s "${ROOT}/installer" -p 'test_*.py' -v
 
 echo "==> gen-repart"
 python3 "${ROOT}/scripts/test_gen_repart.py"

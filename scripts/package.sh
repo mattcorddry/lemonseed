@@ -81,7 +81,6 @@ cat >"${OUT_DIR}/manifest.json" <<EOF
     "initrd.img": {
       "path": "initrd.img",
       "sha256": "${sha256_initrd}",
-      "note": "Included for practical boot/QEMU; soft goal is to drop when no-initrd spike succeeds."
     }
   },
   "signing": {
@@ -94,7 +93,7 @@ EOF
 if [[ "${SIGN:-0}" == "1" ]]; then
   "${ROOT}/scripts/sign.sh" "${OUT_DIR}"
 else
-  echo "==> Signing disabled (set SIGN=1 to enable local/test keys)"
+  echo "==> Signing disabled (set SIGN=1 to sign with the ceremony key)"
 fi
 
 ln -sfn "$(basename "${OUT_DIR}")" "${ROOT}/out/${LATEST_LINK}"

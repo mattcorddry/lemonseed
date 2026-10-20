@@ -30,6 +30,7 @@ VIRTFS_DIR="${QEMU_OWUI_VIRTFS:-${ROOT}/out/qemu-owui-virtfs}"
 E2E_CHAT="${QEMU_E2E_CHAT:-0}"
 
 cleanup() {
+  cleanup_server
   if [[ -f "${PIDFILE}" ]]; then
     pid="$(cat "${PIDFILE}")"
     if kill -0 "${pid}" 2>/dev/null; then
@@ -159,6 +160,81 @@ if [[ -r /dev/kvm && -w /dev/kvm ]]; then
 else
   echo "==> /dev/kvm not usable; falling back to TCG (slow)"
 fi
+
+# --- M8 P1 signing smoke: build + serve the release sets the guest verifier
+# consumes. Three dirs off one server on 127.0.0.1:${QEMU_SIGN_PORT} (the
+# guest reaches it as 10.0.2.2):
+#   good/              correctly signed set (PASS expected)
+#   tampered-payload/  same signed manifest, one flipped root.squashfs byte
+#   tampered-manifest/ the signed manifest altered after signing
+SIGN_PORT="${QEMU_SIGN_PORT:-18081}"
+SIGN_DIR="${ROOT}/out/qemu-signing"
+rm -rf "${SIGN_DIR}"
+mkdir -p "${SIGN_DIR}"
+python3 - "${SIGN_DIR}" "${ROOT}/keys/qemu/qemu-release-v1.priv" <<'PYSIGN'
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+priv = Path(sys.argv[2])
+files = {
+    "vmlinuz": b"smoke-vmlinuz\n" * 1000,
+    "initrd.img": b"smoke-initrd\n" * 1000,
+    "root.squashfs": b"SMOKE-SQUASHFS" + b"\0" * (1024 * 1024),
+}
+manifest = {"version": "signing-smoke", "artifacts": {}}
+for name, body in files.items():
+    (root / name).write_bytes(body)
+    manifest["artifacts"][name] = {
+        "path": name,
+        "sha256": hashlib.sha256(body).hexdigest(),
+    }
+manifest["signing"] = {
+    "scheme": "detached-ed25519",
+    "enabled": True,
+    "public_key": "qemu-release-v1.pub",
+}
+(root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+subprocess.run(
+    ["openssl", "pkeyutl", "-sign", "-inkey", str(priv), "-rawin",
+     "-in", str(root / "manifest.json"), "-out", str(root / "manifest.json.sig")],
+    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+)
+
+for name in ("good", "tampered-payload", "tampered-manifest"):
+    d = root / name
+    d.mkdir()
+    for f in ("manifest.json", "manifest.json.sig", "vmlinuz", "initrd.img", "root.squashfs"):
+        (d / f).write_bytes((root / f).read_bytes())
+
+# tampered-payload: flip one byte of the served root.squashfs, signature and
+# manifest untouched — the download hash check must catch it.
+payload = root / "tampered-payload" / "root.squashfs"
+raw = bytearray(payload.read_bytes())
+raw[17] ^= 0x01
+payload.write_bytes(bytes(raw))
+
+# tampered-manifest: alter the manifest after signing — the signature must
+# refuse before a single hash inside it is trusted.
+m = root / "tampered-manifest" / "manifest.json"
+m.write_text(m.read_text(encoding="utf-8").replace("signing-smoke", "signing-smoke-x"), encoding="utf-8")
+print("signing smoke sets written under", root)
+PYSIGN
+
+SIGN_PID=""
+cleanup_server() {
+  if [[ -n "${SIGN_PID}" ]]; then
+    kill "${SIGN_PID}" 2>/dev/null || true
+    wait "${SIGN_PID}" 2>/dev/null || true
+  fi
+}
+cleanup_server
+python3 -m http.server "${SIGN_PORT}" --bind 127.0.0.1 --directory "${SIGN_DIR}" >/dev/null 2>&1 &
+SIGN_PID=$!
+echo "==> Serving signing-smoke sets on 127.0.0.1:${SIGN_PORT} (pid ${SIGN_PID})"
 
 SERIAL="file:${LOG}"
 if [[ "$DEBUG" == 1 ]] ; then
@@ -2499,5 +2575,49 @@ if [[ "${cp_down_code}" != "404" ]]; then
   exit 1
 fi
 echo "OK: 5xx contract in place; the not-ready page is not directly reachable"
+
+# --- M8 P1 signing smoke: the guest's verifier saw the baked trust set and
+# produced the pass + both refuse paths against the host-served sets. The
+# markers come from lemonseed-signing-smoke.service via journald -> ttyS0.
+echo "==> Signing smoke: baked trust set, pass + both refuse paths"
+sign_deadline=$((SECONDS + 300))
+sign_ok=false
+while (( SECONDS < sign_deadline )); do
+  if grep -q "lemonseed-signing-smoke: DONE" "${LOG}" 2>/dev/null; then
+    sign_ok=true
+    break
+  fi
+  if ! kill -0 "$(cat "${PIDFILE}")" 2>/dev/null; then
+    echo "QEMU exited during signing smoke; tail ${LOG}:" >&2
+    tail -40 "${LOG}" >&2 || true
+    exit 1
+  fi
+  sleep 5
+done
+if [[ "${sign_ok}" != "true" ]]; then
+  echo "Timed out waiting for the signing smoke to finish" >&2
+  grep -n "lemonseed-signing-smoke" "${LOG}" | tail -10 >&2 || true
+  tail -40 "${LOG}" >&2 || true
+  exit 1
+fi
+grep -q "lemonseed-signing-smoke: PASS signed-set" "${LOG}" || {
+  echo "signing smoke: no PASS for the correctly signed set — the verifier or baked trust set failed" >&2
+  grep -n "lemonseed-signing-smoke" "${LOG}" | tail -10 >&2 || true
+  exit 1
+}
+grep -q "lemonseed-signing-smoke: REFUSE tampered-payload.*Checksum mismatch" "${LOG}" || {
+  echo "signing smoke: the flipped payload byte was not refused at the hash check" >&2
+  grep -n "lemonseed-signing-smoke" "${LOG}" | tail -10 >&2 || true
+  exit 1
+}
+grep -q "lemonseed-signing-smoke: REFUSE tampered-manifest" "${LOG}" && \
+  grep -q "release signature does not verify" "${LOG}" || {
+  # The refusal reason spans two serial-log lines (multi-line ArtifactError),
+  # so the marker and the reason are asserted as two greps, not one.
+  echo "signing smoke: the altered manifest was not refused at the signature" >&2
+  grep -n "lemonseed-signing-smoke" "${LOG}" | tail -10 >&2 || true
+  exit 1
+}
+echo "OK: signing smoke — signed set verified, payload tamper and manifest tamper both refused"
 
 echo "==> QEMU API smoke test PASSED"

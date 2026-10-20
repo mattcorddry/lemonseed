@@ -122,7 +122,7 @@ repart-test:
 	sudo "$(ROOT)/scripts/repart-smoke-test.sh"
 
 update-test:
-	sudo "$(ROOT)/scripts/update-smoke-test.sh"
+	"$(ROOT)/scripts/update-smoke-test.sh"
 
 test:
 	"$(ROOT)/scripts/run-unit-tests.sh"

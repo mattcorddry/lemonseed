@@ -40,7 +40,11 @@ flake.nix       Nix flake (nixpkgs 26.05)
 Makefile        Entry point for builds and smoke tests
 ```
 
-Build outputs land under `out/` (gitignored). Signing keys under `keys/` are local-only; `make keys` creates test keys when needed.
+Build outputs land under `out/` (gitignored). Signing: the release **trust set**
+(`keys/release-keys.json` + the public keys it lists) is tracked and baked into the
+appliance and installer images, so every update and install verifies the release
+signature before trusting any hash. The private ceremony key lives only on the signing
+box; `make keys` still creates local test keys for development.
 
 ## Sign-in
 

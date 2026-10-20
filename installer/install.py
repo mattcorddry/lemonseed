@@ -21,7 +21,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+# The shared verifier ships next to the vendored pipeline on the ISO: web.nix
+# puts both the installer dir and the scripts dir on PYTHONPATH, so the
+# installer and the in-place updater never carry two verifiers (SIGNING.md §5).
+import lemonseed_verify
 from disks import list_candidate_disks
+from lemonseed_verify import VerificationError
 from preflight import require_host_ready
 
 ProgressFn = Callable[..., None]
@@ -351,7 +356,12 @@ def _urlopen(url: str, timeout: int = 60):
 
 
 def fetch_manifest(base: str) -> tuple[dict[str, Any], str]:
-    """Return (manifest, directory URL that contains the artifacts)."""
+    """Return (manifest, directory URL that contains the artifacts).
+
+    The detached signature is verified against the baked trust set before the
+    manifest is parsed, so its SHA-256 values are only ever trusted after the
+    root of trust holds (M8 P1). Fail-closed: no signature, no manifest.
+    """
     candidates = [
         base + "manifest.json",
         base + "latest/manifest.json",
@@ -360,14 +370,22 @@ def fetch_manifest(base: str) -> tuple[dict[str, Any], str]:
     for url in candidates:
         try:
             with _urlopen(url) as resp:
-                body = resp.read()
-                manifest = json.loads(body.decode("utf-8"))
-                dir_url = url.rsplit("/", 1)[0] + "/"
-                return manifest, dir_url
+                manifest_bytes = resp.read()
+            with _urlopen(url + ".sig") as resp:
+                sig_bytes = resp.read()
+            lemonseed_verify.verify_manifest(manifest_bytes, sig_bytes)
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
+            lemonseed_verify.check_signing_metadata(manifest)
+            dir_url = url.rsplit("/", 1)[0] + "/"
+            return manifest, dir_url
+        except VerificationError as exc:
+            # Wrap: the verifier's legible reason becomes the InstallError the
+            # installer's job/HTTP layers already surface.
+            errors.append(f"{url}: {exc}")
         except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError) as exc:
             errors.append(f"{url}: {exc}")
     raise InstallError(
-        "Could not download image manifest from lemonseed.ai. Tried:\n  " + "\n  ".join(errors)
+        "Could not download a signed image manifest. Tried:\n  " + "\n  ".join(errors)
     )
 
 
@@ -429,17 +447,29 @@ def copy_local(src: Path, dest: Path, expected_sha: str | None, label: str) -> N
 
 
 def load_local_manifest(directory: Path) -> dict[str, Any]:
+    """Load a local artifact-set manifest, verifying its signature first.
+
+    A directory with no manifest.json at all is an unsigned raw dev set (the
+    seed of P3's ``--dev``); the moment a manifest exists it must carry a
+    valid signature (D10).
+    """
     man = directory / "manifest.json"
-    if man.is_file():
-        return json.loads(man.read_text(encoding="utf-8"))
-    return {
-        "version": "local",
-        "artifacts": {
-            "vmlinuz": {"path": "vmlinuz"},
-            "root.squashfs": {"path": "root.squashfs"},
-            "initrd.img": {"path": "initrd.img"},
-        },
-    }
+    if not man.is_file():
+        return {
+            "version": "local",
+            "artifacts": {
+                "vmlinuz": {"path": "vmlinuz"},
+                "root.squashfs": {"path": "root.squashfs"},
+                "initrd.img": {"path": "initrd.img"},
+            },
+        }
+    try:
+        lemonseed_verify.verify_manifest_files(man)
+        manifest = json.loads(man.read_text(encoding="utf-8"))
+        lemonseed_verify.check_signing_metadata(manifest)
+    except VerificationError as exc:
+        raise InstallError(str(exc)) from exc
+    return manifest
 
 
 def artifact_relpath(manifest: dict[str, Any], key: str) -> tuple[str, str | None]:

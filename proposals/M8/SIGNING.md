@@ -1,0 +1,243 @@
+# M8 P1 — Signing root of trust (SIGNING.md)
+
+**Status: approved and implemented 2026-10-19.** Release key v1 was generated on the
+build/signing box after approval; the trust set (`keys/release-keys.json` +
+`keys/release-v1.pub`) is committed and baked into the appliance and installer images.
+This document is the design-gate deliverable required by `proposals/M8/PLAN.md` §P1. It
+covers the key ceremony, the modular signer interface, the verifier's trust model,
+rotation, and the threat model. Key **custody and escrow are decided and held
+privately**.
+
+---
+
+## 1. Threat model (what this buys, and what it does not)
+
+The appliance installs and updates over plain HTTP. Today, `manifest.json` and its
+SHA-256 values come from the same origin as the blobs, so the existing download +
+read-back hash chain proves **transfer integrity, not authenticity**: anyone on the path
+between the appliance and the release — or anyone with write access to the release
+channel — can serve a malicious `root.squashfs` that passes every check we run today.
+
+After P1:
+
+| Attacker | Outcome |
+|---|---|
+| On-path network attacker (HTTP) | **Defeated.** Cannot forge a signature over a poisoned manifest. |
+| Compromised release channel (GitHub write access) | **Contained.** Can publish releases and flip channel labels, but cannot produce a valid manifest signature. Worst case is selecting among *our* signed releases (downgrade/upgrade confusion), never arbitrary code. |
+| Compromised build box | **Not defended.** The signer holds the private key; whoever controls it can sign anything. Mitigated by the box being dedicated (D15) and the key being escrowed, not by this design. |
+
+Stated plainly, what signing does **not** buy: the session cookie is still a bearer
+token over HTTP (unchanged from §9); an active attacker can still rewrite the login
+page; and a stolen, already-unlocked box is P7's problem, not P1's.
+
+## 2. Root of trust: one signature, one key set
+
+- **D12 — only `manifest.json` is signed.** The detached ed25519 signature over the
+  manifest bytes is the single root of trust. Everything else — `vmlinuz`,
+  `root.squashfs`, `initrd.img`, and (from P2) the payload parts and the installer
+  image — is covered by SHA-256 values recorded *inside* the signed manifest.
+  `sign.sh` is therefore trimmed to signing the manifest alone (today it signs all four
+  artifacts); one root, not two.
+- **D13 — the trust set ships in the image.** The verifier trusts exactly the key set
+  baked into the running image — the read-only SquashFS and the installer image carry
+  the same files. Nothing is fetched at runtime. The keys are also published on
+  lemonseed.ai as out-of-band human confirmation, never as a trust source.
+- **Trust set is an explicit list, never a glob (decision 3).** The baked directory
+  carries a small JSON manifest, **`release-keys.json`, which is the authority**:
+
+  ```json
+  {
+    "version": 1,
+    "keys": [
+      {"version": 1, "algorithm": "ed25519", "file": "release-v1.pub"}
+    ]
+  }
+  ```
+
+  Top-level `version` is monotonically increasing so new > old is machine-comparable;
+  the `keys` list names each permitted key file explicitly (no wildcard expansion, no
+  directory scanning for keys). The key files sit alongside the JSON in the same
+  directory, named `release-v{N}.pub` — the version in the filename is a human
+  convenience only; **the JSON, not the filename, is authoritative**. The algorithm is
+  recorded per key in the JSON (`"algorithm": "ed25519"`), not in the filename: the
+  scheme is fixed for every key in this design, and a future algorithm change is a
+  JSON-schema evolution rather than a filename convention change. The trust set itself
+  is the root of trust and carries no signature — it is protected by the read-only
+  SquashFS it ships in. The manifest verifies if **any** listed key verifies it; that is
+  the entire rotation mechanism (§6).
+- **The repo stores the trust set the way the image does (decision 2).** `keys/`
+  carries the tracked `release-keys.json` plus one tracked `release-v{N}.pub` per key —
+  the same file pair the Nix module copies into the image. Public keys are not secrets;
+  committing them is what lets every build bake the identical trust set with no secret
+  in the tree. Private keys stay gitignored and live only on the signing box.
+
+### Verification order (fail-closed)
+
+The manifest is verified **before it is parsed for hashes**:
+
+```
+fetch manifest.json + manifest.json.sig
+  → verify signature against the baked trust set          (fail → hard refusal)
+  → parse manifest, treat its SHA-256 values as trusted    (D12's integrity chain)
+  → download artifacts/parts, stream-verify each hash
+  → write partition → read-back hash
+```
+
+The signature is over the exact manifest bytes fetched, computed before any JSON
+parsing. A manifest altered after signing (valid sig, different bytes) fails at the
+first step. A missing, malformed, truncated, or wrong-key signature is a hard refusal
+with a legible reason ("release signature does not verify — refusing"), never a
+warning, never a hash-only fallback (D10).
+
+## 3. Key ceremony (signing box)
+
+- One **long-lived ed25519 keypair**, generated **on** the dedicated CI/build/signing
+  box (D11, D15) by `scripts/gen-keys.sh` (extended to take an output directory and a
+  name, so release keys never collide with gitignored test keys).
+- The private key **never leaves the box** and is never committed. It is protected at
+  rest on the box (0600, owned by the signing user) and escrowed privately per D-escrow.
+- **The trust set is committed to the repo**: `keys/release-keys.json` and
+  `keys/release-v1.pub` (tracked). The same key is published on lemonseed.ai for
+  out-of-band comparison.
+- A **known-answer test vector** (fixed test key + fixed manifest bytes + signature,
+  committed under `scripts/test-data/`) pins the verifier's openssl invocation
+  against a third-party-computable answer, so a subtle flag or format regression cannot
+  ship silently.
+
+## 4. Signer interface (modular for a future hardware key)
+
+One entry point, one contract:
+
+```
+scripts/sign.sh <artifact-dir>    # signs <artifact-dir>/manifest.json in place
+```
+
+Environment switch selects the backend; the *interface* (dir in, `.sig` out, manifest
+metadata updated, exit 0 = signed) never changes:
+
+| `SIGN_MODE` (default `file`) | Backing | Key source |
+|---|---|---|
+| `file` | `openssl pkeyutl -sign -rawin` | `SIGN_KEY` (default `keys/release-v1.priv` — the ceremony key; the old gitignored `keys/ed25519.priv` test key still works via override) |
+| *(future)* `pkcs11` | openssl PKCS#11 engine (YubiKey tap-to-sign, D15) | PKCS#11 URI |
+
+Changes in this phase: sign **only** `manifest.json` (D12 — `vmlinuz`/`root.squashfs`/
+`initrd.img`/parts are covered by the manifest's hashes); write the sig as
+`manifest.json.sig`; update manifest metadata to
+`"signing": {"scheme": "detached-ed25519", "enabled": true, "public_key": "<basename>"}`
+and re-sign so the metadata is inside the signed bytes. `SIGN=1` through `package.sh`
+keeps working; an unsigned build (no key present) keeps building but emits the manifest
+with `"enabled": false`, and production consumers refuse it (§5).
+
+## 5. Verifier
+
+### Where it lives
+
+A single stdlib-only Python module, `scripts/lemonseed_verify.py`, imported by both
+consumers (the installer imports it from the vendored copy on the installer image; the
+updater runs it in place). One implementation, two callers — never two verifiers.
+
+### How it verifies (the dependency decision)
+
+Ed25519 is not in the Python stdlib, and grep confirms `openssl` is not currently in the
+appliance or installer Nix closures. Three options; **recommended: (a)**.
+
+- **(a) Subprocess `openssl pkeyutl -verify -rawin`** — mirrors the signer exactly,
+  ~15 lines, and the appliance already needs no new Python deps. Cost: `openssl`
+  (the `bin`, not just the `.so` most closures already carry) must be added to the
+  appliance and installer closures — a small, one-package addition via
+  `nixos/modules/`. The known-answer test (§3) pins the exact invocation.
+- **(b) Pure-Python Ed25519 verify (RFC 8032 reference port).** Zero new binaries;
+  ~200 lines of reviewed math. Cost: hand-rolled cryptography in the trust path, slower
+  (seconds per verify — fine for one manifest, but the cost is per-check).
+- **(c) `ssh-keygen -Y verify` with SSH-signature format.** ssh-keygen is plausibly
+  already present, and SSHSIG is a standard format. Cost: changes the signature format
+  away from what `sign.sh` produces today and couples the appliance verifier's behavior
+  to an external tool's CLI contract.
+
+### Trust set at runtime (decision 3)
+
+- The verifier reads the baked trust directory — `/usr/share/lemonseed/release-keys/`
+  in the appliance SquashFS and the equivalent path in the installer image, populated by
+  a new small Nix module (`nixos/modules/signing.nix`) that copies the committed
+  `keys/release-keys.json` and the `release-v*.pub` files it lists into the closure.
+  Both images get the identical file set.
+- **The verifier never globs.** It reads `release-keys.json`, and trusts exactly the
+  key files it lists, resolved against the baked directory. Missing directory, missing
+  or unparseable JSON, a listed file absent on disk, an unknown `algorithm`, an empty
+  key list, or a JSON whose top-level `version` is not an integer is a hard refusal —
+  fail-closed even to a broken build.
+- `--dev` (P3) is the *only* bypass: it skips verification entirely and is CLI-only;
+  the control plane's install path is always production-strict. Until P3 lands, the
+  P1 QEMU tests exercise both paths by baking either the test key or serving a flipped
+  byte — no env-var escape hatch is added in P1 (D10: no non-`--dev` path can reach an
+  apply unchecked, so the temptation of an undocumented bypass is not created).
+
+### Consumer wiring
+
+- `scripts/lemonseed_update.py` — `check` and `apply` both resolve a manifest; both
+  verify before parsing hashes. `status`/`cancel`/`--dir` local flows that read an
+  already-verified manifest are unchanged.
+- `installer/install.py` — identical wiring at its manifest fetch.
+- `scripts/package.sh` — records the `signing` block (§4); `manifest.json.sig` joins
+  the HTTP-ready layout alongside `manifest.json` (DESIGN §8 layout gains
+  `manifest.json.sig` as *required-when-enabled* rather than optional).
+
+## 6. Rotation (designed, not exercised — D13)
+
+Trust set = keys baked into the **running** image. Rotation:
+
+1. Generate a new keypair on the signing box; commit the new public key alongside the
+   old one (trust set grows to 2).
+2. Build the *transition* image: it embeds both keys, is signed with the **old** key
+   (the running fleet trusts it), and its verifier accepts either key.
+3. Subsequent releases sign with the new key; old-key images update fine during the
+   overlap window (any trusted key verifies).
+4. Retire the old key by shipping an image whose baked set no longer contains it.
+
+The mechanism ships as design only — no second key is generated now. The first real
+rotation drills the process; this document is amended with the runbook at that point.
+
+## 7. What P1 changes (file inventory)
+
+| File | Change |
+|---|---|
+| `scripts/lemonseed_verify.py` | **new** — the verifier (§5) |
+| `scripts/sign.sh` | manifest-only signing; metadata scheme; `SIGN_MODE` seam |
+| `scripts/gen-keys.sh` | output dir/name args; refuse to overwrite |
+| `scripts/test_lemonseed_update.py` | verifier unit tests (§8) |
+| `scripts/lemonseed_update.py` | verify-before-parse in `check`/`apply` |
+| `installer/install.py` | same wiring |
+| `scripts/package.sh` | `signing.enabled = true` when signed |
+| `nixos/modules/signing.nix` + `configuration.nix` / installer profile | bake the trust set (§5) |
+| `nixos/modules/{control-plane,lemond}.nix` (or base env) | add `openssl` bin to the closures (decision 1) |
+| `keys/release-keys.json` + `keys/release-v1.pub` | **new** — the committed trust set (decision 2) |
+| `scripts/test-data/` | known-answer vector |
+| `DESIGN.md` §8/§9 | signing as built; GH-compromise posture |
+
+## 8. Tests → gate (from PLAN.md P1, made concrete)
+
+1. Verifier unit tests: good signature; wrong key; missing `.sig`; tampered manifest
+   byte; valid-sig-but-altered-manifest (re-signed-then-edited); truncated sig; empty
+   trust set; trust set with multiple keys (any-key-accepts).
+2. Known-answer test against the committed fixed vector.
+3. Fail-closed assertions: every production path refuses unsigned/invalid; no
+   non-`--dev` path reaches an apply (asserted by inspecting the call graph in test).
+4. QEMU: updater against a locally served, correctly signed artifact set (passes) and
+   the same set with a flipped payload byte (refuses with the legible reason).
+
+**Gate:** `make test` + QEMU green; shipped manifest carries
+`"signing": {"enabled": true}`; the image contains the public key; QEMU shows both the
+pass and refuse paths. **Key ceremony doc approved before key generation.**
+
+## 9. Decisions (approved 2026-10-19)
+
+1. **Verifier dependency — option (a), subprocess `openssl pkeyutl -verify`.
+   Chosen for the path to more advanced signature methods: the same openssl-subprocess
+   seam later carries PKCS#11 / hardware-key verification without touching the callers
+   (mirrors §4's signer seam).
+2. **The repo stores public keys**, arranged exactly as the image stores them:
+   `keys/release-keys.json` plus one `release-v{N}.pub` per key. The algorithm lives in
+   the JSON (`"algorithm": "ed25519"`), not the filename.
+3. **No wildcard globs at runtime.** The baked `release-keys.json` lists each permitted
+   key explicitly and carries the monotonically increasing set version; the JSON is the
+   authority, filenames are human convenience.

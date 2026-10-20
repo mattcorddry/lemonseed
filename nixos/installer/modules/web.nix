@@ -4,12 +4,20 @@
 
 let
   installerRoot = ../../../installer;
+  # The verifier ships beside the vendored pipeline on the ISO: both dirs go on
+  # PYTHONPATH so the installer and the in-place updater share one verifier
+  # (SIGNING.md §5 — one implementation, two callers, never two).
+  scriptsRoot = ../../../scripts;
+  # The trust set baked into the ISO (M8 P1): release-keys.json plus the key
+  # files it lists. Nothing is fetched at runtime; the ISO carries it.
+  releaseKeys = import ../../packages/release-keys.nix { inherit pkgs; keysDir = ../../../keys; };
   pythonEnv = pkgs.python3;
 
   lemonseedInstaller = pkgs.writeShellApplication {
     name = "lemonseed-installer";
     runtimeInputs = with pkgs; [
       pythonEnv
+      openssl
       iproute2
       util-linux
       systemd
@@ -27,9 +35,10 @@ let
       cacert
     ];
     text = ''
-      export PYTHONPATH=${installerRoot}
+      export PYTHONPATH=${installerRoot}:${scriptsRoot}
       export LEMONSEED_ROOT=/etc/lemonseed
       export LEMONSEED_REPART_DIR=/var/lib/lemonseed/repart.d
+      export LEMONSEED_RELEASE_KEYS_DIR=${releaseKeys}
       export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
       cd ${installerRoot}
       exec ${pythonEnv}/bin/python3 ${installerRoot}/server.py
@@ -59,6 +68,7 @@ in
     path = with pkgs; [
       bash
       pythonEnv
+      openssl
       systemd
       util-linux
       dosfstools
@@ -85,6 +95,7 @@ in
         "LEMONSEED_IMAGE_BASE_URL=http://test.lemonseed.ai/releases/stable/"
         "LEMONSEED_ROOT=/etc/lemonseed"
         "LEMONSEED_REPART_DIR=/var/lib/lemonseed/repart.d"
+        "LEMONSEED_RELEASE_KEYS_DIR=${releaseKeys}"
         "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
       ];
     };

@@ -2,9 +2,16 @@
 # Loopback smoke test for A/B updater: seed slot A, apply to B, verify grubenv
 # and post-write hashes. Does not boot QEMU (fast CI/lab check).
 #
+# Runs as the invoking user; sudo is invoked narrowly, per command, for the
+# block-device operations (losetup/partx/mkfs/mount/dd) and for the updater
+# apply itself — which is realistic, because the packaged updater runs as root.
+#
 # Usage:
-#   sudo scripts/update-smoke-test.sh
-#   sudo scripts/update-smoke-test.sh --keep
+#   scripts/update-smoke-test.sh
+#   scripts/update-smoke-test.sh --keep
+#
+# Host requirements (Ubuntu): systemd-repart, dosfstools, util-linux, python3,
+# openssl. sudo must be passwordless or will prompt once.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,41 +37,90 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "${EUID}" -ne 0 ]]; then
-  echo "update-smoke-test: run as root (sudo)" >&2
+# Non-root run by design; sudo is invoked per command below. Fail fast when a
+# password would be prompted for, so a CI run never hangs on a prompt.
+if [[ "${EUID}" -ne 0 ]] && ! sudo -n true 2>/dev/null; then
+  echo "update-smoke-test: passwordless sudo required (block-device ops only)" >&2
   exit 1
 fi
 
-export PATH="/nix/var/nix/profiles/default/bin:${PATH}"
+for tool in systemd-repart mkfs.vfat losetup partx blockdev udevadm; do
+  if ! command -v "${tool}" >/dev/null 2>&1; then
+    echo "update-smoke-test: missing host tool: ${tool}" >&2
+    exit 1
+  fi
+done
+
 export PYTHONPATH="${ROOT}/scripts"
+# The updater verifies release signatures against the baked trust set (M8 P1).
+# The smoke signs its local artifact sets against the tracked QEMU-only trust
+# set (private key tracked on purpose; never a release key).
+export LEMONSEED_RELEASE_KEYS_DIR="${ROOT}/keys/qemu"
+# The packaged updater exports this (nixos/packages/lemonseed-update.nix); the
+# smoke needs the same template or the arm step refuses.
+export LEMONSEED_GRUB_CFG="${ROOT}/boot/grub.cfg"
+export LEMONSEED_AB="${ROOT}/scripts/lemonseed-ab.sh"
+
+# Env the root-spawned updater stages need (the packaged updater exports these;
+# the smoke reproduces that environment explicitly).
+SUDO_ENV=(
+  env "PATH=${PATH}" "PYTHONPATH=${PYTHONPATH}"
+  "LEMONSEED_AB=${LEMONSEED_AB}" "LEMONSEED_RELEASE_KEYS_DIR=${LEMONSEED_RELEASE_KEYS_DIR}"
+  "LEMONSEED_GRUB_CFG=${LEMONSEED_GRUB_CFG}"
+)
+
+sign_manifest() {  # sign_manifest <dir> — add signing metadata, sign in place
+  python3 - "$1" "${ROOT}/keys/qemu/qemu-release-v1.priv" <<'PYSIGN'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+d = Path(sys.argv[1])
+priv = Path(sys.argv[2])
+mp = d / "manifest.json"
+manifest = json.loads(mp.read_text(encoding="utf-8"))
+manifest["signing"] = {
+    "scheme": "detached-ed25519",
+    "enabled": True,
+    "public_key": "qemu-release-v1.pub",
+}
+mp.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+subprocess.run(
+    ["openssl", "pkeyutl", "-sign", "-inkey", str(priv), "-rawin",
+     "-in", str(mp), "-out", str(mp) + ".sig"],
+    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+)
+print("signed", mp)
+PYSIGN
+}
 
 detach_image_loops() {
   local img="$1"
   local loops loop
   [[ -e "${img}" ]] || return 0
-  loops="$(losetup -j "${img}" -n -O NAME 2>/dev/null || true)"
+  loops="$(sudo losetup -j "${img}" -n -O NAME 2>/dev/null || true)"
   [[ -n "${loops}" ]] || return 0
   while IFS= read -r loop; do
     [[ -n "${loop}" ]] || continue
-    if command -v partx >/dev/null; then
-      partx -d "${loop}" 2>/dev/null || true
-    fi
-    losetup -d "${loop}" 2>/dev/null || true
+    sudo partx -d "${loop}" 2>/dev/null || true
+    sudo losetup -d "${loop}" 2>/dev/null || true
   done <<<"${loops}"
 }
 
 cleanup() {
   if [[ -n "${LOOP}" ]]; then
-    if command -v partx >/dev/null; then
-      partx -d "${LOOP}" 2>/dev/null || true
-    fi
-    losetup -d "${LOOP}" 2>/dev/null || true
+    sudo partx -d "${LOOP}" 2>/dev/null || true
+    sudo losetup -d "${LOOP}" 2>/dev/null || true
     LOOP=""
   fi
   detach_image_loops "${IMAGE}"
   if [[ "${KEEP}" -eq 0 ]]; then
-    rm -rf "${WORKDIR}"
-    rm -f "${IMAGE}"
+    # Root-owned debris (updater download dir, arm-time records) needs root.
+    sudo rm -rf "${WORKDIR}"
+    sudo rm -f "${IMAGE}"
+  else
+    sudo chown -R "$(id -u):$(id -g)" "${WORKDIR}" "${IMAGE}" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -81,14 +137,9 @@ truncate -s 20G "${IMAGE}"
 detach_image_loops "${IMAGE}"
 
 echo "==> applying GPT layout"
-if command -v systemd-repart >/dev/null; then
-  systemd-repart --empty=force --dry-run=no --definitions="${ROOT}/out/repart.d" "${IMAGE}"
-else
-  nix-shell -p systemd dosfstools util-linux --run \
-    "systemd-repart --empty=force --dry-run=no --definitions=$(printf '%q' "${ROOT}/out/repart.d") $(printf '%q' "${IMAGE}")"
-fi
+systemd-repart --empty=force --dry-run=no --definitions="${ROOT}/out/repart.d" "${IMAGE}"
 
-LOOP="$(losetup -f --show -P "${IMAGE}")"
+LOOP="$(sudo losetup -f --show -P "${IMAGE}")"
 udevadm settle -t 10 2>/dev/null || true
 # Wait for partition nodes.
 n=0
@@ -106,10 +157,10 @@ done
 ESP="${LOOP}p1"
 ROOT_A="${LOOP}p2"
 ROOT_B="${LOOP}p3"
-mkdir -p /dev/disk/by-partlabel
-ln -sfn "${ESP}" /dev/disk/by-partlabel/ESP
-ln -sfn "${ROOT_A}" /dev/disk/by-partlabel/root-a
-ln -sfn "${ROOT_B}" /dev/disk/by-partlabel/root-b
+sudo mkdir -p /dev/disk/by-partlabel
+sudo ln -sfn "${ESP}" /dev/disk/by-partlabel/ESP
+sudo ln -sfn "${ROOT_A}" /dev/disk/by-partlabel/root-a
+sudo ln -sfn "${ROOT_B}" /dev/disk/by-partlabel/root-b
 
 # Fake artifacts sized well under 4G.
 python3 - "${WORKDIR}/artifacts" <<'PY'
@@ -132,17 +183,20 @@ for name, body in files.items():
 (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 print("wrote artifacts", root)
 PY
+sign_manifest "${WORKDIR}/artifacts"
 
 echo "==> seeding slot A + ESP"
-dd if="${WORKDIR}/artifacts/root.squashfs" of="${ROOT_A}" bs=4M status=none conv=fsync
-mkfs.vfat -F 32 -n ESP "${ESP}" >/dev/null
-mount -t vfat -o rw,umask=0077 "${ESP}" "${WORKDIR}/esp"
+sudo dd if="${WORKDIR}/artifacts/root.squashfs" of="${ROOT_A}" bs=4M status=none conv=fsync
+sudo mkfs.vfat -F 32 -n ESP "${ESP}" >/dev/null
+# umask=000: the ESP is a loop-backed test fixture, so the unprivileged file
+# operations below (cp, lemonseed-ab) need no sudo of their own.
+sudo mount -t vfat -o rw,umask=000 "${ESP}" "${WORKDIR}/esp"
 mkdir -p "${WORKDIR}/esp/EFI/lemonseed" "${WORKDIR}/esp/grub"
 cp "${ROOT}/boot/grub.cfg" "${WORKDIR}/esp/grub/grub.cfg"
 cp "${WORKDIR}/artifacts/vmlinuz" "${WORKDIR}/esp/EFI/lemonseed/vmlinuz-a"
 cp "${WORKDIR}/artifacts/initrd.img" "${WORKDIR}/esp/EFI/lemonseed/initrd-a.img"
 bash "${ROOT}/scripts/lemonseed-ab.sh" init --esp "${WORKDIR}/esp"
-umount "${WORKDIR}/esp"
+sudo umount "${WORKDIR}/esp"
 
 # Build B artifacts with different content.
 python3 - "${WORKDIR}/artifacts-b" <<'PY'
@@ -164,13 +218,14 @@ for name, body in files.items():
     }
 (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 PY
+sign_manifest "${WORKDIR}/artifacts-b"
 
-export LEMONSEED_AB="${ROOT}/scripts/lemonseed-ab.sh"
 # Pretend we are running on slot A.
 export LEMONSEED_DOWNLOAD_DIR="${WORKDIR}/dl"
-# lemonseed-update reads cmdline; inject via a wrapper env by patching detect:
-# For smoke we call Python APIs directly with mocked current_slot.
-python3 - "${WORKDIR}/artifacts-b" <<'PY'
+# The apply writes the inactive slot partition and the ESP — exactly the
+# privileged operations the packaged updater performs as root in production,
+# so the updater stages run under sudo with the environment it expects.
+sudo "${SUDO_ENV[@]}" python3 - "${WORKDIR}/artifacts-b" <<'PY'
 import os, sys
 from pathlib import Path
 from unittest import mock
@@ -182,16 +237,13 @@ arts = Path(sys.argv[1])
 with mock.patch.object(update, "current_slot", return_value="a"), mock.patch.object(
     update, "cmdline_slot", return_value="a"
 ):
-    # Point AB helper at the repo script (no wrap).
-    update.AB_HELPER = os.environ["LEMONSEED_AB"]
-    # ensure_esp_mounted uses PARTLABEL=ESP which we linked.
     rc = update.cmd_apply(None, str(arts), reboot=False, force=False)
     assert rc == 0, rc
 print("apply ok")
 PY
 
 # Verify B contents and grubenv.
-B_HASH="$(python3 - "${WORKDIR}/artifacts-b/root.squashfs" "${ROOT_B}" <<'PY'
+B_HASH="$(sudo python3 - "${WORKDIR}/artifacts-b/root.squashfs" "${ROOT_B}" <<'PY'
 import hashlib, sys
 from pathlib import Path
 src = Path(sys.argv[1]).read_bytes()
@@ -204,7 +256,7 @@ PY
 )"
 echo "root-b hash ${B_HASH}"
 
-mount -t vfat -o rw,umask=0077 "${ESP}" "${WORKDIR}/esp"
+sudo mount -t vfat -o rw,umask=000 "${ESP}" "${WORKDIR}/esp"
 STATUS="$(bash "${ROOT}/scripts/lemonseed-ab.sh" status --esp "${WORKDIR}/esp")"
 echo "${STATUS}"
 echo "${STATUS}" | grep -q 'boot_default=a'
@@ -221,7 +273,7 @@ if echo "${STATUS2}" | grep -q 'boot_once=b'; then
   echo "FAIL: boot_once still set after clear-once" >&2
   exit 1
 fi
-umount "${WORKDIR}/esp"
+sudo umount "${WORKDIR}/esp"
 
 # Checksum mismatch refusal.
 python3 - "${WORKDIR}/artifacts-bad" <<'PY'
@@ -232,25 +284,22 @@ root.mkdir(parents=True, exist_ok=True)
 (root / "vmlinuz").write_bytes(b"k")
 (root / "initrd.img").write_bytes(b"i")
 (root / "root.squashfs").write_bytes(b"bad-squash")
-(root / "manifest.json").write_text(
-    json.dumps(
-        {
-            "version": "bad",
-            "artifacts": {
-                "vmlinuz": {"path": "vmlinuz", "sha256": "11" * 32},
-                "initrd.img": {"path": "initrd.img", "sha256": hashlib.sha256(b"i").hexdigest()},
-                "root.squashfs": {
-                    "path": "root.squashfs",
-                    "sha256": hashlib.sha256(b"bad-squash").hexdigest(),
-                },
-            },
-        }
-    ),
-    encoding="utf-8",
-)
+manifest = {
+    "version": "bad",
+    "artifacts": {
+        "vmlinuz": {"path": "vmlinuz", "sha256": "11" * 32},
+        "initrd.img": {"path": "initrd.img", "sha256": hashlib.sha256(b"i").hexdigest()},
+        "root.squashfs": {
+            "path": "root.squashfs",
+            "sha256": hashlib.sha256(b"bad-squash").hexdigest(),
+        },
+    },
+}
+(root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 PY
+sign_manifest "${WORKDIR}/artifacts-bad"
 
-if python3 - "${WORKDIR}/artifacts-bad" <<'PY'
+if sudo "${SUDO_ENV[@]}" python3 - "${WORKDIR}/artifacts-bad" <<'PY'
 import os, sys
 from unittest import mock
 sys.path.insert(0, os.environ["PYTHONPATH"])

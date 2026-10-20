@@ -556,15 +556,51 @@ out/appliance-<version>/
 Distribution may later wrap this as a tarball or serve discrete objects; the layout stays the same either way. Current release channel: `http://test.lemonseed.ai/releases/stable/` (`IMAGE_BASE_DEFAULT` in `scripts/lemonseed_artifacts.py` and `installer/install.py`, which must agree). It is an **internal-network origin record over plain HTTP**, deliberately: the public `lemonseed.ai` name sits behind Cloudflare, whose terms prohibit serving large objects through the proxy, and a ~3 GB `root.squashfs` cannot go through it. Two consequences worth stating: a LAN-resident attacker can poison `test.lemonseed.ai` and serve a malicious image, because the manifest's SHA-256 values come from the same origin and **no signature is verified** (see "Signing"), so signing is what makes this channel trustworthy rather than merely consistent; and an appliance on a network without that DNS record simply cannot update. The channel moves to **GitHub releases** in M8: whatever the portal/updater end up doing must work against GitHub release asset downloads. Note that this layout does **not** map one-to-one onto release assets — GitHub caps each asset under 2 GiB, so `root.squashfs` has to ship as ordered parts. See the GitHub-releases backlog entry in §11 for the manifest-and-chunks design.
 
 ### Signing
-- **Detached signatures** over artifacts (and/or a manifest listing hashes); `scripts/sign.sh`, keys from `scripts/gen-keys.sh`.
-- Signing is **disabled by default** with local test keys (gitignored); release keys come later. Secure Boot / TPM are explicit follow-ons.
-- **As built, nothing verifies a signature.** `sign.sh` writes `.sig` files and
-  `package.sh` records `"signing": {"scheme": "detached-ed25519", "enabled": false}` in the
-  manifest, but no code in `scripts/`, `installer/`, `control-plane/` or `nixos/` reads a
-  `.sig` and no public key ships in the image. The updater's SHA-256 checks (per artifact,
-  stream-verified during download, plus a post-write read-back of the partition) come from
-  the same origin as the blobs, so they prove **transfer integrity, not authenticity**.
-  Writing and wiring the verifier is M8's first job, not a formality.
+- **As built (M8 P1):** the root of trust is a **detached ed25519 signature over
+  `manifest.json` alone** (D12) — every artifact, part and installer-image hash lives
+  inside the signed bytes, so one signature covers the whole release. `scripts/sign.sh`
+  signs only the manifest and records
+  `"signing": {"scheme": "detached-ed25519", "enabled": true, "public_key": …}` inside
+  the signed metadata; `SIGN=1 make build-*` signs, unsigned builds keep `enabled: false`
+  and are refused by every production consumer. `SIGN_MODE` is the backend seam
+  (`file` today; PKCS#11/hardware tap-to-sign reserved, D15) — the interface never
+  changes.
+- **The verifier is one module, two callers:** `scripts/lemonseed_verify.py`, imported by
+  `scripts/lemonseed_update.py` (`check`/`apply`) and the installer's vendored pipeline
+  (`installer/install.py`). Verification is **verify-before-parse**: the detached
+  signature is checked against the baked trust set *before* the manifest is parsed, so
+  its SHA-256 values become trustworthy only after the root of trust holds. A missing,
+  empty, malformed, wrong-key or altered-manifest signature is a hard refusal with a
+  legible reason — never a warning, never a hash-only fallback (D10). P3's `--dev` will
+  be the only bypass, and it is CLI-only. The backend is a subprocess
+  `openssl pkeyutl -verify -rawin` — the signer's primitive, so the seam can carry
+  PKCS#11 verification later without touching a caller (`openssl` the binary is now in
+  the appliance, installer and updater closures).
+- **The trust set ships in the image (D13):** a baked `release-keys.json` — the
+  authority, carrying a monotonically increasing set `version` and an explicit key list
+  with a per-key `algorithm` — plus the key files it lists, at
+  `/usr/share/lemonseed/release-keys/` (via `nixos/packages/release-keys.nix`, copied
+  explicitly: no globs anywhere). The repo stores the same pair
+  (`keys/release-keys.json` + tracked `release-v*.pub`) and the same file pair is
+  published on lemonseed.ai for out-of-band human comparison, never fetched at runtime.
+  An empty, malformed or keyless trust set refuses — fail-closed even to a broken build.
+- **Key ceremony:** one long-lived ed25519 keypair generated on the dedicated
+  CI/build/signing box (`scripts/gen-keys.sh --name release-v1`); the private key never
+  leaves the box and is escrowed privately (details deliberately not in the repo). The
+  public key is committed and published. Rotation is **designed, not exercised** (D13):
+  a transition image signed by the old key embeds the new key; the verifier accepts any
+  key in the baked set during the overlap window.
+- **GH-compromise posture:** an attacker with GitHub write access can publish releases
+  and flip channel labels, but cannot produce a valid manifest signature. Worst case is
+  selecting among *our* signed releases (downgrade/upgrade confusion), never arbitrary
+  code. A compromised build box, however, can sign anything — that is mitigated by the
+  box being dedicated and the key escrowed, not by this design.
+- **QEMU validation:** `make test-qemu` runs a signing smoke (`lemonseed-signing-smoke`
+  in the QEMU profile, against the tracked QEMU-only trust set in `keys/qemu/`) that
+  verifies a correctly signed set, refuses a flipped payload byte at the hash check,
+  and refuses an altered manifest at the signature — asserted on the serial log.
+  `scripts/test-data/signing/` pins the openssl invocation with a committed
+  known-answer vector.
 
 ### QEMU validation
 - `make run-qemu` boots kernel + SquashFS + serial console.
@@ -577,7 +613,7 @@ Distribution may later wrap this as a tarball or serve discrete objects; the lay
 
 | Layer | Approach |
 |-------|----------|
-| Transport / update authenticity | HTTP + **detached signatures** on artifacts (signing optional until release keys exist); TLS deliberately absent on the LAN |
+| Transport / update authenticity | HTTP + **detached ed25519 over `manifest.json`**, verified fail-closed against the baked trust set before any hash is trusted (M8 P1); TLS deliberately absent on the LAN |
 | Root filesystem | Read-only SquashFS; no overlay |
 | Mutable state | Minimal btrfs binds; restrictive mount flags |
 | Edge auth | **CP-native login** at the nginx boundary: signed stateless session cookie, `auth_request` → CP, identity via `X-Forwarded-*` set **only** from the verify response. Modules stay auth-naive; OWUI's own login is disabled |
@@ -698,7 +734,7 @@ Moved to [BACKLOG](BACKLOG.md)
 | Builds | Local; flakes; `build-production` / `build-qemu` / `run-qemu` / `qemu-clean` |
 | Version | Date + local counter; `VERSION` override |
 | Partition config | YAML source (`partitions.yaml`) → `gen-repart.py` → systemd-repart as apply engine |
-| Signing | Layout ready; detached sigs; optional/local keys for now |
+| Signing | **M8 P1 (as built):** detached ed25519 over `manifest.json` alone (D12); verifier `scripts/lemonseed_verify.py` shared by the updater and the installer, fail-closed, verify-before-parse; trust set = baked `release-keys.json` + listed keys, no globs (D13); openssl subprocess backend, modular for PKCS#11 (D15); `--dev` (P3) the only bypass. Rotation designed, not exercised. |
 | Distribution | HTTP; versioned artifact directory |
 | Installer | M4; partitions + optional admin lockout reset marker; no auth work for fresh installs; reinstall releases LVM/DM |
 | Encryption | Deferred; TPM + GRUB password planned together with closing the bring-up root login |

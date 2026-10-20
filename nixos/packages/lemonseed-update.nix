@@ -8,6 +8,11 @@
 let
   abHelper = import ./lemonseed-ab.nix { inherit pkgs lib; };
 
+  # The trust set baked into this image (M8 P1): release-keys.json plus the
+  # key files it lists, copied explicitly. The verifier reads it from here;
+  # the store path ships inside the SquashFS, so nothing is fetched at runtime.
+  releaseKeys = import ./release-keys.nix { inherit pkgs lib; keysDir = ../../keys; };
+
   # The ESP grub.cfg template the updater refreshes on every update. Staged
   # from the same boot/grub.cfg the control-plane image stages, because no
   # nixos module created either candidate path on the *installed* system —
@@ -24,6 +29,7 @@ pkgs.writeShellApplication {
   name = "lemonseed-update";
   runtimeInputs = with pkgs; [
     python3
+    openssl
     coreutils
     util-linux
     systemd
@@ -38,6 +44,9 @@ pkgs.writeShellApplication {
   text = ''
     export PYTHONPATH=${../../scripts}
     export LEMONSEED_AB=${abHelper}/bin/lemonseed-ab
+    # The baked trust set: the updater verifies release signatures against
+    # exactly these keys before it trusts a manifest hash (M8 P1, D10/D13).
+    export LEMONSEED_RELEASE_KEYS_DIR=${releaseKeys}
     export LEMONSEED_DOWNLOAD_DIR="''${LEMONSEED_DOWNLOAD_DIR:-/var/lib/lemonseed/download}"
     # The template path is exported with a fallback so a CP-spawned update
     # (which inherits the CP environment) and a CLI/systemd update (which

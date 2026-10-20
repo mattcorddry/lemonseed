@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,34 @@ sys.path.insert(0, str(SCRIPTS))
 
 import lemonseed_artifacts as artifacts  # noqa: E402
 import lemonseed_update as update  # noqa: E402
+
+# The smoke trust set shipped in-tree: its private key is tracked (QEMU-only,
+# never a release key), so unit tests and root smoke tests can sign local
+# artifact sets against it. The verifier is pointed at it before any test
+# fetches a manifest.
+SMOKE_KEYS = Path(__file__).resolve().parents[1] / "keys" / "qemu"
+SMOKE_PRIV = SMOKE_KEYS / "qemu-release-v1.priv"
+os.environ.setdefault("LEMONSEED_RELEASE_KEYS_DIR", str(SMOKE_KEYS))
+
+
+def write_signed_manifest(directory: Path, manifest: dict) -> None:
+    """Write manifest.json with the signing metadata, then sign in place —
+    exactly what the shipped sets look like after scripts/sign.sh."""
+    manifest = dict(manifest)
+    manifest["signing"] = {
+        "scheme": "detached-ed25519",
+        "enabled": True,
+        "public_key": "qemu-release-v1.pub",
+    }
+    (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    subprocess.run(
+        [
+            "openssl", "pkeyutl", "-sign", "-inkey", str(SMOKE_PRIV), "-rawin",
+            "-in", str(directory / "manifest.json"),
+            "-out", str(directory / "manifest.json.sig"),
+        ],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
 
 
 class ArtifactTests(unittest.TestCase):
@@ -51,7 +80,7 @@ class ArtifactTests(unittest.TestCase):
                     "path": name,
                     "sha256": hashlib.sha256(body).hexdigest(),
                 }
-            (src / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            write_signed_manifest(src, manifest)
             got, version, _ = artifacts.acquire_artifacts(
                 download_dir=dest,
                 directory=str(src),
@@ -59,6 +88,23 @@ class ArtifactTests(unittest.TestCase):
             self.assertEqual(version, "test.01")
             for name in files:
                 self.assertTrue(got[name].is_file())
+
+    def test_acquire_local_manifest_requires_signature(self) -> None:
+        """A local set whose manifest exists but is unsigned is refused —
+        there is no hash-only path (M8 P1, D10)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src"
+            dest = Path(tmp) / "dl"
+            src.mkdir()
+            (src / "vmlinuz").write_bytes(b"kernel-bytes")
+            (src / "initrd.img").write_bytes(b"initrd-bytes")
+            (src / "root.squashfs").write_bytes(b"squash-bytes")
+            (src / "manifest.json").write_text(
+                json.dumps({"version": "test.01", "artifacts": {}}), encoding="utf-8"
+            )
+            with self.assertRaises(artifacts.ArtifactError) as ctx:
+                artifacts.acquire_artifacts(download_dir=dest, directory=str(src))
+            self.assertIn("signature", str(ctx.exception))
 
     def test_acquire_rejects_bad_checksum(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -68,25 +114,21 @@ class ArtifactTests(unittest.TestCase):
             (src / "vmlinuz").write_bytes(b"kernel")
             (src / "initrd.img").write_bytes(b"initrd")
             (src / "root.squashfs").write_bytes(b"squash")
-            (src / "manifest.json").write_text(
-                json.dumps(
-                    {
-                        "version": "bad",
-                        "artifacts": {
-                            "vmlinuz": {"path": "vmlinuz", "sha256": "00" * 32},
-                            "initrd.img": {
-                                "path": "initrd.img",
-                                "sha256": hashlib.sha256(b"initrd").hexdigest(),
-                            },
-                            "root.squashfs": {
-                                "path": "root.squashfs",
-                                "sha256": hashlib.sha256(b"squash").hexdigest(),
-                            },
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
+            manifest = {
+                "version": "bad",
+                "artifacts": {
+                    "vmlinuz": {"path": "vmlinuz", "sha256": "00" * 32},
+                    "initrd.img": {
+                        "path": "initrd.img",
+                        "sha256": hashlib.sha256(b"initrd").hexdigest(),
+                    },
+                    "root.squashfs": {
+                        "path": "root.squashfs",
+                        "sha256": hashlib.sha256(b"squash").hexdigest(),
+                    },
+                },
+            }
+            write_signed_manifest(src, manifest)
             with self.assertRaises(artifacts.ArtifactError):
                 artifacts.acquire_artifacts(download_dir=dest, directory=str(src))
 
@@ -110,7 +152,7 @@ class ArtifactTests(unittest.TestCase):
             (src / "vmlinuz").write_bytes(b"kernel")
             (src / "initrd.img").write_bytes(b"initrd")
             (src / "root.squashfs").write_bytes(body)
-            (src / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            write_signed_manifest(src, manifest)
             err = io.StringIO()
             # Slot plumbing is mocked so the assertion stays on the checksum:
             # the failure must come from the artifact, not the A/B preflight.
@@ -207,7 +249,7 @@ class UpdateApplyTests(unittest.TestCase):
                     "path": name,
                     "sha256": hashlib.sha256(body).hexdigest(),
                 }
-            (arts / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            write_signed_manifest(arts, manifest)
 
             root_a = root / "root-a"
             root_b = root / "root-b"

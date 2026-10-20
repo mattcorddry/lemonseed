@@ -49,6 +49,13 @@ framework (M9). All remain in `BACKLOG.md`.
 
 ## P1 — Signing root of trust
 
+**Status: shipped 2026-10-19.** `SIGNING.md` approved with its three decisions
+resolved; release key v1 generated on the build/signing box; `make test` green,
+`make lint` clean, `QEMU_API_TIMEOUT=1200 make test-qemu` PASSED including the new
+signing smoke (signed set verifies; flipped payload byte refused at the hash check;
+altered manifest refused at the signature). Design record:
+[`SIGNING.md`](./SIGNING.md).
+
 ### Problem
 
 `DESIGN.md` §8 states it plainly: *"As built, nothing verifies a signature. Writing and
@@ -100,8 +107,7 @@ malicious `root.squashfs` that passes every check we run today.
 
 **Design-gate deliverable:** `proposals/M8/SIGNING.md` — key generation, the modular
 signer interface, rotation, and the threat model. Key **custody and escrow are decided
-and held privately** (1Password plus a physical printout in a fireproof safe) and are
-deliberately *not* documented in the public repo; `SIGNING.md` records only that escrow
+and held privately**; `SIGNING.md` records only that escrow
 exists (D-escrow). The key is generated only after this is approved; generating it
 first is a one-way door.
 

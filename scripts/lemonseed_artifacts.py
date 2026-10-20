@@ -14,6 +14,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import lemonseed_verify
+from lemonseed_verify import VerificationError
+
 ProgressFn = Callable[..., None]
 
 # Internal-network channel only. `lemonseed.ai` sits behind Cloudflare, which
@@ -93,6 +96,13 @@ def _urlopen(url: str, timeout: int = 60):
 
 
 def fetch_manifest(base: str) -> tuple[dict[str, Any], str]:
+    """Fetch manifest.json + its detached signature, verifying before parsing.
+
+    The signature is checked against the baked trust set *before* the manifest
+    is parsed, so its SHA-256 values become trustworthy only after the root of
+    trust holds (M8 P1). A missing, malformed or wrong-key signature refuses
+    the release with the verifier's legible reason.
+    """
     candidates = [
         base + "manifest.json",
         base + "latest/manifest.json",
@@ -101,10 +111,18 @@ def fetch_manifest(base: str) -> tuple[dict[str, Any], str]:
     for url in candidates:
         try:
             with _urlopen(url) as resp:
-                body = resp.read()
-                manifest = json.loads(body.decode("utf-8"))
-                dir_url = url.rsplit("/", 1)[0] + "/"
-                return manifest, dir_url
+                manifest_bytes = resp.read()
+            with _urlopen(url + ".sig") as resp:
+                sig_bytes = resp.read()
+            lemonseed_verify.verify_manifest(manifest_bytes, sig_bytes)
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
+            lemonseed_verify.check_signing_metadata(manifest)
+            dir_url = url.rsplit("/", 1)[0] + "/"
+            return manifest, dir_url
+        except VerificationError as exc:
+            # Wrap: the verifier's legible reason becomes the boundary error
+            # every caller already knows how to surface.
+            errors.append(f"{url}: {exc}")
         except (
             urllib.error.URLError,
             urllib.error.HTTPError,
@@ -114,7 +132,7 @@ def fetch_manifest(base: str) -> tuple[dict[str, Any], str]:
         ) as exc:
             errors.append(f"{url}: {exc}")
     raise ArtifactError(
-        "Could not download image manifest. Tried:\n  " + "\n  ".join(errors)
+        "Could not download a signed image manifest. Tried:\n  " + "\n  ".join(errors)
     )
 
 
@@ -176,17 +194,29 @@ def copy_local(src: Path, dest: Path, expected_sha: str | None, label: str) -> N
 
 
 def load_local_manifest(directory: Path) -> dict[str, Any]:
+    """Load a local artifact-set manifest, verifying its signature first.
+
+    A directory that carries no manifest.json at all is an unsigned raw dev
+    set (P3's future ``--dev`` seed); the moment a manifest exists it must
+    carry a valid signature — there is no hash-only path (D10).
+    """
     man = directory / "manifest.json"
-    if man.is_file():
-        return json.loads(man.read_text(encoding="utf-8"))
-    return {
-        "version": "local",
-        "artifacts": {
-            "vmlinuz": {"path": "vmlinuz"},
-            "root.squashfs": {"path": "root.squashfs"},
-            "initrd.img": {"path": "initrd.img"},
-        },
-    }
+    if not man.is_file():
+        return {
+            "version": "local",
+            "artifacts": {
+                "vmlinuz": {"path": "vmlinuz"},
+                "root.squashfs": {"path": "root.squashfs"},
+                "initrd.img": {"path": "initrd.img"},
+            },
+        }
+    try:
+        lemonseed_verify.verify_manifest_files(man)
+        manifest = json.loads(man.read_text(encoding="utf-8"))
+        lemonseed_verify.check_signing_metadata(manifest)
+    except VerificationError as exc:
+        raise ArtifactError(str(exc)) from exc
+    return manifest
 
 
 def artifact_relpath(manifest: dict[str, Any], key: str) -> tuple[str, str | None]:
