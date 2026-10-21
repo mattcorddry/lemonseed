@@ -21,12 +21,22 @@ from lemonseed_verify import VerificationError
 
 ProgressFn = Callable[..., None]
 
-# Internal-network channel only. `lemonseed.ai` sits behind Cloudflare, which
-# forbids serving large objects through its proxy, so a ~3 GB root.squashfs
-# cannot be distributed from there; `test.lemonseed.ai` is the origin record.
-# M8 replaces this whole channel with GitHub releases.
-IMAGE_BASE_DEFAULT = "http://test.lemonseed.ai/releases/stable/"
-USER_AGENT = "lemonseed/0.1"
+# The release channel is GitHub releases (M8 P3, D8/D23): `lemonseed.ai` sits
+# behind Cloudflare, which forbids serving large objects through its proxy, so
+# a ~3 GB root.squashfs cannot be distributed from there. One REST listing per
+# check; the assets themselves ride the CDN (D26).
+RELEASES_API_DEFAULT = (
+    "https://api.github.com/repos/mattcorddry/lemonseed/releases?per_page=10"
+)
+# The channel is *only* GitHub's prerelease flag (D-C1): the signed manifest
+# describes the payload, never the audience, so a beta→stable flip is a GitHub
+# metadata edit — no rebuild, no re-sign.
+CHANNELS = ("stable", "beta")
+# The settings table's materialization (control-plane/settings.py writes it;
+# DB-free root jobs — the systemd timers — read it through the wrapper).
+CHANNEL_FILE = Path("/var/lib/lemonseed/channel")
+# Distinctive, as GitHub asks; never a token (D26).
+USER_AGENT = "lemonseed-updater/0.1 (+https://github.com/mattcorddry/lemonseed)"
 
 
 class ArtifactError(Exception):
@@ -57,14 +67,91 @@ def artifact_dir(override: str | None = None) -> Path | None:
     return path if path.is_dir() else None
 
 
-def image_base_url(override: str | None = None) -> str:
-    raw = (
-        override
-        or cmdline_val("lemonseed.image")
-        or os.environ.get("LEMONSEED_IMAGE_BASE_URL")
-        or IMAGE_BASE_DEFAULT
+def image_base_url(override: str | None = None) -> str | None:
+    """A --url-style source override, or None (the caller discovers)."""
+    raw = override or cmdline_val("lemonseed.image") or os.environ.get("LEMONSEED_IMAGE_BASE_URL")
+    return raw.rstrip("/") + "/" if raw else None
+
+
+def resolve_channel(override: str | None = None) -> str:
+    """--channel flag > LEMONSEED_CHANNEL > the settings-materialized file
+    > the installer's ESP stub (kernel command line) > stable.
+
+    An unreadable or unknown file value falls back rather than bricking
+    updates: the writer (control-plane settings.set_setting) is the whitelist.
+    """
+    raw = override or os.environ.get("LEMONSEED_CHANNEL")
+    if raw is None:
+        try:
+            raw = CHANNEL_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            raw = ""
+    if raw not in CHANNELS:
+        raw = cmdline_val("lemonseed.channel") or ""
+    return raw if raw in CHANNELS else "stable"
+
+
+def releases_api_url() -> str:
+    return os.environ.get("LEMONSEED_RELEASES_API") or RELEASES_API_DEFAULT
+
+
+def resolve_release_base(channel: str) -> tuple[str, str] | None:
+    """GitHub discovery (D5): the release *this channel* resolves to.
+
+    Returns the asset base — everything under
+    ``releases/download/<tag>/`` — plus the tag, or ``None`` when no release
+    qualifies. ``None`` means "up to date", not an error (D-C2: the channel
+    filters candidates; the version comparison decides). Drafts are never
+    candidates; prereleases qualify for beta only.
+    """
+    try:
+        with _urlopen(releases_api_url()) as resp:
+            releases = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 403:
+            retry = exc.headers.get("Retry-After") or "shortly"
+            raise ArtifactError(
+                "GitHub API rate limit reached (unauthenticated requests are "
+                "60/hour, shared by every appliance behind your IP). "
+                f"Try again {retry}."
+            ) from exc
+        raise ArtifactError(f"GitHub release API error: {exc}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        raise ArtifactError(f"Could not reach the GitHub release API: {exc}") from exc
+    if not isinstance(releases, list):
+        raise ArtifactError("GitHub release API returned an unexpected answer (not a list)")
+
+    candidates = [r for r in releases if isinstance(r, dict) and r.get("draft") is False]
+    if channel == "stable":
+        candidates = [r for r in candidates if r.get("prerelease") is False]
+    if not candidates:
+        return None
+    # The API lists newest-first; sort anyway so the answer never depends on
+    # the order GitHub happens to hand us.
+    candidates.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+    skipped: list[str] = []
+    for release in candidates:
+        tag = str(release.get("tag_name") or "")
+        asset = next(
+            (
+                a
+                for a in release.get("assets") or []
+                if isinstance(a, dict) and a.get("name") == "manifest.json"
+            ),
+            None,
+        )
+        if not tag or not asset or not asset.get("browser_download_url"):
+            skipped.append(tag or "(untagged release)")
+            continue
+        url = str(asset["browser_download_url"])
+        return url[: -len("manifest.json")], tag
+    raise ArtifactError(
+        "No release on channel '"
+        + channel
+        + "' carries a manifest.json asset (skipped: "
+        + ", ".join(skipped)
+        + ")"
     )
-    return raw.rstrip("/") + "/"
 
 
 def sha256_file(path: Path) -> str:
@@ -235,6 +322,7 @@ def acquire_artifacts(
     download_dir: Path,
     url: str | None = None,
     directory: str | None = None,
+    channel: str | None = None,
 ) -> tuple[dict[str, Path], str, dict[str, Any]]:
     download_dir.mkdir(parents=True, exist_ok=True)
     local = artifact_dir(directory)
@@ -280,13 +368,31 @@ def acquire_artifacts(
         )
         return files, version, manifest
 
-    base = image_base_url(url)
-    _progress(
-        progress,
-        phase="download",
-        message=f"Fetching manifest from {base}",
-        progress=6,
-    )
+    if url:
+        # --url is a source override: production-strict, unchanged (D8).
+        base = image_base_url(url)
+        _progress(
+            progress,
+            phase="download",
+            message=f"Fetching manifest from {base}",
+            progress=6,
+        )
+    else:
+        # GitHub discovery (M8 P3): the channel resolves to a release; the
+        # assets then ride the CDN exactly like any --url set.
+        picked = resolve_channel(channel)
+        resolved = resolve_release_base(picked)
+        if resolved is None:
+            raise ArtifactError(
+                f"No release on channel '{picked}' to install — the channel is up to date"
+            )
+        base, tag = resolved
+        _progress(
+            progress,
+            phase="download",
+            message=f"Channel {picked}: release {tag}",
+            progress=4,
+        )
     manifest, dir_url = fetch_manifest(base)
     version = str(manifest.get("version") or "unknown")
     if manifest.get("payload"):

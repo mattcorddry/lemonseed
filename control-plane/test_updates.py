@@ -29,6 +29,9 @@ class _Files(unittest.TestCase):
             mock.patch.object(updates, "ATTEMPT_FILE", root / "update-attempt.json"),
             mock.patch.object(updates, "LATEST_FILE", root / "latest-update.json"),
             mock.patch.object(updates, "CMDLINE", root / "cmdline"),
+            # The channel is whatever the settings table says; tests pin it to
+            # stable unless they are about the channel itself (D-C4).
+            mock.patch.object(updates.settings, "get_setting", return_value="stable"),
         ]
         for patch in patches:
             patch.start()
@@ -204,7 +207,31 @@ class StartJobTests(_Files):
             self.assertIsNone(updates.start_check())
             self.assertIsNone(updates.in_flight(), "a check is a read; it blocks nothing")
             self.assertTrue(updates._job_thread.join(timeout=5) is None or True)
-        self.assertEqual(calls, [["lemonseed-update", "check", "--record"]])
+        self.assertEqual(calls, [["lemonseed-update", "check", "--record", "--channel", "stable"]])
+        self.assertEqual(updates._job["state"], "done")
+
+    def test_the_check_carries_the_configured_channel(self) -> None:
+        """D-C4: the settings table is what the updater is told — a beta box
+        discovers prereleases without anyone editing files by hand."""
+        calls: list[list[str]] = []
+
+        def fake_popen(command, **_kwargs):
+            calls.append(command)
+
+            class Proc:
+                stdout = iter(["lemonseed-update: latest=test.02", ""])
+                returncode = 0
+
+                def wait(self) -> int:
+                    return 0
+
+            return Proc()
+
+        with mock.patch.object(updates.settings, "get_setting", return_value="beta"), \
+                mock.patch.object(updates.subprocess, "Popen", side_effect=fake_popen):
+            self.assertIsNone(updates.start_check())
+            self.assertTrue(updates._job_thread.join(timeout=5) is None or True)
+        self.assertEqual(calls, [["lemonseed-update", "check", "--record", "--channel", "beta"]])
         self.assertEqual(updates._job["state"], "done")
 
     def test_install_runs_cancel_then_apply_on_retry(self) -> None:
@@ -229,7 +256,7 @@ class StartJobTests(_Files):
             calls,
             [
                 ["lemonseed-update", "cancel"],
-                ["lemonseed-update", "apply", "--reboot"],
+                ["lemonseed-update", "apply", "--reboot", "--channel", "stable"],
             ],
         )
         # The job reached its own reboot and stays there: the box is on its way
@@ -321,7 +348,7 @@ class JobRunTests(_Files):
         with mock.patch.object(updates.subprocess, "Popen", side_effect=fake_popen):
             self.assertIsNone(updates.start_check())
             self.assertTrue(_wait_idle())
-        self.assertEqual(calls, [["lemonseed-update", "check", "--record"]])
+        self.assertEqual(calls, [["lemonseed-update", "check", "--record", "--channel", "stable"]])
 
     def test_install_retry_cancels_first_then_applies(self) -> None:
         calls: list[list[str]] = []
@@ -347,7 +374,7 @@ class JobRunTests(_Files):
             calls,
             [
                 ["lemonseed-update", "cancel"],
-                ["lemonseed-update", "apply", "--reboot"],
+                ["lemonseed-update", "apply", "--reboot", "--channel", "stable"],
             ],
         )
         self.assertEqual(updates._job["state"], "rebooting")

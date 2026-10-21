@@ -53,7 +53,7 @@ def get_state() -> dict[str, Any]:
 
 
 def install_worker(
-    disk_path: str, preserve_user_data: bool, reset_admin_credentials: bool
+    disk_path: str, preserve_user_data: bool, reset_admin_credentials: bool, channel: str
 ) -> None:
     def progress(**kwargs: Any) -> None:
         _set(**kwargs)
@@ -64,6 +64,7 @@ def install_worker(
             progress=progress,
             preserve_user_data=preserve_user_data,
             reset_admin_credentials=reset_admin_credentials,
+            channel=channel,
         )
     except InstallError as exc:
         _set(
@@ -84,7 +85,10 @@ def install_worker(
 
 
 def start_install(
-    disk_path: str, preserve_user_data: bool, reset_admin_credentials: bool = False
+    disk_path: str,
+    preserve_user_data: bool,
+    reset_admin_credentials: bool = False,
+    channel: str = "stable",
 ) -> tuple[int, dict[str, Any]]:
     # Only meaningful with preserve (fresh installs create the first admin at
     # /setup anyway; a marker on a fresh box would be noise).
@@ -107,7 +111,7 @@ def start_install(
         )
     threading.Thread(
         target=install_worker,
-        args=(disk_path, preserve_user_data, reset_admin_credentials),
+        args=(disk_path, preserve_user_data, reset_admin_credentials, channel),
         daemon=True,
     ).start()
     return 202, {"ok": True, "state": get_state()}
@@ -193,6 +197,20 @@ INDEX_HTML = """<!DOCTYPE html>
     <section id="disk-panel" class="panel">
       <h2>Target disk</h2>
       <div id="disks" class="disks"></div>
+      <div id="channel-row">
+        <span>
+          <strong>Release channel</strong>
+          <small>Beta gets new builds first, including support for brand-new hardware. You can change it later in Settings.</small>
+        </span>
+        <label class="channel-option">
+          <input type="radio" name="channel" value="stable" checked />
+          <span>Stable — the default for most homes</span>
+        </label>
+        <label class="channel-option">
+          <input type="radio" name="channel" value="beta" />
+          <span>Beta — newer, less tested</span>
+        </label>
+      </div>
       <label id="preserve-row" class="preserve hidden">
         <input id="preserve-user-data" type="checkbox" checked />
         <span>
@@ -326,8 +344,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             preserve_user_data = bool(body.get("preserve_user_data"))
             reset_admin_credentials = bool(body.get("reset_admin_credentials"))
+            channel = body.get("channel") or "stable"
+            if channel not in ("stable", "beta"):
+                self._json(400, {"error": "channel must be stable or beta"})
+                return
             code, payload = start_install(
-                disk, preserve_user_data, reset_admin_credentials
+                disk, preserve_user_data, reset_admin_credentials, channel=channel
             )
             self._json(code, payload)
             return

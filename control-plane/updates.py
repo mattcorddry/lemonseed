@@ -26,6 +26,7 @@ from typing import Any, Optional
 import chat_ready
 import modules
 import owui_policy
+import settings
 
 UPDATER = "lemonseed-update"  # packaged in nixos/packages/lemonseed-update.nix
 ATTEMPT_FILE = Path("/var/lib/lemonseed/update-attempt.json")
@@ -153,7 +154,11 @@ def _interlock_reason() -> Optional[str]:
 
 def start_check() -> Optional[str]:
     """Record the latest available version. ``None`` when the job started."""
-    return _start("check", [[UPDATER, "check", "--record"]])
+    command = [UPDATER, "check", "--record"]
+    channel = settings.get_setting("release_channel", "stable")
+    if channel:
+        command.extend(["--channel", channel])
+    return _start("check", [command])
 
 
 def start_install(*, retry: bool = False) -> Optional[str]:
@@ -167,7 +172,11 @@ def start_install(*, retry: bool = False) -> Optional[str]:
     commands: list[list[str]] = []
     if retry:
         commands.append([UPDATER, "cancel"])
-    commands.append([UPDATER, "apply", "--reboot"])
+    command = [UPDATER, "apply", "--reboot"]
+    channel = settings.get_setting("release_channel", "stable")
+    if channel:
+        command.extend(["--channel", channel])
+    commands.append(command)
     return _start("install", commands)
 
 

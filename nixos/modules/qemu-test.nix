@@ -74,6 +74,20 @@ try:
 except artifacts.ArtifactError as exc:
     report("REFUSE tampered-manifest: %s" % str(exc)[:200])
 
+# Scenario 4: discovery (M8 P3). The stub GitHub API lists the beta release
+# newer than the stable one; each channel must resolve to its own signed set
+# — the same verify-before-trust path, just a different base.
+os.environ["LEMONSEED_RELEASES_API"] = base + "/api/releases"
+stable_base, stable_tag = artifacts.resolve_release_base("stable")
+if stable_tag != "v-smoke-stable":
+    report("FAIL channel-stable: resolved %r, expected v-smoke-stable" % stable_tag)
+    sys.exit(1)
+files, version, _ = artifacts.acquire_artifacts(download_dir=dl / "chan-stable", url=stable_base)
+report("PASS channel-stable version=%s" % version)
+
+files, version, _ = artifacts.acquire_artifacts(download_dir=dl / "chan-beta", channel="beta")
+report("PASS channel-beta version=%s" % version)
+
 report("DONE")
 '';
 

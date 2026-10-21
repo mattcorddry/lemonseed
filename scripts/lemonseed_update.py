@@ -26,11 +26,14 @@ from pathlib import Path
 from typing import Any
 
 from lemonseed_artifacts import (
+    CHANNELS,
     ArtifactError,
     acquire_artifacts,
     cleanup_payload,
     fetch_manifest,
     image_base_url,
+    resolve_channel,
+    resolve_release_base,
     sha256_device,
     sha256_file,
     write_raw,
@@ -293,10 +296,19 @@ def cmd_status() -> int:
     return 0
 
 
-def cmd_apply(url: str | None, directory: str | None, *, reboot: bool, force: bool) -> int:
+def cmd_apply(
+    url: str | None,
+    directory: str | None,
+    channel: str | None = None,
+    *,
+    reboot: bool,
+    force: bool,
+) -> int:
     require_root()
     if url and directory:
         raise UpdateError("use either --url or --dir, not both")
+    if url and channel:
+        raise UpdateError("use either --url or --channel, not both")
     # Preflight before the download: nothing below touches a disk until the
     # slot pointer is trustworthy and no update is pending.
     preflight(force=force)
@@ -308,11 +320,22 @@ def cmd_apply(url: str | None, directory: str | None, *, reboot: bool, force: bo
         download_dir=DOWNLOAD_DIR,
         url=url,
         directory=directory,
+        channel=channel,
     )
-    if version == running_version() and not force:
+    running = running_version()
+    if version == running and not force:
         raise UpdateError(
             f"the channel offers {version}, which is already running; "
             "nothing to update (use --force to reinstall it anyway)"
+        )
+    if version < running and running != "unknown" and not force:
+        # D-C2: switching channels must never walk a box backwards. The beta
+        # box moved to stable simply waits for stable to catch up. A box whose
+        # running version cannot be read ("unknown") has nothing to compare —
+        # dev sets and fresh probes — so the guard stays out of the way.
+        raise UpdateError(
+            f"the channel offers {version}, which is older than the running "
+            f"{running}; refusing the downgrade (use --force to write it anyway)"
         )
     log(f"artifacts ready (version {version})")
     write_inactive_slot(files, target, force=force)
@@ -374,25 +397,42 @@ def running_version() -> str:
         return "unknown"
 
 
-def cmd_check(url: str | None, *, record: bool) -> int:
+def cmd_check(url: str | None, channel: str | None, *, record: bool) -> int:
     """Running vs latest available; the one definition of "an update exists".
 
     Both the weekly timer and the panel's *Check now* run this, and the panel
     never fetches the channel itself. ``--record`` persists the finding for the
     control plane's snapshot (the timer passes it; a plain check just prints).
     """
-    manifest, _dir_url = fetch_manifest(image_base_url(url))
-    latest = str(manifest.get("version") or "unknown")
+    picked = resolve_channel(channel)
+    if url:
+        manifest, _dir_url = fetch_manifest(image_base_url(url))
+        latest = str(manifest.get("version") or "unknown")
+    else:
+        # Discovery picks the release this channel resolves to. No candidate
+        # (e.g. only prereleases published, stable selected) is *up to date*,
+        # not an error (D-C2/Q5) — the same answer as a candidate no newer
+        # than the running release.
+        resolved = resolve_release_base(picked)
+        if resolved is None:
+            latest = running_version()
+            print(f"no release on channel '{picked}'; treating it as up to date")
+        else:
+            manifest, _dir_url = fetch_manifest(resolved[0])
+            latest = str(manifest.get("version") or "unknown")
     running = running_version()
-    # Same rule as the panel: a stale record must not offer a downgrade.
+    # Same rule as the panel: a stale record must not offer a downgrade —
+    # which is also the whole channel-switch story (D-C2).
     available = "true" if (latest != running and latest > running) else "false"
     print(f"running={running}")
     print(f"latest={latest}")
+    print(f"channel={picked}")
     print(f"update_available={available}")
     if record:
         payload = {
             "latest": latest,
             "running": running,
+            "channel": picked,
             "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         LATEST_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -412,6 +452,11 @@ def build_parser() -> argparse.ArgumentParser:
     apply_p = sub.add_parser("apply", help="Write inactive slot and set boot_once")
     apply_p.add_argument("--url", help="HTTP directory with manifest.json + artifacts")
     apply_p.add_argument("--dir", dest="directory", help="Local artifact directory")
+    apply_p.add_argument(
+        "--channel",
+        choices=CHANNELS,
+        help="Release channel to resolve (default: the configured one, else stable)",
+    )
     apply_p.add_argument("--reboot", action="store_true", help="Reboot after arming boot_once")
     apply_p.add_argument(
         "--force",
@@ -423,6 +468,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     check_p = sub.add_parser("check", help="Report running vs latest available version")
     check_p.add_argument("--url", help="HTTP directory with manifest.json")
+    check_p.add_argument(
+        "--channel",
+        choices=CHANNELS,
+        help="Release channel to resolve (default: the configured one, else stable)",
+    )
     check_p.add_argument(
         "--record",
         action="store_true",
@@ -445,11 +495,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "cancel":
             return cmd_cancel()
         if args.command == "check":
-            return cmd_check(args.url, record=args.record)
+            return cmd_check(args.url, getattr(args, "channel", None), record=args.record)
         if args.command == "apply":
             return cmd_apply(
                 args.url,
                 args.directory,
+                channel=getattr(args, "channel", None),
                 reboot=bool(args.reboot),
                 force=bool(args.force),
             )

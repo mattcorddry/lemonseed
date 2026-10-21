@@ -56,7 +56,7 @@ Lemonseed is a **local, multi-user home AI hub** — not a cloud client and not 
 ### Non-goals (for now)
 - ARM builds
 - Legacy BIOS / MBR boot support (EFI-only assumption)
-- Offline USB image payload (installer downloads from lemonseed.ai; offline option later)
+- Offline USB image payload (installer downloads from GitHub releases; offline option later)
 - Installer WiFi AP / captive portal (Ethernet-only for M4)
 - CI builders (local builds first)
 - Secure Boot / TPM root of trust (later; detached sigs first)
@@ -554,7 +554,23 @@ out/appliance-<version>/
   manifest.json.sig
 ```
 
-Distribution is the sharded release set below; the appliance build layout stays the same either way. Current release channel: `http://test.lemonseed.ai/releases/stable/` (`IMAGE_BASE_DEFAULT` in `scripts/lemonseed_artifacts.py` and `installer/install.py`, which must agree). It is an **internal-network origin record over plain HTTP**, deliberately: the public `lemonseed.ai` name sits behind Cloudflare, whose terms prohibit serving large objects through the proxy, and a ~3 GB `root.squashfs` cannot go through it. Two consequences worth stating: a LAN-resident attacker can poison `test.lemonseed.ai` and serve a malicious image, because the manifest's SHA-256 values come from the same origin and **no signature is verified** (see "Signing"), so signing is what makes this channel trustworthy rather than merely consistent; and an appliance on a network without that DNS record simply cannot update. The channel moves to **GitHub releases** in M8: whatever the portal/updater end up doing must work against GitHub release asset downloads. As built (M8 P2), a release **is** a sharded asset set: `make release` stages `out/release-<version>/` containing the signed `manifest.json`, the payload cut into fixed **1 GiB** `payload-NNN.part` parts (a canonical pax tar of `vmlinuz`, `initrd.img` and `root.squashfs`; the final part is a remainder), and the USB installer ISO as its own direct asset recorded in the manifest. The tar is **not gzipped**: the SquashFS is already zstd-compressed and dominates the payload, so a second compression layer costs assemble-time CPU for no size win. The manifest is both the assembly plan (chunk names, order, hashes) and the root of trust (output names, lengths, SHA-256); consumers verify the signature, then each part, then the concatenated tar, then re-verify every extracted file before the A/B slot flips. Design and decisions: [`proposals/M8/PACKAGING.md`](./proposals/M8/PACKAGING.md).
+Distribution is the sharded release set below; the appliance build layout stays the same either way. The channel is **GitHub releases** (M8 P3): discovery is one `GET /releases` call —
+`stable` = newest non-draft non-prerelease, `beta` = newest non-draft release — and the
+release's asset base (`releases/download/<tag>/`) feeds the exact same signed-manifest
+and sharded-payload machinery a `--url` set does. The channel is *only* GitHub's
+prerelease flag (D-C1): the signed manifest describes the payload, never the audience,
+so a beta → stable flip is `gh release edit <tag> --prerelease=false` — no rebuild, no
+re-sign. Switching channels never downgrades (D-C2): the channel filters candidates;
+the version comparison decides. A stable box with only prereleases published is *up to
+date*, the same as a candidate no newer than the running release. Rate limits (D26):
+one API call per check, 60/hour per originating IP, assets ride the CDN — we never
+poll. The on-box channel comes from `--channel` / the settings table (materialized to
+`/var/lib/lemonseed/channel`, written by the CP's settings API and seeded by the
+installer) / the installer's ESP stub / stable, in that order.
+
+`make dev-httpd-start` / `-stop` (D-C3) serve `./out` over HTTP from a pinned busybox
+container for local `--url` testing — static files only, bound to the primary
+interface's own address, high port 8083. As built (M8 P2), a release **is** a sharded asset set: `make release` stages `out/release-<version>/` containing the signed `manifest.json`, the payload cut into fixed **1 GiB** `payload-NNN.part` parts (a canonical pax tar of `vmlinuz`, `initrd.img` and `root.squashfs`; the final part is a remainder), and the USB installer ISO as its own direct asset recorded in the manifest. The tar is **not gzipped**: the SquashFS is already zstd-compressed and dominates the payload, so a second compression layer costs assemble-time CPU for no size win. The manifest is both the assembly plan (chunk names, order, hashes) and the root of trust (output names, lengths, SHA-256); consumers verify the signature, then each part, then the concatenated tar, then re-verify every extracted file before the A/B slot flips. Design and decisions: [`proposals/M8/PACKAGING.md`](./proposals/M8/PACKAGING.md).
 
 ### Signing
 - **As built (M8 P1):** the root of trust is a **detached ed25519 signature over
@@ -765,7 +781,7 @@ Moved to [BACKLOG](BACKLOG.md)
 | Update policy | **Never auto-download and never auto-install.** A weekly check (heavily fuzzed, `sleep $(( $RANDOM * 86400 / 32768 ))`) and a manual “check now” run the same workflow; on success they light a red dot on the settings icon for admins and arm the update button. Rejected: silent auto-update on a household box that may be mid-pull. |
 | Shutdown timing | **systemd owns the timeout** for reboot/shutdown; the CP asks and gets out of the way rather than wrapping systemd in another timer script. |
 | Destructive-action confirms | Typed "type the word to continue" interstitials are reserved for **data-destroying** actions (settings reset, user delete). Reboot, shutdown and update are data-safe, so they get an explainer plus a confirm — no typing. |
-| Release channel | Today: `http://test.lemonseed.ai/releases/stable/`, an internal-network origin over plain HTTP, because Cloudflare (which fronts the public name) prohibits large proxied objects. Updates must stay compatible with **GitHub release** asset downloads, which replace it in **M8**. Distribution mechanics, the 2 GiB asset cap and the chunking design live in the §11 backlog entry, not here. |
+| Release channel | **GitHub releases** since M8 P3: discovery is one `GET /releases` per check; `stable` = newest non-draft non-prerelease, `beta` = newest non-draft release; assets ride the CDN. The channel is *only* GitHub's prerelease flag (D-C1) — the signed manifest describes the payload, so a flip is a metadata edit, and switching channels never downgrades (D-C2). The setting lives in the CP settings table (`cp_meta`), materialized to `/var/lib/lemonseed/channel` for the DB-free root jobs; the installer seeds it. The old `test.lemonseed.ai` origin survives only as a `--url` value. |
 | Release payload (M8 P2) | **All appliance artifacts ship as one canonical tar cut into fixed 1 GiB `payload-NNN.part` parts**, never gzipped — the SquashFS is already zstd-compressed, so a second layer wins nothing. `manifest.json` stays outside the tar and describes both the chunks and the outputs; the installer ISO ships as its own direct asset. `make release` builds → packs → signs → self-verifies → stages `out/release-<version>/`; the hand-run SCP (`push-image-to-website.sh`) is removed (D23) and publishing becomes P4's GitHub-release job. Design: [`proposals/M8/PACKAGING.md`](./proposals/M8/PACKAGING.md). [2026-10, M8 P2] |
 | Auth without TLS | The appliance is reached by mDNS name over **plain HTTP**, so TLS is not available: there is no FQDN for a public cert, browsers reject self-signed certs and re-block them, and importing a private CA is beyond a home user. Because the transport cannot be trusted, the design goal becomes **never put the plaintext password on the wire at all** — a PAKE (SRP-6a) rather than client-side hashing, which is only obfuscation. See `proposals/M7/PLAN.md` D1. |
 | SRP rollout | **SRP-only, no migration path** (chosen over shipping SRP alongside bcrypt, and over a one-time migrate-on-next-sign-in). Reason: a mixed tree is a tree with two auth paths, one of which is the thing we are removing; and there is **no install base**, so a breaking change is free today and expensive later. bcrypt cannot yield an SRP verifier (one-way), so "migrate on next sign-in" would have kept the plaintext POST alive indefinitely. Consequence: **all existing test machines need a fresh reinstall**, and A/B rollback across the boundary cannot sign anyone in (§11). |

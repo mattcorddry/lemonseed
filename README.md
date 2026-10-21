@@ -19,6 +19,7 @@ That prints the available targets. Common ones:
 | `make run-qemu` | Build QEMU image if needed, then boot a serial console |
 | `make build-installer` | EFI/USB installer ISO → `out/latest-installer` |
 | `make release` | Build + pack + sign + stage a release → `out/release-<version>/` |
+| `make dev-httpd-start` / `-stop` | Serve `./out` over HTTP (Docker busybox) for `--url` testing |
 | `make test` | Unit tests — update, repart, control-plane (no root) |
 | `make test-qemu` | QEMU boot + HTTP API smoke (`/healthz`, `/api/status`) |
 | `sudo make repart-test` | Loopback GPT/repart smoke (requires root) |
@@ -70,6 +71,15 @@ USB installer, keep your data, and tick **Reset admin credentials**, which reope
 first-boot setup. Forgetting any other account's password is an admin's job — they hand you a
 one-time password, and it makes you choose a new one before you get signed in at all. The
 mechanism is in [DESIGN.md](./DESIGN.md) §9.
+
+## Updates
+
+The appliance checks GitHub releases weekly (fuzzed; nothing is ever installed
+unattended) and offers the newest release on its **channel** — `stable` for most
+homes, `beta` for early builds and brand-new hardware. The channel is chosen at
+install time and changeable in Settings; switching channels never downgrades the box.
+Every update is signature-verified against the keys baked into the image before a
+single byte is trusted.
 
 ## Status
 

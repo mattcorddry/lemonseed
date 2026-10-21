@@ -48,6 +48,10 @@ pkgs.writeShellApplication {
     # exactly these keys before it trusts a manifest hash (M8 P1, D10/D13).
     export LEMONSEED_RELEASE_KEYS_DIR=${releaseKeys}
     export LEMONSEED_DOWNLOAD_DIR="''${LEMONSEED_DOWNLOAD_DIR:-/var/lib/lemonseed/download}"
+    # The release channel (M8 P3): the settings table's materialization,
+    # written by the control plane and seeded by the installer. Empty means
+    # stable — the Python side then falls back to the ESP command-line stub.
+    export LEMONSEED_CHANNEL="''${LEMONSEED_CHANNEL:-$(cat /var/lib/lemonseed/channel 2>/dev/null)}"
     # The template path is exported with a fallback so a CP-spawned update
     # (which inherits the CP environment) and a CLI/systemd update (which
     # does not) resolve the same file.

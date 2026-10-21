@@ -11,7 +11,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import typing
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -403,13 +405,95 @@ class UpdateCheckTests(unittest.TestCase):
             ), mock.patch.object(update, "running_version", return_value="test.01"), mock.patch.object(
                 update, "LATEST_FILE", latest_file
             ):
-                rc = update.cmd_check(None, record=True)
+                rc = update.cmd_check("http://base/", None, record=True)
                 self.assertEqual(rc, 0)
             self.assertTrue(latest_file.is_file())
             record = json.loads(latest_file.read_text(encoding="utf-8"))
             self.assertEqual(record["latest"], "test.02")
             self.assertEqual(record["running"], "test.01")
+            self.assertEqual(record["channel"], "stable")
             self.assertIn("checked_at", record)
+
+    def test_check_discovers_the_channel_release(self) -> None:
+        """No --url: the channel resolves to a release and the manifest comes
+        from that release's asset base (M8 P3)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            latest_file = Path(tmp) / "latest-update.json"
+            with mock.patch.object(
+                update,
+                "resolve_release_base",
+                return_value=("http://cdn/v-test.02/", "v-test.02"),
+            ) as resolved, mock.patch.object(
+                update,
+                "fetch_manifest",
+                return_value=({"version": "test.02"}, "http://cdn/v-test.02/"),
+            ) as fetched, mock.patch.object(
+                update, "running_version", return_value="test.01"
+            ), mock.patch.object(
+                update, "LATEST_FILE", latest_file
+            ):
+                rc = update.cmd_check(None, "beta", record=True)
+                self.assertEqual(rc, 0)
+            resolved.assert_called_once_with("beta")
+            self.assertIn("http://cdn/v-test.02/", fetched.call_args[0][0])
+            record = json.loads(latest_file.read_text(encoding="utf-8"))
+            self.assertEqual(record["channel"], "beta")
+            self.assertEqual(record["latest"], "test.02")
+
+    def test_no_candidate_on_the_channel_is_up_to_date_not_an_error(self) -> None:
+        """Only prereleases published with stable selected: the same answer as
+        a candidate no newer than running — no offer, exit 0 (D-C2/Q5)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            latest_file = Path(tmp) / "latest-update.json"
+            with mock.patch.object(
+                update, "resolve_release_base", return_value=None
+            ), mock.patch.object(update, "running_version", return_value="test.01"), mock.patch.object(
+                update, "LATEST_FILE", latest_file
+            ):
+                rc = update.cmd_check(None, "stable", record=True)
+                self.assertEqual(rc, 0)
+            record = json.loads(latest_file.read_text(encoding="utf-8"))
+            self.assertEqual(record["latest"], "test.01")
+            self.assertEqual(record["channel"], "stable")
+
+
+class UpdateSwitchTests(unittest.TestCase):
+    """D-C2: the channel only filters candidates; the version comparison is
+    the only update decision, so switching beta → stable never downgrades."""
+
+    def _apply(self, *, channel: str | None, force: bool) -> typing.Any:
+        return update.cmd_apply(None, None, channel=channel, reboot=False, force=force)
+
+    def test_switching_to_stable_never_downgrades(self) -> None:
+        with mock.patch.object(update, "require_root"), mock.patch.object(
+            update, "preflight"
+        ), mock.patch.object(update, "current_slot", return_value="a"), mock.patch.object(
+            update, "acquire_artifacts", return_value=({}, "2026.01", {})
+        ), mock.patch.object(update, "running_version", return_value="2026.02"):
+            with self.assertRaises(update.UpdateError) as ctx:
+                self._apply(channel="stable", force=False)
+            self.assertIn("refusing the downgrade", str(ctx.exception))
+
+    def test_force_still_writes_the_older_release(self) -> None:
+        with mock.patch.object(update, "require_root"), mock.patch.object(
+            update, "preflight"
+        ), mock.patch.object(update, "current_slot", return_value="a"), mock.patch.object(
+            update, "inactive_slot", return_value="b"
+        ), mock.patch.object(
+            update, "acquire_artifacts", return_value=({}, "2026.01", {})
+        ), mock.patch.object(update, "running_version", return_value="2026.02"), mock.patch.object(
+            update, "write_inactive_slot"
+        ), mock.patch.object(update, "record_attempt"), mock.patch.object(update, "cleanup_payload"):
+            self.assertEqual(self._apply(channel="stable", force=True), 0)
+
+    def test_url_and_channel_are_a_usage_error(self) -> None:
+        with mock.patch.object(update, "require_root"):
+            with self.assertRaises(update.UpdateError) as ctx:
+                self._apply_url_and_channel()
+            self.assertIn("use either --url or --channel", str(ctx.exception))
+
+    def _apply_url_and_channel(self) -> typing.Any:
+        return update.cmd_apply("http://base/", None, channel="beta", reboot=False, force=False)
 
     def test_cancel_clears_the_attempt_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -425,6 +509,189 @@ class UpdateCheckTests(unittest.TestCase):
             ), mock.patch.object(update, "run"), mock.patch.object(update, "require_root"):
                 update.cmd_cancel()
             self.assertFalse(attempt.exists())
+
+
+class DiscoveryTests(unittest.TestCase):
+    """D5: the GitHub listing is the whole discovery surface. The stubs are
+    exactly the API JSON shape; every refusal is legible, never a traceback."""
+
+    RELEASES = [
+        {  # oldest first, so the sort has something to prove
+            "tag_name": "v-test.01",
+            "draft": False,
+            "prerelease": False,
+            "created_at": "2026-01-01T00:00:00Z",
+            "assets": [
+                {"name": "manifest.json", "browser_download_url": "http://cdn/v-test.01/manifest.json"}
+            ],
+        },
+        {  # a draft is never a candidate, whatever its date
+            "tag_name": "v-test.99",
+            "draft": True,
+            "prerelease": False,
+            "created_at": "2026-02-01T00:00:00Z",
+            "assets": [],
+        },
+        {  # the prerelease: beta's newest, invisible to stable
+            "tag_name": "v-test.03",
+            "draft": False,
+            "prerelease": True,
+            "created_at": "2026-03-01T00:00:00Z",
+            "assets": [
+                {"name": "manifest.json", "browser_download_url": "http://cdn/v-test.03/manifest.json"}
+            ],
+        },
+        {  # stable's newest
+            "tag_name": "v-test.02",
+            "draft": False,
+            "prerelease": False,
+            "created_at": "2026-02-15T00:00:00Z",
+            "assets": [
+                {"name": "manifest.json", "browser_download_url": "http://cdn/v-test.02/manifest.json"}
+            ],
+        },
+    ]
+
+    def _serve(self, payload, *, status=200, headers=None):
+        body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        holder: dict = {}
+
+        class Resp:
+            def __init__(self, data):
+                self._data = data
+
+            def read(self):
+                return self._data
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(url, timeout=60):
+            holder["url"] = url
+            if status != 200:
+                raise urllib.error.HTTPError(url, status, "rate limited", headers or {}, io.BytesIO(body))
+            return Resp(body)
+
+        return holder, mock.patch.object(artifacts, "_urlopen", side_effect=fake_urlopen)
+
+    def test_stable_picks_the_newest_release(self) -> None:
+        holder, patch = self._serve(self.RELEASES)
+        with patch:
+            base, tag = artifacts.resolve_release_base("stable")
+        self.assertEqual((base, tag), ("http://cdn/v-test.02/", "v-test.02"))
+        self.assertIn("api.github.com", holder["url"])
+
+    def test_beta_picks_the_newest_prerelease(self) -> None:
+        _holder, patch = self._serve(self.RELEASES)
+        with patch:
+            base, tag = artifacts.resolve_release_base("beta")
+        self.assertEqual((base, tag), ("http://cdn/v-test.03/", "v-test.03"))
+
+    def test_no_candidates_is_none_not_an_error(self) -> None:
+        only_rc = [r for r in self.RELEASES if r["prerelease"]]
+        _holder, patch = self._serve(only_rc)
+        with patch:
+            self.assertIsNone(artifacts.resolve_release_base("stable"))
+
+    def test_malformed_answer_is_legible(self) -> None:
+        _holder, patch = self._serve({"no": "list"})
+        with patch:
+            with self.assertRaises(artifacts.ArtifactError) as ctx:
+                artifacts.resolve_release_base("stable")
+        self.assertIn("unexpected answer", str(ctx.exception))
+
+    def test_rate_limit_names_the_shared_ip_quota(self) -> None:
+        _holder, patch = self._serve(b"[]", status=403, headers={"Retry-After": "42"})
+        with patch:
+            with self.assertRaises(artifacts.ArtifactError) as ctx:
+                artifacts.resolve_release_base("stable")
+        self.assertIn("60/hour", str(ctx.exception))
+        self.assertIn("42", str(ctx.exception))
+
+    def test_a_release_without_a_manifest_asset_is_skipped_legibly(self) -> None:
+        broken = [
+            {
+                "tag_name": "v-broken",
+                "draft": False,
+                "prerelease": False,
+                "created_at": "2026-04-01T00:00:00Z",
+                "assets": [{"name": "something-else.zip", "browser_download_url": "http://cdn/x"}],
+            }
+        ]
+        _holder, patch = self._serve(broken)
+        with patch:
+            with self.assertRaises(artifacts.ArtifactError) as ctx:
+                artifacts.resolve_release_base("stable")
+        self.assertIn("v-broken", str(ctx.exception))
+
+
+class ChannelResolutionTests(unittest.TestCase):
+    """D-C4: flag > env > the materialized file > the ESP stub > stable."""
+
+    def test_flag_wins_over_everything(self) -> None:
+        with mock.patch.dict(os.environ, {"LEMONSEED_CHANNEL": "stable"}), mock.patch.object(
+            artifacts, "CHANNEL_FILE", Path("/nonexistent/channel")
+        ), mock.patch.object(artifacts, "cmdline_val", return_value="beta"):
+            self.assertEqual(artifacts.resolve_channel("beta"), "beta")
+
+    def test_env_beats_the_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            channel_file = Path(tmp) / "channel"
+            channel_file.write_text("stable\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"LEMONSEED_CHANNEL": "beta"}), mock.patch.object(
+                artifacts, "CHANNEL_FILE", channel_file
+            ):
+                self.assertEqual(artifacts.resolve_channel(None), "beta")
+
+    def test_the_materialized_file_beats_the_esp_stub(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            channel_file = Path(tmp) / "channel"
+            channel_file.write_text("beta\n", encoding="utf-8")
+            with mock.patch.object(artifacts, "CHANNEL_FILE", channel_file), mock.patch.object(
+                artifacts, "cmdline_val", return_value="stable"
+            ):
+                self.assertEqual(artifacts.resolve_channel(None), "beta")
+
+    def test_the_esp_stub_beats_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(artifacts, "CHANNEL_FILE", Path(tmp) / "missing"), mock.patch.object(
+                artifacts, "cmdline_val", return_value="beta"
+            ):
+                self.assertEqual(artifacts.resolve_channel(None), "beta")
+
+    def test_garbage_falls_back_to_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            channel_file = Path(tmp) / "channel"
+            channel_file.write_text("nonsense\n", encoding="utf-8")
+            with mock.patch.object(artifacts, "CHANNEL_FILE", channel_file), mock.patch.object(
+                artifacts, "cmdline_val", return_value=""
+            ):
+                self.assertEqual(artifacts.resolve_channel(None), "stable")
+
+    def test_acquire_uses_the_resolved_base(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(
+                artifacts, "resolve_release_base", return_value=("http://cdn/v1/", "v1")
+            ) as resolved, mock.patch.object(
+                artifacts,
+                "fetch_manifest",
+                return_value=({"version": "v1", "payload": {"chunks": []}}, "http://cdn/v1/"),
+            ), mock.patch.object(artifacts, "assemble_payload", return_value={}) as assembled:
+                _files, version, _manifest = artifacts.acquire_artifacts(
+                    download_dir=Path(tmp), channel="beta"
+                )
+            resolved.assert_called_once_with("beta")
+            self.assertEqual(assembled.call_args.kwargs["base_url"], "http://cdn/v1/")
+            self.assertEqual(version, "v1")
+
+    def test_acquire_refuses_when_the_channel_has_nothing(self) -> None:
+        with mock.patch.object(artifacts, "resolve_release_base", return_value=None):
+            with self.assertRaises(artifacts.ArtifactError) as ctx:
+                artifacts.acquire_artifacts(download_dir=Path("/tmp"), channel="beta")
+        self.assertIn("No release on channel 'beta'", str(ctx.exception))
 
 
 if __name__ == "__main__":

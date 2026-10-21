@@ -27,7 +27,7 @@ DISK ?=
 .PHONY: help build-production build-qemu build-installer release run-qemu qemu-clean clean keys \
 	repart-generate disk-repart grub-cfg repart-test update-test test test-qemu \
 	test-update-unit check-untracked nix-gc lint refresh-image-pins check-image-pins \
-	test-gateway
+	test-gateway dev-httpd-start dev-httpd-stop
 
 help:
 	@echo "Lemonseed image build pipeline"
@@ -60,6 +60,8 @@ help:
 	@echo "  make clean             Remove out/"
 	@echo "  make keys              Generate local ed25519 test keys under keys/"
 	@echo "  make release           Build + pack + sign + stage a release (out/release-<version>/)"
+	@echo "  make dev-httpd-start   Serve ./out over HTTP (Docker busybox, primary-IF only)"
+	@echo "  make dev-httpd-stop    Stop the dev-httpd container"
 	@echo "  make help              Show this help (default)"
 	@echo ""
 	@echo "Variables:"
@@ -87,6 +89,12 @@ build-installer:
 
 release:
 	"$(ROOT)/scripts/release.sh"
+
+dev-httpd-start:
+	"$(ROOT)/scripts/dev-httpd.sh" start
+
+dev-httpd-stop:
+	"$(ROOT)/scripts/dev-httpd.sh" stop
 
 run-qemu:
 	@if [[ ! -f "$(ROOT)/out/latest-qemu/vmlinuz" \

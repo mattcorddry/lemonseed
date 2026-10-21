@@ -276,6 +276,7 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         disk: selected,
+        channel: document.querySelector('input[name="channel"]:checked')?.value || "stable",
         preserve_user_data: Boolean(
           selectedDisk && selectedDisk.preservable_user_data && preserveCheck.checked
         ),

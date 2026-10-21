@@ -378,7 +378,9 @@ class InstallWiringTests(unittest.TestCase):
     def setUp(self) -> None:
         patch_install_log(self)
 
-    def drive_install(self, stack: contextlib.ExitStack, preserve: bool, reset: bool) -> mock.Mock:
+    def drive_install(
+        self, stack: contextlib.ExitStack, preserve: bool, reset: bool, channel: str = "stable"
+    ) -> mock.Mock:
         files = {"root.squashfs": Path("/nonexistent/root.squashfs")}
         stack.enter_context(mock.patch.object(install, "require_host_ready"))
         stack.enter_context(
@@ -395,12 +397,20 @@ class InstallWiringTests(unittest.TestCase):
         stack.enter_context(mock.patch.object(install, "partition_disk"))
         stack.enter_context(mock.patch.object(install, "wait_part", return_value="/dev/sda2"))
         stack.enter_context(mock.patch.object(install, "write_raw"))
-        stack.enter_context(mock.patch.object(install, "seed_esp"))
+        seed = stack.enter_context(mock.patch.object(install, "seed_esp"))
+        channel_file = stack.enter_context(mock.patch.object(install, "apply_channel_file"))
         stack.enter_context(mock.patch.object(install, "parts_on_disk", return_value={}))
         stack.enter_context(mock.patch.object(install.time, "sleep"))
         stack.enter_context(mock.patch.object(install.subprocess, "run"))
         marker = stack.enter_context(mock.patch.object(install, "apply_reset_marker"))
-        install.run_install("/dev/sda", preserve_user_data=preserve, reset_admin_credentials=reset)
+        install.run_install(
+            "/dev/sda",
+            preserve_user_data=preserve,
+            reset_admin_credentials=reset,
+            channel=channel,
+        )
+        self.last_seed = seed
+        self.last_channel_file = channel_file
         return marker
 
     def test_preserve_install_states_the_reset_intent(self) -> None:
@@ -417,6 +427,72 @@ class InstallWiringTests(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             marker = self.drive_install(stack, preserve=False, reset=True)
         marker.assert_not_called()
+
+    def test_a_beta_choice_reaches_the_esp_and_preserved_user_data(self) -> None:
+        with contextlib.ExitStack() as stack:
+            self.drive_install(stack, preserve=True, reset=False, channel="beta")
+        self.last_seed.assert_called_once()
+        self.assertEqual(self.last_seed.call_args.kwargs["channel"], "beta")
+        self.last_channel_file.assert_called_once_with("/dev/sda", "beta")
+
+    def test_a_stable_choice_writes_no_channel_artifacts(self) -> None:
+        with contextlib.ExitStack() as stack:
+            self.drive_install(stack, preserve=True, reset=False, channel="stable")
+        self.last_seed.assert_called_once()
+        self.assertEqual(self.last_seed.call_args.kwargs["channel"], "stable")
+        self.last_channel_file.assert_not_called()
+
+
+class ChannelSeedTests(unittest.TestCase):
+    """M8 P3: the chosen channel is durable on the box — the @var file for
+    preserved user-data, the ESP stub for a fresh install (no @var yet)."""
+
+    def setUp(self) -> None:
+        patch_install_log(self)
+        tmp, self.root = user_data_root()
+        self.addCleanup(tmp.cleanup)
+
+    def test_the_channel_file_lands_where_the_wrapper_reads_it(self) -> None:
+        # @var is the appliance's /var: this must be exactly the file the
+        # packaged updater wrapper (and the settings materialization) read.
+        self.assertEqual(
+            str(install.USER_DATA_MOUNT / install.CHANNEL_FILE_REL),
+            "/run/lemonseed-install-user-data/@var/lib/lemonseed/channel",
+        )
+
+    def test_a_beta_choice_is_written_into_user_data(self) -> None:
+        with mock.patch.object(
+            install, "mount_user_data", side_effect=lambda _disk: contextlib.nullcontext(self.root)
+        ) as mount:
+            install.apply_channel_file("/dev/sda", "beta")
+        mount.assert_called_once_with("/dev/sda")
+        written = (
+            (self.root / "@var" / "lib" / "lemonseed" / "channel").read_text(encoding="utf-8").strip()
+        )
+        self.assertEqual(written, "beta")
+
+    def test_a_failed_channel_write_fails_the_install(self) -> None:
+        with mock.patch.object(install, "mount_user_data", side_effect=OSError("busy")):
+            with self.assertRaises(install.InstallError):
+                install.apply_channel_file("/dev/sda", "beta")
+
+    def test_the_esp_stub_is_written_for_beta_and_absent_for_stable(self) -> None:
+        grub_dir = self.root / "grub"
+        grub_dir.mkdir()
+        install.write_channel_stub(grub_dir, "beta")
+        stub = grub_dir / "channel-params"
+        self.assertIn("lemonseed.channel=beta", stub.read_text(encoding="utf-8"))
+        install.write_channel_stub(grub_dir, "stable")
+        self.assertFalse(stub.is_file())
+
+    def test_the_installer_carries_no_channel_constant_of_its_own(self) -> None:
+        # One definition, in the shared module (M8 P3): the vendored copies
+        # must not drift the way IMAGE_BASE_DEFAULT once did.
+        self.assertFalse(hasattr(install, "IMAGE_BASE_DEFAULT"))
+        import lemonseed_artifacts
+
+        self.assertEqual(install.lemonseed_artifacts.RELEASES_API_DEFAULT, lemonseed_artifacts.RELEASES_API_DEFAULT)
+        self.assertIn("api.github.com", install.lemonseed_artifacts.RELEASES_API_DEFAULT)
 
 
 if __name__ == "__main__":

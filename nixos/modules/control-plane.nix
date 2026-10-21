@@ -14,7 +14,7 @@ let
        ${cpSrc}/db.py ${cpSrc}/data_services.py ${cpSrc}/modules.py ${cpSrc}/auth.py \
        ${cpSrc}/sessions.py ${cpSrc}/srp.py ${cpSrc}/audit.py ${cpSrc}/usermgmt.py \
        ${cpSrc}/model_store.py ${cpSrc}/lemond_client.py ${cpSrc}/updates.py \
-       ${cpSrc}/journal.py \
+       ${cpSrc}/settings.py ${cpSrc}/journal.py \
        ${cpSrc}/owui_client.py \
        ${cpSrc}/owui_policy.py ${cpSrc}/owui_portal.py ${cpSrc}/owui-policy.json \
        ${cpSrc}/image_pins.py ${cpSrc}/container-images.json \

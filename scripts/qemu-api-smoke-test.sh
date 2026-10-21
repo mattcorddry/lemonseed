@@ -218,6 +218,64 @@ subprocess.run(
     check=True,
     env={**os.environ, "SIGN_KEY": str(priv)},
 )
+
+# A second, *newer* signed set for the beta channel (M8 P3): same payload
+# shape, different version, packed and signed by the same machinery. The stub
+# GitHub API (out/qemu-signing/api/releases) is what the guest's discovery
+# reads — stable = the non-prerelease, beta = the newer prerelease.
+beta_build = root / "build-beta"
+beta_build.mkdir(parents=True)
+for name, body in files.items():
+    (beta_build / name).write_bytes(body)
+manifest2 = dict(manifest)
+manifest2["version"] = "smoke-beta"
+(beta_build / "manifest.json").write_text(json.dumps(manifest2, indent=2) + "\n", encoding="utf-8")
+subprocess.run(
+    [sys.executable, str(root_arg / "scripts" / "release_payload.py"), "pack",
+     "--artifacts-dir", str(beta_build), "--out-dir", str(root / "beta-set"),
+     "--part-bytes", "262144"],
+    check=True,
+)
+subprocess.run(
+    [str(root_arg / "scripts" / "sign.sh"), str(root / "beta-set")],
+    check=True,
+    env={**os.environ, "SIGN_KEY": str(priv)},
+)
+api_dir = root / "api"
+api_dir.mkdir()
+(api_dir / "releases").write_text(
+    json.dumps(
+        [
+            {
+                "tag_name": "v-smoke-beta",
+                "draft": False,
+                "prerelease": True,
+                "created_at": "2026-03-01T00:00:00Z",
+                "assets": [
+                    {
+                        "name": "manifest.json",
+                        "browser_download_url": "http://10.0.2.2:18081/beta-set/manifest.json",
+                    }
+                ],
+            },
+            {
+                "tag_name": "v-smoke-stable",
+                "draft": False,
+                "prerelease": False,
+                "created_at": "2026-02-15T00:00:00Z",
+                "assets": [
+                    {
+                        "name": "manifest.json",
+                        "browser_download_url": "http://10.0.2.2:18081/good/manifest.json",
+                    }
+                ],
+            },
+        ],
+        indent=2,
+    )
+    + "\n",
+    encoding="utf-8",
+)
 for name in ("good", "tampered-payload", "tampered-manifest"):
     d = root / name
     d.mkdir(exist_ok=True)
@@ -2611,6 +2669,19 @@ if [[ "${sign_ok}" != "true" ]]; then
 fi
 grep -q "lemonseed-signing-smoke: PASS signed-set" "${LOG}" || {
   echo "signing smoke: no PASS for the correctly signed set — the verifier or baked trust set failed" >&2
+  grep -n "lemonseed-signing-smoke" "${LOG}" | tail -10 >&2 || true
+  exit 1
+}
+# M8 P3: the stub GitHub API resolves each channel to its own signed set —
+# stable to the non-prerelease, beta to the newer prerelease — and both are
+# acquired production-strict through the sharded assembly path.
+grep -q "lemonseed-signing-smoke: PASS channel-stable version=signing-smoke" "${LOG}" || {
+  echo "signing smoke: discovery did not resolve stable to the signed set" >&2
+  grep -n "lemonseed-signing-smoke" "${LOG}" | tail -10 >&2 || true
+  exit 1
+}
+grep -q "lemonseed-signing-smoke: PASS channel-beta version=smoke-beta" "${LOG}" || {
+  echo "signing smoke: discovery did not resolve beta to the newer prerelease" >&2
   grep -n "lemonseed-signing-smoke" "${LOG}" | tail -10 >&2 || true
   exit 1
 }

@@ -32,10 +32,10 @@ from preflight import require_host_ready
 
 ProgressFn = Callable[..., None]
 
-# Internal-network channel only; see the note in scripts/lemonseed_artifacts.py.
-# The USB installer and the in-place updater must read the same channel or a
-# freshly installed box looks for releases somewhere the appliance does not.
-IMAGE_BASE_DEFAULT = "http://test.lemonseed.ai/releases/stable/"
+# Internal-network channel note is gone: the release channel is GitHub
+# releases, resolved by the shared module (lemonseed_artifacts.resolve_channel /
+# resolve_release_base). The installer carries no channel constant of its own —
+# one definition, shared with the updater (M8 P3).
 USER_AGENT = "lemonseed-installer/0.1"
 DOWNLOAD_DIR = Path(os.environ.get("LEMONSEED_DOWNLOAD_DIR", "/var/lib/lemonseed/download"))
 INSTALL_LOG = Path("/var/lib/lemonseed/installer.log")
@@ -76,6 +76,9 @@ USER_DATA_LV = "user-data"
 # readers/writers on the box are auth.RESET_MARKER_FILE and auth.ADMINS_FILE.
 RESET_MARKER_REL = Path("@var/lib/lemonseed/reset-admin")
 ADMIN_ROSTER_REL = Path("@var/lib/lemonseed/admins.json")
+# Same volume, same rule (M8 P3): the updater wrapper and the settings
+# materialization read /var/lib/lemonseed/channel.
+CHANNEL_FILE_REL = Path("@var/lib/lemonseed/channel")
 LEMONSEED_ROOT = Path(os.environ.get("LEMONSEED_ROOT", "/etc/lemonseed"))
 REPART_SCRIPT = LEMONSEED_ROOT / "disk-repart.sh"
 RELEASE_SCRIPT = LEMONSEED_ROOT / "disk-release.sh"
@@ -132,13 +135,9 @@ def artifact_dir() -> Path | None:
     return p if p.is_dir() else None
 
 
-def image_base_url() -> str:
-    raw = (
-        _cmdline_val("lemonseed.image")
-        or os.environ.get("LEMONSEED_IMAGE_BASE_URL")
-        or IMAGE_BASE_DEFAULT
-    )
-    return raw.rstrip("/") + "/"
+def image_base_url() -> str | None:
+    raw = _cmdline_val("lemonseed.image") or os.environ.get("LEMONSEED_IMAGE_BASE_URL")
+    return raw.rstrip("/") + "/" if raw else None
 
 
 def _eligible(disk_path: str) -> dict[str, Any]:
@@ -289,6 +288,45 @@ def apply_reset_marker(disk: str, requested: bool) -> None:
             f"Lemonseed was installed, but the admin password was not reset: {exc}"
         ) from exc
     _log(syslog.LOG_INFO, f"admin reset marker written to {marker}")
+
+
+def write_channel_stub(grub_dir: Path, channel: str) -> None:
+    """The chosen release channel rides the kernel command line (M8 P3):
+    a fresh install has no @var yet (the first-boot provisioner creates it),
+    so the ESP stub is the only durable seed. Stable writes nothing — absence
+    means stable — and a beta stub survives A/B updates because the ESP is
+    never touched by the updater. The control plane adopts the choice into its
+    settings table at first boot; from then on the materialized channel file
+    outranks the command line. boot/grub.cfg sources this file into every
+    linux line, next to the amdgpu kernel-params stub it mirrors.
+    """
+    stub = grub_dir / "channel-params"
+    if channel == "beta":
+        stub.write_text("set channel_params='lemonseed.channel=beta'\n", encoding="utf-8")
+    elif stub.is_file():
+        stub.unlink()
+
+
+def apply_channel_file(disk: str, channel: str) -> None:
+    """Record the chosen release channel on the target's user-data (M8 P3, D-C4).
+
+    ``@var/lib/lemonseed/channel`` is the file the packaged updater wrapper
+    reads (the settings table's materialization), so the box checks the channel
+    the installer was asked for. Only non-stable channels are written: absence
+    means stable. The control plane imports the value into ``cp_meta`` at boot
+    and owns the file from then on. Like the reset marker, a failed write
+    fails the install — a silently applied channel contradicts an explicit
+    choice. Only meaningful for preserved user-data: a fresh install has no
+    btrfs yet and carries the choice on the ESP instead (seed_esp).
+    """
+    try:
+        with mount_user_data(disk) as root:
+            target = root / CHANNEL_FILE_REL
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(channel + "\n", encoding="utf-8")
+    except (InstallError, OSError) as exc:
+        raise InstallError(f"Lemonseed was installed, but the channel choice was not recorded: {exc}") from exc
+    _log(syslog.LOG_INFO, f"release channel '{channel}' written to {target}")
 
 
 def parse_admin_roster(raw: str) -> list[str] | None:
@@ -481,7 +519,7 @@ def artifact_relpath(manifest: dict[str, Any], key: str) -> tuple[str, str | Non
     return path, sha
 
 
-def acquire_artifacts(progress: ProgressFn | None) -> tuple[dict[str, Path], str]:
+def acquire_artifacts(progress: ProgressFn | None, channel: str | None = None) -> tuple[dict[str, Path], str]:
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     local = artifact_dir()
     if local:
@@ -527,13 +565,33 @@ def acquire_artifacts(progress: ProgressFn | None) -> tuple[dict[str, Path], str
         )
         return files, str(manifest.get("version") or "local")
 
-    base = image_base_url()
-    _progress(
-        progress,
-        phase="download",
-        message=f"Fetching manifest from {base}",
-        progress=6,
-    )
+    override = image_base_url()
+    if override:
+        # A lemonseed.image= / LEMONSEED_IMAGE_BASE_URL source override:
+        # production-strict, unchanged (D8).
+        base = override
+        _progress(
+            progress,
+            phase="download",
+            message=f"Fetching manifest from {base}",
+            progress=6,
+        )
+    else:
+        # GitHub discovery (M8 P3): the channel resolves to a release; the
+        # assets then ride the CDN exactly like any override set.
+        picked = lemonseed_artifacts.resolve_channel(channel)
+        resolved = lemonseed_artifacts.resolve_release_base(picked)
+        if resolved is None:
+            raise InstallError(
+                f"No release on channel '{picked}' to install — the channel is up to date"
+            )
+        base, tag = resolved
+        _progress(
+            progress,
+            phase="download",
+            message=f"Channel {picked}: release {tag}",
+            progress=4,
+        )
     manifest, dir_url = fetch_manifest(base)
     version = manifest.get("version", "unknown")
     if manifest.get("payload"):
@@ -661,6 +719,7 @@ def seed_esp(
     disk: str,
     files: dict[str, Path],
     progress: ProgressFn | None,
+    channel: str = "stable",
 ) -> None:
     esp = wait_part(disk, "ESP")
     ESP_MOUNT.mkdir(parents=True, exist_ok=True)
@@ -714,6 +773,8 @@ def seed_esp(
 
         if AB_HELPER.is_file():
             _run(["bash", str(AB_HELPER), "init", "--esp", str(ESP_MOUNT)])
+
+        write_channel_stub(grub_dir, channel)
 
         # APU iGPU shared memory: write the ttm GRUB stub to the target
         # ESP so the first appliance boot already has the correct GPU/CPU
@@ -800,6 +861,7 @@ def run_install(
     progress: ProgressFn | None = None,
     preserve_user_data: bool = False,
     reset_admin_credentials: bool = False,
+    channel: str = "stable",
 ) -> None:
     _progress(
         progress,
@@ -820,7 +882,7 @@ def run_install(
         error=None,
         can_reboot=False,
     )
-    files, version = acquire_artifacts(progress)
+    files, version = acquire_artifacts(progress, channel=channel)
     if preserve_user_data and not disk.get("preservable_user_data"):
         raise InstallError("Preserve user data was requested for an unverified disk")
     partition_disk(disk_path, progress, preserve_user_data=preserve_user_data)
@@ -828,7 +890,7 @@ def run_install(
     _progress(progress, phase="write", message="Writing system image to root-a", progress=58)
     write_raw(files["root.squashfs"], root_a, progress, 58, 84)
     _progress(progress, phase="write", message="System image written", progress=85)
-    seed_esp(disk_path, files, progress)
+    seed_esp(disk_path, files, progress, channel=channel)
     # Flush target disk before inviting media removal — the live installer
     # root is still on that CD/USB and will vanish when it is ejected.
     _progress(
@@ -877,6 +939,13 @@ def run_install(
         _log(syslog.LOG_WARNING, "admin reset requested without preserved user data; skipped")
     if preserve_user_data:
         apply_reset_marker(disk_path, reset_admin_credentials)
+        # The chosen channel is recorded on preserved user-data (D-C4). A
+        # fresh install carries it on the ESP instead (see seed_esp) — @var
+        # does not exist until the first-boot provisioner runs. A failed write
+        # fails the install: a silently flipped channel contradicts an
+        # explicit choice, the same standard the reset marker is held to.
+        if channel != "stable":
+            apply_channel_file(disk_path, channel)
     _progress(
         progress,
         phase="await_usb",
