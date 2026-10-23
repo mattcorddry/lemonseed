@@ -209,7 +209,7 @@ shipped (D-C4). Bare metal shares BM-1 with P4/P5 (below). Design record:
 
 ### Problem
 
-The channel is a flat HTTP directory on `test.lemonseed.ai` — hardcoded in
+The channel is a flat HTTP directory on `dev-server` — hardcoded in
 `scripts/lemonseed_artifacts.py` and `installer/install.py` (`IMAGE_BASE_DEFAULT`,
 which must agree), served from an RFC1918 address, signature-less, and useless to anyone
 off that network (D8). The updater (`status|apply|cancel|check`, `--url`/`--dir`,
@@ -234,11 +234,11 @@ same is true of the installer.
   release name is `$VERSION`.
 - **Flags: source × trust (D8, D10).** `--url=BASE` is a source override and remains
   **production-strict** (the base must serve a signed manifest — that is how
-  `test.lemonseed.ai` stays usable as a private mirror). `--dir=PATH` is unchanged for
+  `dev-server` stays usable as a private mirror). `--dir=PATH` is unchanged for
   local artifact sets. `--dev` skips signature verification and all GitHub semantics and
   composes with both. `--dev` is CLI-only; the portal's install path is always
   production-strict.
-- **De-hardcode (D8, D23).** Every hardcoded `test.lemonseed.ai` reference leaves the
+- **De-hardcode (D8, D23).** Every hardcoded `dev-server` reference leaves the
   appliance and the installer; `IMAGE_BASE_DEFAULT` becomes the GitHub releases base in
   both files, which must agree (existing rule). `scripts/push-image-to-website.sh` is
   **removed** in this iteration — dev iterations run through `--url`/`--dir` against a
@@ -540,7 +540,7 @@ mid-build:
 | **D5** | The updater **scans GitHub releases** via the API and picks by channel: stable = newest non-prerelease, beta = newest including prereleases (P3). |
 | **D6** | Channels are **stable** and **beta**. The **installer asks**, defaulting to stable (brand-new hardware may need beta); `--channel=(beta|stable)` covers unattended installs; the choice persists as a **CP DB setting** an admin can flip to beta (P5). Tags are `v$VERSION`; release name `$VERSION`. |
 | **D7** | Tags are `v$VERSION`; release name `$VERSION`; channel labels flip as releases mature. |
-| **D8** | All hardcoded `test.lemonseed.ai` references are removed from the appliance and installer; it remains reachable via `--url` only (private RFC1918 mirror). |
+| **D8** | All hardcoded `dev-server` references are removed from the appliance and installer; it remains reachable via `--url` only (private RFC1918 mirror). |
 | **D9** | The download path is exercised end-to-end only after the repo flips **public**; no token or credential ever ships in the image. |
 | **D10** | `--dev` disables signature verification and GitHub semantics, is CLI-only, and composes with `--url`/`--dir` (source × trust are orthogonal). Production is **fail-closed**. |
 | **D11** | A dedicated CI + build + signing box holds a **single long-lived** signing key; the signing step is modular for a future hardware key (D15). |
@@ -566,9 +566,9 @@ mid-build:
 
 1. ~~Repo coordinates~~ — **answered:** `https://github.com/mattcorddry/lemonseed`; may
    move to a new owner later, so the base URL stays one constant per file.
-2. ~~Key escrow~~ — **answered privately:** the signing key lives in 1Password plus a
-   physical printout in a fireproof safe; not documented in the public repo —
-   `SIGNING.md` records only that escrow exists.
+2. ~~Key escrow~~ — **answered privately:** the signing key is escrowed; where and
+   how is deliberately not documented in the public repo — `SIGNING.md` records only
+   that escrow exists.
 3. ~~Part size~~ — **answered:** 1 GiB parts; the final part is a remainder.
 4. ~~Channel flip UX~~ — **answered:** an audit log entry only; no banner for beta.
 5. ~~Installer channel prompt~~ — **answered:** the installer asks, defaulting to

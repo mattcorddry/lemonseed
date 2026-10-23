@@ -133,7 +133,7 @@ verify manifest signature            (P1, already wired)
 Failures are legible and fail-closed: corrupt part, short part, chunk-count mismatch,
 tar length/hash mismatch, unexpected tar member, extracted-file hash mismatch — each
 names the asset. A manifest without a `payload` block (flat sets: `--dir` raw dirs, the
-current `test.lemonseed.ai` channel) keeps the existing path unchanged, so the channel
+current `dev-server` channel) keeps the existing path unchanged, so the channel
 keeps working until P3 moves it.
 
 ### 4.1 Staging: 1× disk, `/var`-backed, cleaned up

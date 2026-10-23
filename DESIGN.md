@@ -2,7 +2,7 @@
 
 Status: **living design, as built** — M1–M5 shipped; M6 landed through **M6.6** (Open WebUI durable config + control-plane reconciliation, AMD Vulkan support, model picker, session & error contract; 2026-10). M7 has begun: **P2 (SRP-6a sign-in), P3 (household accounts + audit) and P4 (groups + OWUI guards) are built** — as APIs; the portal screens over them are not. LiteLLM friendly model names and the portal power controls remain in **M7**.
 
-Related: [Concept.md](./Concept.md) (product vision), [Requirements.md](./Requirements.md), [AGENTS.md](./AGENTS.md) (how to change code and close a sprint).
+Related: [Requirements.md](./Requirements.md), [AGENTS.md](./AGENTS.md) (how to change code and close a sprint).
 
 **How to read this repo's docs**
 
@@ -11,13 +11,13 @@ Related: [Concept.md](./Concept.md) (product vision), [Requirements.md](./Requir
 | `DESIGN.md` (this file) | How the product works **as built**, plus the consolidated backlog. The product/architecture contract. |
 | `AGENTS.md` | Engineering process: conventions, test lifecycle, command map. |
 | `proposals/M*/` | **Milestone design records** — the reasoning, alternatives and phase plans behind each milestone. Historical: where they disagree with this file, **this file wins** on current behavior. |
-| `Concept.md` / `Requirements.md` | Product intent and historical requirements. Defer to this file when unsure. |
+| `Requirements.md` | Historical requirements. Defer to this file when unsure. |
 
-This document captures architectural decisions. Product intent lives in Concept.md; this file translates that intent into buildable decisions and records what the appliance actually does today.
+This document captures architectural decisions. The product intent it serves is framed in §0 below; this file translates that intent into buildable decisions and records what the appliance actually does today.
 
 ---
 
-## 0. Product framing (from Concept.md)
+## 0. Product framing
 
 Lemonseed is a **local, multi-user home AI hub** — not a cloud client and not a DIY container toolkit. The OS appliance (read-only SquashFS, A/B updates, installer, control plane) exists so non-technical households can run open models privately on LAN hardware.
 
@@ -653,7 +653,7 @@ interface's own address, high port 8083. As built (M8 P2), a release **is** a sh
 .
 ├── DESIGN.md                 # this file — as-built contract + backlog
 ├── AGENTS.md                 # engineering process + test lifecycle
-├── README.md, Concept.md, Requirements.md
+├── README.md, Requirements.md
 ├── Makefile, flake.nix (defines `mkAppliance` + the appliance / appliance-qemu
 │   / installer outputs), flake.lock
 ├── partitions.yaml           # layout source of truth (§5)
@@ -691,7 +691,6 @@ interface's own address, high port 8083. As built (M8 P2), a release **is** a sh
 │                             # run-unit-tests.sh, check-untracked.sh, nix-gc.sh,
 │                             # sign.sh, gen-keys.sh, and their test_*.py
 ├── assets/brand/             # brand marks / favicon
-├── artifacts/                # captured hardware references (lspci, vulkaninfo)
 ├── proposals/                # milestone design records (§2) + forward-looking ideas
 ├── keys/                     # optional local test keys (gitignored contents)
 └── out/                      # build outputs (gitignored)
@@ -727,7 +726,7 @@ Moved to [BACKLOG](BACKLOG.md)
 
 | Topic | Decision |
 |-------|----------|
-| Product | Local multi-user home AI hub; Concept.md is product source |
+| Product | Local multi-user home AI hub; §0 Product framing is product source |
 | Arch | x86_64; ARM later |
 | Firmware | EFI-only for now |
 | Bootloader | GRUB EFI |
@@ -781,7 +780,7 @@ Moved to [BACKLOG](BACKLOG.md)
 | Update policy | **Never auto-download and never auto-install.** A weekly check (heavily fuzzed, `sleep $(( $RANDOM * 86400 / 32768 ))`) and a manual “check now” run the same workflow; on success they light a red dot on the settings icon for admins and arm the update button. Rejected: silent auto-update on a household box that may be mid-pull. |
 | Shutdown timing | **systemd owns the timeout** for reboot/shutdown; the CP asks and gets out of the way rather than wrapping systemd in another timer script. |
 | Destructive-action confirms | Typed "type the word to continue" interstitials are reserved for **data-destroying** actions (settings reset, user delete). Reboot, shutdown and update are data-safe, so they get an explainer plus a confirm — no typing. |
-| Release channel | **GitHub releases** since M8 P3: discovery is one `GET /releases` per check; `stable` = newest non-draft non-prerelease, `beta` = newest non-draft release; assets ride the CDN. The channel is *only* GitHub's prerelease flag (D-C1) — the signed manifest describes the payload, so a flip is a metadata edit, and switching channels never downgrades (D-C2). The setting lives in the CP settings table (`cp_meta`), materialized to `/var/lib/lemonseed/channel` for the DB-free root jobs; the installer seeds it. The old `test.lemonseed.ai` origin survives only as a `--url` value. |
+| Release channel | **GitHub releases** since M8 P3: discovery is one `GET /releases` per check; `stable` = newest non-draft non-prerelease, `beta` = newest non-draft release; assets ride the CDN. The channel is *only* GitHub's prerelease flag (D-C1) — the signed manifest describes the payload, so a flip is a metadata edit, and switching channels never downgrades (D-C2). The setting lives in the CP settings table (`cp_meta`), materialized to `/var/lib/lemonseed/channel` for the DB-free root jobs; the installer seeds it. The old `dev-server` origin survives only as a `--url` value. |
 | Release payload (M8 P2) | **All appliance artifacts ship as one canonical tar cut into fixed 1 GiB `payload-NNN.part` parts**, never gzipped — the SquashFS is already zstd-compressed, so a second layer wins nothing. `manifest.json` stays outside the tar and describes both the chunks and the outputs; the installer ISO ships as its own direct asset. `make release` builds → packs → signs → self-verifies → stages `out/release-<version>/`; the hand-run SCP (`push-image-to-website.sh`) is removed (D23) and publishing becomes P4's GitHub-release job. Design: [`proposals/M8/PACKAGING.md`](./proposals/M8/PACKAGING.md). [2026-10, M8 P2] |
 | Auth without TLS | The appliance is reached by mDNS name over **plain HTTP**, so TLS is not available: there is no FQDN for a public cert, browsers reject self-signed certs and re-block them, and importing a private CA is beyond a home user. Because the transport cannot be trusted, the design goal becomes **never put the plaintext password on the wire at all** — a PAKE (SRP-6a) rather than client-side hashing, which is only obfuscation. See `proposals/M7/PLAN.md` D1. |
 | SRP rollout | **SRP-only, no migration path** (chosen over shipping SRP alongside bcrypt, and over a one-time migrate-on-next-sign-in). Reason: a mixed tree is a tree with two auth paths, one of which is the thing we are removing; and there is **no install base**, so a breaking change is free today and expensive later. bcrypt cannot yield an SRP verifier (one-way), so "migrate on next sign-in" would have kept the plaintext POST alive indefinitely. Consequence: **all existing test machines need a fresh reinstall**, and A/B rollback across the boundary cannot sign anyone in (§11). |

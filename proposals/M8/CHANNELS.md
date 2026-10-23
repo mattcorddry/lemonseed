@@ -3,7 +3,7 @@
 **Status: approved and shipped.** Implements `proposals/M8/PLAN.md` §P3 with the four
 review decisions below. P1 (signed manifest, fail-closed verifier) and P2 (sharded
 payload, `make release`) are prerequisites and are shipped; this phase moved the
-channel from a flat HTTP directory on `test.lemonseed.ai` to **GitHub releases**,
+channel from a flat HTTP directory on `dev-server` to **GitHub releases**,
 added the **stable/beta channel concept**, and de-hardcoded the old origin (D8, D23).
 
 **Decisions taken on review (2026-10-20):**
@@ -28,7 +28,7 @@ added the **stable/beta channel concept**, and de-hardcoded the old origin (D8, 
 
 ## 1. Problem
 
-`IMAGE_BASE_DEFAULT = "http://test.lemonseed.ai/releases/stable/"` is hardcoded in
+`IMAGE_BASE_DEFAULT = "http://dev-server/releases/stable/"` is hardcoded in
 `scripts/lemonseed_artifacts.py` and `installer/install.py` (the two must agree). It is
 an RFC1918 origin over plain HTTP: useless off that network, and one DNS-poisoning
 sentence away from a malicious image for anyone on it. The updater
@@ -112,7 +112,7 @@ Write paths, one direction each:
 | Invocation | Source | Signature |
 |---|---|---|
 | *(default)* | GitHub discovery, per channel | **verified** |
-| `--url=BASE` | BASE (flat dir incl. `test.lemonseed.ai` mirrors and `file://`) | **verified** — production-strict, unchanged |
+| `--url=BASE` | BASE (flat dir incl. `dev-server` mirrors and `file://`) | **verified** — production-strict, unchanged |
 | `--dir=PATH` | local artifact set | verified; a bare unsigned dev set stays allowed |
 | `--dev` | default source (discovery or `--url`/`--dir`) | **skipped** — no signature, no GitHub semantics enforced |
 
@@ -146,7 +146,7 @@ Write paths, one direction each:
   `RELEASES_API_DEFAULT = "https://api.github.com/repos/mattcorddry/lemonseed/releases?per_page=10"`,
   appears in `scripts/lemonseed_artifacts.py` and the vendored `installer/install.py`
   under the existing "must agree" rule — and a unit test pins the agreement this time
-  (the comment alone let it drift once already). The old `test.lemonseed.ai` origin
+  (the comment alone let it drift once already). The old `dev-server` origin
   survives only as a `--url` value in docs/proposals, never as a constant.
 - `lemonseed.image=` on the kernel cmdline keeps working as a source override
   (rescues, kexec-style testing); it overrides discovery exactly like `--url`.

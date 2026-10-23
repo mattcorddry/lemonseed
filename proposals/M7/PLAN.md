@@ -729,15 +729,15 @@ before we build a UI on top of it.
 
 Per your note, the updater refactor, release signing, and the move to GitHub releases leave
 P5 entirely (see "Split out to M8"). **D2 — which channel — is decided
-(`http://test.lemonseed.ai/releases/stable/`, because the public name is behind Cloudflare
+(`http://dev-server/releases/stable/`, because the public name is behind Cloudflare
 and Cloudflare prohibits large proxied objects), and it is already applied**, so P5's
 *Check now* starts pointing at a channel that actually has releases:
 
 | Site | Before | Now |
 |------|--------|-----|
-| `scripts/lemonseed_artifacts.py` `IMAGE_BASE_DEFAULT` | `https://lemonseed.ai/releases/stable/` | `http://test.lemonseed.ai/releases/stable/` |
+| `scripts/lemonseed_artifacts.py` `IMAGE_BASE_DEFAULT` | `https://lemonseed.ai/releases/stable/` | `http://dev-server/releases/stable/` |
 | `installer/install.py` `IMAGE_BASE_DEFAULT` | same | same change, with a comment that the two must agree |
-| `scripts/push-image-to-website.sh` `URI` | `https://lemonseed.ai/releases/stable/` | `http://test.lemonseed.ai/releases/stable/` |
+| `scripts/push-image-to-website.sh` `URI` | `https://lemonseed.ai/releases/stable/` | `http://dev-server/releases/stable/` |
 | `nixos/installer/modules/web.nix` `LEMONSEED_IMAGE_BASE_URL` | already the test URL | unchanged |
 | `DESIGN.md` §8 + decision log | "lemonseed.ai" | internal origin record, with the Cloudflare reason and the signing caveat |
 
@@ -745,7 +745,7 @@ Two honest caveats:
 
 - **`SCP_PATH` stays `/websites/lemonseed.ai/releases/stable/` — resolved, and the
   question itself was the wrong one to ask.** `scripts/push-image-to-website.sh` is the
-  existing, in-use deploy path for the host that serves `test.lemonseed.ai`; it is not
+  existing, in-use deploy path for the host that serves `dev-server`; it is not
   new code with an unverified constant, it is the mechanism that already publishes this
   channel. **Keep using it. No new deploy mechanism until GitHub releases land in M8.**
   Whether `SCP_PATH` and the vhost root line up is therefore settled by the next real
@@ -756,7 +756,7 @@ Two honest caveats:
 
 This also raises the stakes on signing, which is M8's first job: an internal HTTP origin with
 **no signature verification anywhere in the tree** means anyone who can poison
-`test.lemonseed.ai` can serve a malicious `root.squashfs`. The manifest's SHA-256s come from
+`dev-server` can serve a malicious `root.squashfs`. The manifest's SHA-256s come from
 the same origin, so they prove transfer integrity, not authenticity.
 
 ### GRUB config refresh — **two fixes, folded into P5** (from resolving Q3)
@@ -854,7 +854,7 @@ updated image, while a manual `modprobe` bound instantly, so the rules fire the
 load explicitly). Same review: the control plane's per-request access trail moved to **its own journald channel** (`-t appliance-control-plane-access`), each line carrying the real client IP from `X-Forwarded-For` and the forwarded username instead of the loopback address; and nginx's proxy-headers hash is sized for the identity gate, so the parse warnings that flooded the compiled default `/var/log/nginx/error.log` are gone (nginx errors were already journald).
 
 **BM-2 (yours):** reboot, shut down, and sign out with the chat frame open; *Check now*
-against `test.lemonseed.ai`; run a real **Download and install** and confirm it reboots
+against `dev-server`; run a real **Download and install** and confirm it reboots
 itself, shows the interstitial, and comes back on the new version; then — if you are willing,
 since it is the one path no automation can reach — install a **bad** build and confirm the
 failure banner appears after the fallback boot.
@@ -955,7 +955,7 @@ load all verified there. What remains unvalidated is the AMD **dGPU** path only.
 | | Decision |
 |---|---|
 | **D1** | No TLS is achievable (no FQDN; browsers reject self-signed certs; a private CA is beyond a home user). Status quo today is a **plaintext password in the request body** — verified in code, not assumed. Fix: **SRP-6a**, built as **P2**, plus moving rate-limit state to Valkey. TLS stays backlog, labelled *blocked on FQDN/CA UX*. |
-| **D2** | Channel is `http://test.lemonseed.ai/releases/stable/`; the public name is behind Cloudflare, which prohibits large proxied objects. **Already applied to the tree** — see the table under "Release channel" in P5. |
+| **D2** | Channel is `http://dev-server/releases/stable/`; the public name is behind Cloudflare, which prohibits large proxied objects. **Already applied to the tree** — see the table under "Release channel" in P5. |
 | **D3** | Reduced groups phase: ship the engine + system-group immutability in P4, defer the attribute editor and the content-filter attribute to the LiteLLM sprint. **Partly overtaken by P4 as built:** the key `content_filter` and its editor routes (`groups/attribute`, `groups/attribute-remove`) did ship, so what remains deferred is the **consumer** and the portal editor. Nothing reads the attribute yet, which is the honest reading of "deferred to the LiteLLM sprint" — but the value is writable today, so a later sprint should not assume the key arrives blank. |
 | **D4** | The update flow reboots by itself. Reboot and shutdown are plain `systemctl reboot` / `systemctl poweroff`; no typed interstitial on data-safe actions. This replaces the "choose: reboot into new version or not" dialog from your earlier note — you asked how the auto-reboot would land, and the honest answer is that it *deletes* that dialog. *(BM-4 supersession: a failed update now offers **Retry/Cancel** in the dialog — Retry is cancel-then-apply; there is still no way to cancel an update that is running.)* |
 
@@ -965,7 +965,7 @@ where it came from, so none of them gets re-litigated from memory:**
 | | Question | Answer, and how it was established |
 |---|---|---|
 | **Q1** | In Chrome on the portal, does `window.crypto.subtle` evaluate to `undefined`? | **Yes — `undefined`.** Verified on the portal over plain HTTP: a non-secure origin gets no SubtleCrypto, which is exactly why the appliance can never have it. The ~60-line pure-JS SHA-256 stays, and there is now only one code path to get wrong rather than a subtle/fallback pair. Pinned by `test_srp_client_js.py`, which executes that SHA-256 against the FIPS 180-4 vectors *and* against `hashlib` on identical inputs, including the 55/56/63/64/65-byte block boundaries where hand-rolled padding usually breaks. |
-| **Q2** | On `fubar-ssh.badbit.net`, is `test.lemonseed.ai` served from `/websites/lemonseed.ai/releases/stable/`? | **Resolved by decision, not by inspection: `scripts/push-image-to-website.sh` remains the deploy mechanism, unchanged.** It is the script already used to publish this channel, so it is the authority on where the bits go; `SCP_PATH` is left exactly as D2 set it. No new deploy tooling until M8 moves the channel to GitHub releases. The directory question collapses into a release-time check — publish, then fetch `${URI}/manifest.json` — rather than an open design question. |
+| **Q2** | On `the dev web host`, is `dev-server` served from `/websites/lemonseed.ai/releases/stable/`? | **Resolved by decision, not by inspection: `scripts/push-image-to-website.sh` remains the deploy mechanism, unchanged.** It is the script already used to publish this channel, so it is the authority on where the bits go; `SCP_PATH` is left exactly as D2 set it. No new deploy tooling until M8 moves the channel to GitHub releases. The directory question collapses into a release-time check — publish, then fetch `${URI}/manifest.json` — rather than an open design question. |
 | **Q3** | Do `/etc/lemonseed/grub.cfg` or `/usr/share/lemonseed/grub.cfg` exist? | **Neither is created by any `nixos/` module** — confirmed by inspection, and it is the root cause of a real field defect: `write_inactive_slot` refreshes the ESP `grub.cfg` only when `LEMONSEED_GRUB_CFG` is set, and the `lemonseed-update` wrapper does not export it. So an installed box never refreshes its GRUB config except by USB reinstall. Fix folded into P5 (see below). Note the control plane *does* receive `LEMONSEED_GRUB_CFG`; the gap is specific to the updater wrapper. |
 | **Q4** | P1 §6: OWUI group ownership. | **Decided: the CP owns groups and membership; `X-Forwarded-Groups` is the authority; OWUI mirrors on sign-in.** Chosen over "OWUI owns its groups" because the upstream sync **deletes** memberships absent from the header, so the two-owner arrangement is not merely untidy — it silently evicts users. Consequence for P4: the six unused `groups.*` entries in `owui-policy.json` are deleted rather than wired up, OWUI's own group UI is treated as **ADVISORY** (a mirror that the next sign-in will overwrite), and the hard constraint stands that **OWUI remains a vanilla upstream container with no source modification**. |
 

@@ -2,7 +2,7 @@
 
 Lemonseed is a **local home AI appliance**: a NixOS-based, read-only SquashFS image with A/B updates, a web installer, and a small control plane. The goal is private LAN chat and related workloads on ordinary PC hardware (NVIDIA and AMD Strix Halo APUs supported today), without depending on cloud AI for core use.
 
-This repository builds the appliance artifacts, the USB/EFI installer, and the bring-up tooling. Deeper design lives in [DESIGN.md](./DESIGN.md); product intent in [Concept.md](./Concept.md). Agent/process conventions live in [AGENTS.md](./AGENTS.md).
+This repository builds the appliance artifacts, the USB/EFI installer, and the bring-up tooling. Deeper design lives in [DESIGN.md](./DESIGN.md). Agent/process conventions live in [AGENTS.md](./AGENTS.md).
 
 ## Getting started
 

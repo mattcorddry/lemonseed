@@ -117,4 +117,4 @@ When coming back to the user, include briefly:
 | `AGENTS.md` | How agents should work and close sprints |
 | `README.md` | Human-oriented project entry |
 | `proposals/M*/` | Milestone design records — the reasoning and phase plans behind each milestone. Historical: `DESIGN.md` wins on current behavior |
-| `Concept.md` / `Requirements.md` | Historical / broader context — defer to DESIGN when unsure |
+| `Requirements.md` | Historical requirements — defer to DESIGN when unsure |

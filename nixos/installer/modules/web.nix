@@ -92,7 +92,6 @@ in
       Environment = [
         "LEMONSEED_INSTALLER_HOST=0.0.0.0"
         "LEMONSEED_INSTALLER_PORT=80"
-        "LEMONSEED_IMAGE_BASE_URL=http://test.lemonseed.ai/releases/stable/"
         "LEMONSEED_ROOT=/etc/lemonseed"
         "LEMONSEED_REPART_DIR=/var/lib/lemonseed/repart.d"
         "LEMONSEED_RELEASE_KEYS_DIR=${releaseKeys}"
