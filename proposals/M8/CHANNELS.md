@@ -17,9 +17,9 @@ added the **stable/beta channel concept**, and de-hardcoded the old origin (D8, 
   already runs a newer version simply stays where it is until stable catches up. The
   channel only ever *filters candidates*; the version comparison (which already
   refuses equal/older offers) is the only update decision.
-- **D-C3: `make dev-httpd`, Docker-based** — a pinned busybox `httpd` container
-  (static files only, no CGI), bound to a high port on 127.0.0.1; no dependence on
-  distro httpd paths.
+- **D-C3: `make dev-httpd`, Docker-based** — a small busybox `httpd` container
+  (`busybox:latest`, per review; static files only, no CGI), bound to a high port
+  on the primary interface's own address; no dependence on distro httpd paths.
 - **D-C4: the channel setting goes through the CP settings table now**, via the
   existing `cp_meta` KV store — a thin `get_setting`/`set_setting` wrapper, no new
   storage, no web UI in this phase.
@@ -163,8 +163,9 @@ verify-after-publish step; there is no `release-channel` script in this phase.
 Serves `./out` over HTTP for local installer/updater testing of `--url` sets —
 **via Docker**, so no distro httpd path is depended on:
 
-- pinned small image (`busybox:<current stable>`, verified at implementation — a
-couple of MB), `busybox httpd -f`: static files only, no CGI enabled;
+- small image (`busybox:latest` — a couple of MB; deliberately not version-pinned,
+  dev-tool-only, `DEV_HTTPD_IMAGE` overrides), `busybox httpd -f`: static files
+  only, no CGI enabled;
 - `--rm`, read-only bind of `./out`, high port **8083**;
 - **binding:** busybox httpd has no subnet ACL, so the restriction comes from the
   Docker publish address: the *primary interface's* own IP (iproute2-detected, the

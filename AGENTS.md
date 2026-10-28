@@ -116,5 +116,6 @@ When coming back to the user, include briefly:
 | `DESIGN.md` | Product and architecture decisions **as built**, plus the consolidated backlog |
 | `AGENTS.md` | How agents should work and close sprints |
 | `README.md` | Human-oriented project entry |
+| `RELEASE.md` | The release runbook: build/sign VM setup, per-release workflow, publish + verify, channel flip, BM drill |
 | `proposals/M*/` | Milestone design records — the reasoning and phase plans behind each milestone. Historical: `DESIGN.md` wins on current behavior |
 | `Requirements.md` | Historical requirements — defer to DESIGN when unsure |

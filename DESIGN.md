@@ -521,7 +521,7 @@ Mount flags principle: **`noexec` / `nodev` / `nosuid` wherever practical**; `/v
 | `test-update-unit` / `repart-test` / `update-test` | Narrow update tests / partition + updater smoke (the latter two need root) |
 | `check-untracked` | Flake gate: fail if non-ignored untracked files exist |
 | `nix-gc` | Store GC before a build |
-| `keys` | Generate local ed25519 test keys |
+| `keys` | Generate local EC test keys |
 | `clean` | Remove `out/` |
 
 `make test` and `make build-*` run `scripts/check-untracked.sh` first — the flake only sees tracked/staged files, so new paths must be `git add`’d.
@@ -568,45 +568,56 @@ poll. The on-box channel comes from `--channel` / the settings table (materializ
 `/var/lib/lemonseed/channel`, written by the CP's settings API and seeded by the
 installer) / the installer's ESP stub / stable, in that order.
 
-`make dev-httpd-start` / `-stop` (D-C3) serve `./out` over HTTP from a pinned busybox
-container for local `--url` testing — static files only, bound to the primary
+`make dev-httpd-start` / `-stop` (D-C3) serve `./out` over HTTP from a small busybox
+container (`busybox:latest`) for local `--url` testing — static files only, bound to the primary
 interface's own address, high port 8083. As built (M8 P2), a release **is** a sharded asset set: `make release` stages `out/release-<version>/` containing the signed `manifest.json`, the payload cut into fixed **1 GiB** `payload-NNN.part` parts (a canonical pax tar of `vmlinuz`, `initrd.img` and `root.squashfs`; the final part is a remainder), and the USB installer ISO as its own direct asset recorded in the manifest. The tar is **not gzipped**: the SquashFS is already zstd-compressed and dominates the payload, so a second compression layer costs assemble-time CPU for no size win. The manifest is both the assembly plan (chunk names, order, hashes) and the root of trust (output names, lengths, SHA-256); consumers verify the signature, then each part, then the concatenated tar, then re-verify every extracted file before the A/B slot flips. Design and decisions: [`proposals/M8/PACKAGING.md`](./proposals/M8/PACKAGING.md).
 
 ### Signing
-- **As built (M8 P1):** the root of trust is a **detached ed25519 signature over
-  `manifest.json` alone** (D12) — every artifact, part and installer-image hash lives
-  inside the signed bytes, so one signature covers the whole release. `scripts/sign.sh`
-  signs only the manifest and records
-  `"signing": {"scheme": "detached-ed25519", "enabled": true, "public_key": …}` inside
-  the signed metadata; `SIGN=1 make build-*` signs, unsigned builds keep `enabled: false`
-  and are refused by every production consumer. `SIGN_MODE` is the backend seam
-  (`file` today; PKCS#11/hardware tap-to-sign reserved, D15) — the interface never
-  changes.
+- **As built (M8 P1, scheme updated in M8):** the root of trust is a **detached
+  ECDSA signature over `manifest.json` alone** (D12) — every artifact, part and
+  installer-image hash lives inside the signed bytes, so one signature covers
+  the whole release. The scheme is **ECDSA NIST P-256, SHA-256 over the exact
+  manifest bytes, DER-encoded `ECDSA-Sig-Value`** (OpenSSL's native output —
+  not raw `r‖s`); signatures are randomized (no deterministic-nonce assumption,
+  no `s` normalization). The scheme is recorded in the signed metadata as
+  `"signing": {"scheme": "detached-ecdsa-p256", "enabled": true,
+  "public_key": …}` and the verifier accepts exactly that scheme — the earlier
+  `detached-ed25519` generation was fully superseded in one cut (no install
+  base, single trust-set generation). `SIGN_MODE` is the backend seam: `file`
+  signs with a local PEM test key (milestone iteration never needs the
+  production key), `pkcs11` signs with the hardware-backed production key
+  through the openssl pkcs11 provider — the key never exists as a file, and
+  every signature requires the token's own authorization. The interface never
+  changes: directory in, `manifest.json.sig` out.
 - **The verifier is one module, two callers:** `scripts/lemonseed_verify.py`, imported by
   `scripts/lemonseed_update.py` (`check`/`apply`) and the installer's vendored pipeline
   (`installer/install.py`). Verification is **verify-before-parse**: the detached
   signature is checked against the baked trust set *before* the manifest is parsed, so
   its SHA-256 values become trustworthy only after the root of trust holds. A missing,
   empty, malformed, wrong-key or altered-manifest signature is a hard refusal with a
-  legible reason — never a warning, never a hash-only fallback (D10). P3's `--dev` will
-  be the only bypass, and it is CLI-only. The backend is a subprocess
-  `openssl pkeyutl -verify -rawin` — the signer's primitive, so the seam can carry
-  PKCS#11 verification later without touching a caller (`openssl` the binary is now in
-  the appliance, installer and updater closures).
+  legible reason — never a warning, never a hash-only fallback (D10). The
+  verifier additionally enforces the manifest's recorded scheme: anything other
+  than `detached-ecdsa-p256` is refused. The backend is a subprocess
+  `openssl pkeyutl -verify -rawin` — the signer's primitive, so the seam can
+  carry further signature backends without touching a caller (`openssl` the
+  binary is in the appliance, installer and updater closures).
 - **The trust set ships in the image (D13):** a baked `release-keys.json` — the
   authority, carrying a monotonically increasing set `version` and an explicit key list
   with a per-key `algorithm` — plus the key files it lists, at
   `/usr/share/lemonseed/release-keys/` (via `nixos/packages/release-keys.nix`, copied
   explicitly: no globs anywhere). The repo stores the same pair
-  (`keys/release-keys.json` + tracked `release-v*.pub`) and the same file pair is
+  (`keys/release-keys.json` + tracked `lemonseed-release.pub`, with the key's
+  public fingerprint recorded in the JSON) and the same file pair is
   published on lemonseed.ai for out-of-band human comparison, never fetched at runtime.
   An empty, malformed or keyless trust set refuses — fail-closed even to a broken build.
-- **Key ceremony:** one long-lived ed25519 keypair generated on the dedicated
-  CI/build/signing box (`scripts/gen-keys.sh --name release-v1`); the private key never
-  leaves the box and is escrowed privately (details deliberately not in the repo). The
-  public key is committed and published. Rotation is **designed, not exercised** (D13):
-  a transition image signed by the old key embeds the new key; the verifier accepts any
-  key in the baked set during the overlap window.
+- **Key ceremony:** the long-lived production keypair is an EC P-256 key,
+  generated in a temporary directory on the signing machine during the key
+  ceremony and imported into the signing hardware; only the public half is
+  committed and published, and custody details are deliberately not in the
+  repo. The tracked `keys/test` pair (via `make keys`) is for local iteration
+  only. Rotation is **designed, not exercised** (D13): a transition image
+  signed by the old key embeds the new key; the verifier accepts any key in
+  the baked set during the overlap window.
 - **GH-compromise posture:** an attacker with GitHub write access can publish releases
   and flip channel labels, but cannot produce a valid manifest signature. Worst case is
   selecting among *our* signed releases (downgrade/upgrade confusion), never arbitrary
@@ -630,7 +641,7 @@ interface's own address, high port 8083. As built (M8 P2), a release **is** a sh
 
 | Layer | Approach |
 |-------|----------|
-| Transport / update authenticity | HTTP + **detached ed25519 over `manifest.json`**, verified fail-closed against the baked trust set before any hash is trusted (M8 P1); TLS deliberately absent on the LAN |
+| Transport / update authenticity | HTTP + **detached ECDSA (P-256) over `manifest.json`**, verified fail-closed against the baked trust set before any hash is trusted (M8 P1, scheme updated in M8); TLS deliberately absent on the LAN |
 | Root filesystem | Read-only SquashFS; no overlay |
 | Mutable state | Minimal btrfs binds; restrictive mount flags |
 | Edge auth | **CP-native login** at the nginx boundary: signed stateless session cookie, `auth_request` → CP, identity via `X-Forwarded-*` set **only** from the verify response. Modules stay auth-naive; OWUI's own login is disabled |
@@ -750,7 +761,7 @@ Moved to [BACKLOG](BACKLOG.md)
 | Builds | Local; flakes; `build-production` / `build-qemu` / `run-qemu` / `qemu-clean` |
 | Version | Date + local counter; `VERSION` override |
 | Partition config | YAML source (`partitions.yaml`) → `gen-repart.py` → systemd-repart as apply engine |
-| Signing | **M8 P1 (as built):** detached ed25519 over `manifest.json` alone (D12); verifier `scripts/lemonseed_verify.py` shared by the updater and the installer, fail-closed, verify-before-parse; trust set = baked `release-keys.json` + listed keys, no globs (D13); openssl subprocess backend, modular for PKCS#11 (D15); `--dev` (P3) the only bypass. Rotation designed, not exercised. |
+| Signing | **M8 P1 (as built, scheme updated in M8):** detached ECDSA P-256 (SHA-256, DER) over `manifest.json` alone (D12); verifier `scripts/lemonseed_verify.py` shared by the updater and the installer, fail-closed, verify-before-parse, scheme-enforcing; trust set = baked `release-keys.json` + listed keys, no globs (D13); openssl subprocess backend, `SIGN_MODE` seam with `file` (test keys) and `pkcs11` (hardware-backed production key) backends (D15, D29). Rotation designed, not exercised. |
 | Distribution | HTTP; versioned artifact directory |
 | Installer | M4; partitions + optional admin lockout reset marker; no auth work for fresh installs; reinstall releases LVM/DM |
 | Encryption | Deferred; TPM + GRUB password planned together with closing the bring-up root login |

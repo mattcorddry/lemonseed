@@ -9,7 +9,7 @@
 set -euo pipefail
 
 NAME="lemonseed-dev-httpd"
-IMAGE="${DEV_HTTPD_IMAGE:-busybox:1.37.1-musl}"
+IMAGE="${DEV_HTTPD_IMAGE:-busybox:latest}"
 PORT="${DEV_HTTPD_PORT:-8083}"
 
 start() {

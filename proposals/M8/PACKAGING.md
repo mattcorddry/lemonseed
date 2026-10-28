@@ -92,7 +92,11 @@ Pipeline (`scripts/release.sh`):
 3. **Pack** (`scripts/release_payload.py pack`): canonical tar → cut into 1 GiB parts →
    **size gate** → write the `payload`/`installer` blocks into the manifest.
 4. **Sign** (`scripts/sign.sh`) — the signature covers the final manifest, so packing
-   strictly precedes signing.
+   strictly precedes signing. `SIGN_MODE` picks the backend: `file` (local test keys,
+   self-verified against the signing key's own public half), `pkcs11` (production,
+   self-verified against the baked trust set), or `offline` (finalizes the signing
+   block, writes no signature — the detached signature arrives out of band and the
+   completed set must pass `make release-verify`).
 5. **Stage**: the complete, upload-ready asset set lands in `out/release-<version>/`.
    Publishing is P4's job (`push-image-to-website.sh` is removed — D23).
 
@@ -105,11 +109,15 @@ ASCII. A synthetic oversize artifact must fail with the offending name (test §6
 
 ### `make release` and signing
 
-`make release` **fails without the ceremony key** — a release set is always signed;
-there are no unsigned release sets. And because `make release` stages but does not
-upload, the P4 publisher must **re-verify the signature before and after upload**
-(re-download and run the appliance's own verifier) — a release is not done until the
-publisher's check passes (PLAN §P4 self-verify).
+`make release` **always produces a signed-or-signable set**: `file` mode signs with
+the local test keys and self-verifies against them (self-consistent for local
+iteration, but appliances refuse it — the baked trust set carries only the production
+key); `pkcs11` signs with the production key and self-verifies against the baked trust
+set; `offline` stages the finalized, unsigned set for an external signing environment
+and completes only via `make release-verify`. And because `make release` stages but
+does not upload, the P4 publisher must **re-verify the signature before and after
+upload** (re-download and run the appliance's own verifier) — a release is not done
+until the publisher's check passes (PLAN §P4 self-verify).
 
 ## 4. Consumer changes: verify → assemble → verify → apply
 
