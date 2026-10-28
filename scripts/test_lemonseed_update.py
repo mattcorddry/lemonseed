@@ -37,7 +37,7 @@ def write_signed_manifest(directory: Path, manifest: dict) -> None:
     exactly what the shipped sets look like after scripts/sign.sh."""
     manifest = dict(manifest)
     manifest["signing"] = {
-        "scheme": "detached-ed25519",
+        "scheme": "detached-ecdsa-p256",
         "enabled": True,
         "public_key": "qemu-release-v1.pub",
     }
@@ -231,6 +231,59 @@ class UpdateLogicTests(unittest.TestCase):
                 self.assertIn("cancel", str(ctx.exception))
                 # --force is the operator's escape hatch, as the message says.
                 update.preflight(force=True)
+
+    def test_preflight_clears_a_landed_attempt_record(self) -> None:
+        """A record whose attempt *landed* — booting the target slot — is stale
+        success, not dirt: the next apply must proceed without a manual cancel
+        (bare-metal review: the CLI has no panel read to clear it for it)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            attempt = Path(tmp) / "update-attempt.json"
+            attempt.write_text(
+                json.dumps({"intended_version": "u1", "target_slot": "b"}),
+                encoding="utf-8",
+            )
+            with mock.patch.object(update, "cmdline_slot", return_value="b"), mock.patch.object(
+                update, "ab_status", return_value={"boot_default": "b"}
+            ), mock.patch.object(update, "ATTEMPT_FILE", attempt):
+                update.preflight(force=False)
+            self.assertFalse(attempt.exists())
+
+    def test_preflight_clears_when_the_intended_version_is_running(self) -> None:
+        """Same clearance from the other detector arm: running the intended
+        version means the update landed even if the booted slot is unclear."""
+        with tempfile.TemporaryDirectory() as tmp:
+            attempt = Path(tmp) / "update-attempt.json"
+            attempt.write_text(
+                json.dumps({"intended_version": "u1", "target_slot": "b"}),
+                encoding="utf-8",
+            )
+            with mock.patch.object(update, "cmdline_slot", return_value="a"), mock.patch.object(
+                update, "ab_status", return_value={"boot_default": "a"}
+            ), mock.patch.object(update, "running_version", return_value="u1"), mock.patch.object(
+                update, "ATTEMPT_FILE", attempt
+            ):
+                update.preflight(force=False)
+            self.assertFalse(attempt.exists())
+
+    def test_preflight_keeps_a_failed_attempt_record(self) -> None:
+        """A failed-or-stuck attempt keeps its record (and the refusal): the
+        failed-update banner is shown exactly once per failed attempt, and the
+        record surviving until it is seen is what makes that true."""
+        with tempfile.TemporaryDirectory() as tmp:
+            attempt = Path(tmp) / "update-attempt.json"
+            attempt.write_text(
+                json.dumps({"intended_version": "u1", "target_slot": "b"}),
+                encoding="utf-8",
+            )
+            with mock.patch.object(update, "cmdline_slot", return_value="a"), mock.patch.object(
+                update, "ab_status", return_value={"boot_default": "a"}
+            ), mock.patch.object(update, "running_version", return_value="v0"), mock.patch.object(
+                update, "ATTEMPT_FILE", attempt
+            ):
+                with self.assertRaises(update.UpdateError) as ctx:
+                    update.preflight(force=False)
+                self.assertIn("cancel", str(ctx.exception))
+                self.assertTrue(attempt.exists())
 
 
 class UpdateApplyTests(unittest.TestCase):

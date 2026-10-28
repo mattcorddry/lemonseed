@@ -81,7 +81,7 @@ priv = Path(sys.argv[2])
 mp = d / "manifest.json"
 manifest = json.loads(mp.read_text(encoding="utf-8"))
 manifest["signing"] = {
-    "scheme": "detached-ed25519",
+    "scheme": "detached-ecdsa-p256",
     "enabled": True,
     "public_key": "qemu-release-v1.pub",
 }
@@ -178,6 +178,7 @@ for name, body in files.items():
     (root / name).write_bytes(body)
     manifest["artifacts"][name] = {
         "path": name,
+        "length": len(body),
         "sha256": hashlib.sha256(body).hexdigest(),
     }
 (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -214,6 +215,7 @@ for name, body in files.items():
     (root / name).write_bytes(body)
     manifest["artifacts"][name] = {
         "path": name,
+        "length": len(body),
         "sha256": hashlib.sha256(body).hexdigest(),
     }
 (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

@@ -188,11 +188,27 @@ def preflight(*, force: bool) -> None:
                 "run 'lemonseed-ab status' and set a default first"
             )
     refuse_dirty_state(force=force)
-    if ATTEMPT_FILE.exists() and not force:
-        raise UpdateError(
-            f"a previous attempt is still recorded ({ATTEMPT_FILE}); "
-            "run 'lemonseed-update cancel' first"
+    if ATTEMPT_FILE.exists():
+        # The record is only dirt when the attempt did not land: booting the
+        # target (or running the intended version) is a landed update whose
+        # record simply outlived the panel's first read. Clearing it here lets
+        # the next CLI apply proceed without a manual cancel; a failed-or-stuck
+        # attempt keeps the refusal, because the failed-update banner's one-shot
+        # semantics depend on the record surviving until it is seen.
+        attempt = _read_attempt()
+        target = str(attempt.get("target_slot") or "")
+        intended = str(attempt.get("intended_version") or "")
+        landed = (target and current_slot() == target) or (
+            intended and running_version() == intended
         )
+        if landed:
+            clear_attempt()
+            log("cleared the arm-time record of the update that landed")
+        elif not force:
+            raise UpdateError(
+                f"a previous attempt is still recorded ({ATTEMPT_FILE}); "
+                "run 'lemonseed-update cancel' first"
+            )
 
 
 def atomic_copy(src: Path, dest: Path) -> None:
@@ -367,6 +383,15 @@ def cmd_cancel() -> int:
         umount_esp()
     clear_attempt()
     return 0
+
+
+def _read_attempt() -> dict[str, Any]:
+    """The arm-time record, else {} — an unreadable one reads as no record."""
+    try:
+        attempt = json.loads(ATTEMPT_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return attempt if isinstance(attempt, dict) else {}
 
 
 def record_attempt(version: str, target_slot: str) -> None:
