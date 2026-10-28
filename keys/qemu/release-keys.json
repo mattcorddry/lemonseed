@@ -1,11 +1,11 @@
 {
-  "version": 1,
+  "version": 2,
+  "comment": "QEMU/smoke-test trust set only; the private key is tracked so any build host can sign the QEMU signing smoke's artifact sets. Never used for production releases.",
   "keys": [
     {
       "version": 1,
-      "algorithm": "ed25519",
-      "file": "qemu-release-v1.pub",
-      "comment": "QEMU/smoke-test trust set only; the private key is tracked so any build host can sign the QEMU signing smoke's artifact sets. Never used for production releases."
+      "algorithm": "ecdsa-p256",
+      "file": "qemu-release-v1.pub"
     }
   ]
 }

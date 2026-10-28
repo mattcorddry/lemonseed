@@ -1,11 +1,11 @@
 {
-  "version": 1,
+  "version": 2,
   "keys": [
     {
       "version": 1,
-      "algorithm": "ed25519",
-      "file": "release-v1.pub",
-      "fingerprint": "7fe8a00239367c67"
+      "algorithm": "ecdsa-p256",
+      "file": "lemonseed-release.pub",
+      "fingerprint": "9ce7567b223d7116"
     }
   ]
 }

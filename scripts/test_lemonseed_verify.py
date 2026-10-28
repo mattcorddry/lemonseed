@@ -2,7 +2,7 @@
 """Unit tests for lemonseed_verify (M8 P1): fail-closed signature verification.
 
 Uses the committed known-answer vector (scripts/test-data/signing/) for the
-openssl ed25519 verify path, and freshly generated keys in a temp dir for the
+openssl ECDSA P-256 verify path, and freshly generated keys in a temp dir for the
 refusal matrix. Requires openssl on PATH, like the signer.
 """
 
@@ -45,7 +45,7 @@ class TrustSetTestCase(unittest.TestCase):
         for key in keys:
             name = f"{key.name}"
             (directory / name).write_bytes(key.read_bytes())
-            entries.append({"version": 1, "algorithm": "ed25519", "file": name})
+            entries.append({"version": 1, "algorithm": "ecdsa-p256", "file": name})
         if raw is not None:
             (directory / verify.TRUST_MANIFEST_NAME).write_text(raw, encoding="utf-8")
         else:
@@ -83,11 +83,27 @@ class KnownAnswerTest(TrustSetTestCase):
         verified = verify.verify_manifest_files(VECTOR_DIR / "manifest.json", directory=trust)
         self.assertEqual(verified.name, "known-answer.pub")
 
+    def test_ecdsa_signatures_are_randomized(self):
+        # RFC 6979 is NOT used: two signatures over the same bytes differ, and
+        # both must verify — the verifier never assumes deterministic nonces
+        # and never normalizes an s value (SIGNING.md §2).
+        trust = self.make_trust_dir([VECTOR_PUB])
+        first = self.sign(VECTOR_DIR / "known-answer.priv", VECTOR_MANIFEST)
+        second = self.sign(VECTOR_DIR / "known-answer.priv", VECTOR_MANIFEST)
+        self.assertNotEqual(first, second)
+        self.assertEqual(verify.verify_manifest(VECTOR_MANIFEST, first, trust).name, "known-answer.pub")
+        self.assertEqual(verify.verify_manifest(VECTOR_MANIFEST, second, trust).name, "known-answer.pub")
+
     def test_wrong_key_refuses(self):
         with tempfile.TemporaryDirectory() as tmp:
             other = Path(tmp) / "other.pub"
             subprocess.run(
-                ["openssl", "genpkey", "-algorithm", "Ed25519", "-out", Path(tmp) / "other.priv"],
+                [
+                    "openssl", "genpkey", "-algorithm", "EC",
+                    "-pkeyopt", "ec_paramgen_curve:P-256",
+                    "-pkeyopt", "ec_param_enc:named_curve",
+                    "-out", Path(tmp) / "other.priv",
+                ],
                 check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             subprocess.run(
@@ -187,7 +203,7 @@ class TrustSetRefusalTest(TrustSetTestCase):
                 json.dumps(
                     {
                         "version": 1,
-                        "keys": [{"version": 1, "algorithm": "ed25519", "file": "*.pub"}],
+                        "keys": [{"version": 1, "algorithm": "ecdsa-p256", "file": "*.pub"}],
                     }
                 ),
                 encoding="utf-8",
@@ -204,7 +220,7 @@ class TrustSetRefusalTest(TrustSetTestCase):
                 json.dumps(
                     {
                         "version": 1,
-                        "keys": [{"version": 1, "algorithm": "ed25519", "file": "absent.pub"}],
+                        "keys": [{"version": 1, "algorithm": "ecdsa-p256", "file": "absent.pub"}],
                     }
                 ),
                 encoding="utf-8",
@@ -218,7 +234,12 @@ class TrustSetRefusalTest(TrustSetTestCase):
             second = Path(tmp) / "second.priv"
             second_pub = Path(tmp) / "second.pub"
             subprocess.run(
-                ["openssl", "genpkey", "-algorithm", "Ed25519", "-out", str(second)],
+                [
+                    "openssl", "genpkey", "-algorithm", "EC",
+                    "-pkeyopt", "ec_paramgen_curve:P-256",
+                    "-pkeyopt", "ec_param_enc:named_curve",
+                    "-out", str(second),
+                ],
                 check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             subprocess.run(
@@ -253,16 +274,39 @@ class SigningMetadataTest(unittest.TestCase):
     def test_enabled_and_listed_key_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
-            (directory / "release-v1.pub").write_bytes(b"key")
+            (directory / "lemonseed-release.pub").write_bytes(b"key")
             import os
 
             os.environ[verify.TRUST_DIR_ENV] = tmp
             try:
                 verify.check_signing_metadata(
-                    self.make_manifest(enabled=True, scheme="detached-ed25519", public_key="release-v1.pub")
+                    self.make_manifest(enabled=True, scheme="detached-ecdsa-p256", public_key="lemonseed-release.pub")
                 )
             finally:
                 os.environ.pop(verify.TRUST_DIR_ENV, None)
+
+    def test_wrong_scheme_refuses(self):
+        # Single trust generation: the previous scheme is rejected outright,
+        # not merely superseded (SIGNING.md §2).
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "lemonseed-release.pub").write_bytes(b"key")
+            import os
+
+            os.environ[verify.TRUST_DIR_ENV] = tmp
+            try:
+                with self.assertRaises(verify.VerificationError) as ctx:
+                    verify.check_signing_metadata(
+                        self.make_manifest(enabled=True, scheme="detached-ed25519", public_key="lemonseed-release.pub")
+                    )
+                self.assertIn("expected", str(ctx.exception))
+            finally:
+                os.environ.pop(verify.TRUST_DIR_ENV, None)
+
+    def test_missing_scheme_refuses(self):
+        with self.assertRaises(verify.VerificationError) as ctx:
+            verify.check_signing_metadata(self.make_manifest(enabled=True, public_key="lemonseed-release.pub"))
+        self.assertIn("expected", str(ctx.exception))
 
     def test_disabled_signing_refuses(self):
         with self.assertRaises(verify.VerificationError) as ctx:
@@ -282,7 +326,7 @@ class SigningMetadataTest(unittest.TestCase):
             try:
                 with self.assertRaises(verify.VerificationError) as ctx:
                     verify.check_signing_metadata(
-                        self.make_manifest(enabled=True, public_key="release-v9.pub")
+                        self.make_manifest(enabled=True, scheme="detached-ecdsa-p256", public_key="release-v9.pub")
                     )
                 self.assertIn("does not contain it", str(ctx.exception))
             finally:

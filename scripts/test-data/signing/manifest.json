@@ -1,1 +1,1 @@
-{"version": "known-answer", "artifacts": {"root.squashfs": {"path": "root.squashfs", "sha256": "5f1c1b6a5b0f0b7c8a2a0e6e2b2b1f9b7a2c0d5e9f3a1b2c3d4e5f6a7b8c9d0e"}}, "signing": {"scheme": "detached-ed25519", "enabled": true, "public_key": "known-answer.pub"}}
+{"version": "known-answer", "artifacts": {"root.squashfs": {"path": "root.squashfs", "sha256": "5f1c1b6a5b0f0b7c8a2a0e6e2b2b1f9b7a2c0d5e9f3a1b2c3d4e5f6a7b8c9d0e"}}, "signing": {"scheme": "detached-ecdsa-p256", "enabled": true, "public_key": "known-answer.pub"}}

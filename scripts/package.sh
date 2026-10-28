@@ -61,6 +61,11 @@ install -m 0644 "$(readlink -f "${BUILD_DIR}/artifacts/initrd.img")" "${OUT_DIR}
 sha256_vmlinuz="$(sha256sum "${OUT_DIR}/vmlinuz" | awk '{print $1}')"
 sha256_squashfs="$(sha256sum "${OUT_DIR}/root.squashfs" | awk '{print $1}')"
 sha256_initrd="$(sha256sum "${OUT_DIR}/initrd.img" | awk '{print $1}')"
+# Lengths ride inside the signed bytes too: the payload assembler re-verifies
+# every extracted artifact against length + sha256 (PACKAGING.md §2.2).
+size_vmlinuz="$(stat -c %s "${OUT_DIR}/vmlinuz")"
+size_squashfs="$(stat -c %s "${OUT_DIR}/root.squashfs")"
+size_initrd="$(stat -c %s "${OUT_DIR}/initrd.img")"
 
 cat >"${OUT_DIR}/manifest.json" <<EOF
 {
@@ -72,19 +77,22 @@ cat >"${OUT_DIR}/manifest.json" <<EOF
   "artifacts": {
     "vmlinuz": {
       "path": "vmlinuz",
+      "length": ${size_vmlinuz},
       "sha256": "${sha256_vmlinuz}"
     },
     "root.squashfs": {
       "path": "root.squashfs",
+      "length": ${size_squashfs},
       "sha256": "${sha256_squashfs}"
     },
     "initrd.img": {
       "path": "initrd.img",
+      "length": ${size_initrd},
       "sha256": "${sha256_initrd}"
     }
   },
   "signing": {
-    "scheme": "detached-ed25519",
+    "scheme": "detached-ecdsa-p256",
     "enabled": false
   }
 }

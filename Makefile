@@ -27,6 +27,7 @@ DISK ?=
 .PHONY: help build-production build-qemu build-installer release run-qemu qemu-clean clean keys \
 	repart-generate disk-repart grub-cfg repart-test update-test test test-qemu \
 	test-update-unit check-untracked nix-gc lint refresh-image-pins check-image-pins \
+	release-verify \
 	test-gateway dev-httpd-start dev-httpd-stop
 
 help:
@@ -58,8 +59,9 @@ help:
 	@echo "  make check-untracked   Fail if untracked (non-ignored) files exist"
 	@echo "  make nix-gc            Soft Nix GC (drop stale build roots; no -d)"
 	@echo "  make clean             Remove out/"
-	@echo "  make keys              Generate local ed25519 test keys under keys/"
+	@echo "  make keys              Generate local EC test keys under keys/"
 	@echo "  make release           Build + pack + sign + stage a release (out/release-<version>/)"
+	@echo "  make release-verify    Re-verify a staged release set (out/release-<version>/)"
 	@echo "  make dev-httpd-start   Serve ./out over HTTP (Docker busybox, primary-IF only)"
 	@echo "  make dev-httpd-stop    Stop the dev-httpd container"
 	@echo "  make help              Show this help (default)"
@@ -89,6 +91,9 @@ build-installer:
 
 release:
 	"$(ROOT)/scripts/release.sh"
+
+release-verify:
+	"$(ROOT)/scripts/release.sh" verify
 
 dev-httpd-start:
 	"$(ROOT)/scripts/dev-httpd.sh" start

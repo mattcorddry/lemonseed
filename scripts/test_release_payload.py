@@ -289,5 +289,40 @@ class FlatManifestRegressionTest(unittest.TestCase):
             self.assertTrue(files["vmlinuz"].is_file())
 
 
+class OfflineModeTest(unittest.TestCase):
+    """SIGN_MODE=offline finalizes the signing block and writes no signature
+    (M8: split build/sign environments). The completed set is only provable
+    once the detached signature returns — `make release-verify` is the gate."""
+
+    def test_offline_finalizes_block_and_writes_no_signature(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            manifest = {"version": "test.01", "signing": {"enabled": False}}
+            (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            subprocess.run(
+                [str(SCRIPTS / "sign.sh"), str(directory)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                env={**os.environ, "SIGN_MODE": "offline"},
+            )
+            signing = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))["signing"]
+            self.assertEqual(signing["scheme"], "detached-ecdsa-p256")
+            self.assertTrue(signing["enabled"])
+            self.assertEqual(signing["public_key"], "lemonseed-release.pub")
+            self.assertFalse((directory / "manifest.json.sig").exists())
+
+    def test_unknown_mode_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "manifest.json").write_text("{}", encoding="utf-8")
+            proc = subprocess.run(
+                [str(SCRIPTS / "sign.sh"), str(tmp)],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env={**os.environ, "SIGN_MODE": "carrier-pigeon"},
+            )
+            self.assertNotEqual(proc.returncode, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,10 +9,11 @@ lists every permitted key file explicitly — never a directory glob — next to
 the key files themselves, copied into the image by
 nixos/packages/release-keys.nix. Nothing is fetched at runtime.
 
-Signatures are detached ed25519 over the exact manifest bytes, verified with
+Signatures are detached ECDSA over the exact manifest bytes — NIST P-256,
+SHA-256 digest, DER-encoded ``ECDSA-Sig-Value`` — verified with
 ``openssl pkeyutl -verify -rawin`` — the same primitive the signer uses, so the
-subprocess seam can later carry PKCS#11/hardware verification (D15) without
-touching a caller. Everything here is fail-closed: a missing, malformed or
+subprocess seam can carry other signature backends without touching a caller.
+Everything here is fail-closed: a missing, malformed or
 wrong-key signature is a hard refusal, never a warning, never a hash-only
 fallback (D10).
 """
@@ -32,9 +33,16 @@ TRUST_DIR_ENV = "LEMONSEED_RELEASE_KEYS_DIR"
 TRUST_DIR_DEFAULT = "/usr/share/lemonseed/release-keys"
 TRUST_MANIFEST_NAME = "release-keys.json"
 
-# algorithm name → verifier backend. The signer's SIGN_MODE seam mirrors this;
-# a PKCS#11 backend lands here before a second algorithm ever does.
-_ALGORITHMS = ("ed25519",)
+# Trust-set algorithm name → verifier backend. The signer's SIGN_MODE seam
+# mirrors this. ECDSA signatures are randomized (RFC 6979 is NOT used): never
+# assume deterministic nonces, and never normalize an ``s`` value — either
+# half-order must verify as-is.
+_ALGORITHMS = ("ecdsa-p256",)
+
+# The only signature scheme the manifest's signing block may name. One trust
+# generation: the previous detached-ed25519 scheme is rejected outright, not
+# merely superseded.
+_SCHEME = "detached-ecdsa-p256"
 
 
 class VerificationError(Exception):
@@ -150,7 +158,7 @@ def verify_manifest(
     signature: bytes,
     directory: Path | None = None,
 ) -> Path:
-    """Verify a detached ed25519 signature over the exact manifest bytes.
+    """Verify a detached ECDSA P-256 signature over the exact manifest bytes.
 
     Returns the trusted key that verified, for legible logging. Every key in
     the baked trust set is attempted; any one verifying is sufficient (the
@@ -207,6 +215,12 @@ def check_signing_metadata(manifest: dict[str, Any]) -> None:
     if not signing.get("enabled"):
         raise VerificationError(
             "release manifest says signing is not enabled — refusing an unsigned build"
+        )
+    scheme = signing.get("scheme")
+    if scheme != _SCHEME:
+        raise VerificationError(
+            f"release manifest names signature scheme {scheme!r}, expected "
+            f"{_SCHEME!r} — refusing"
         )
     public_key = signing.get("public_key")
     if public_key:
