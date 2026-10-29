@@ -250,6 +250,29 @@ class AssembleTest(unittest.TestCase):
             self.assertEqual(files[key].read_bytes(), body, key)
 
 
+class VerifyTrustDirTest(unittest.TestCase):
+    """The publisher's --trust-dir must be the one trust set for BOTH the
+    signature and the metadata cross-check: a build machine without
+    /usr/share/lemonseed (lemonbuild) refused a perfectly good set because
+    check_signing_metadata re-derived the baked default path (BM: first
+    production-keyed release)."""
+
+    def test_trust_dir_override_reaches_the_metadata_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release = make_release(Path(tmp))
+            env = {k: v for k, v in os.environ.items() if k != "LEMONSEED_RELEASE_KEYS_DIR"}
+            proc = subprocess.run(
+                [
+                    sys.executable, str(SCRIPTS / "release_payload.py"), "verify",
+                    "--release-dir", str(release), "--trust-dir", str(SMOKE_KEYS),
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("release set verifies", proc.stdout)
+
+
 class FlatManifestRegressionTest(unittest.TestCase):
     def test_flat_manifest_has_no_length_requirement(self) -> None:
         """A flat set (no payload block) must not be asked for artifact
