@@ -3872,13 +3872,11 @@ UPDATE_JS = r"""
         {confirmLabel: 'Switch to Beta', cancelLabel: 'Remain on Stable'});
       if (!go) { channelSelect.value = 'stable'; return; }
     }
-    const ui = await post('/_lemonseed/api/update/channel', {channel: value});
-    if (!ui.ok) {
-      channelSelect.value = current;
-      noteIt(ui.data.detail || 'The appliance refused to change the channel.', true);
-      return;
-    }
-    refresh();
+    // This scope's post() renders its own refusals and answers a bare
+    // yes/no — on success the fresh snapshot arrives through refresh(), and
+    // on failure the select goes back to what the appliance actually has.
+    if (await post('/_lemonseed/api/update/channel', {channel: value})) refresh();
+    else channelSelect.value = current;
   });
 
   // One attempt: open the progress box, start the job, watch it. A failed job

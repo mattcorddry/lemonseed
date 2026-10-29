@@ -72,6 +72,14 @@ h1 { margin: 0.55rem 0 0.45rem; font-size: clamp(2rem, 8vw, 2.5rem); letter-spac
 .state.ok { color: var(--ok); }
 .state.wait { color: var(--wait); }
 .state.bad { color: var(--bad); }
+/* The channel dropdown sits inside a .row next to 0.92rem version text —
+   compact, unlike the form-wide control sizing above. */
+.row select {
+  padding: 0.2rem 0.45rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  margin: 0;
+}
 .progress {
   height: 0.7rem; overflow: hidden; border-radius: 999px;
   background: rgba(255,255,255,0.1); margin: 0.85rem 0 0.55rem;
