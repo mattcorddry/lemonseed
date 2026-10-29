@@ -4,7 +4,7 @@
 A release is a flat asset set: manifest.json (+ .sig) outside the payload,
 fixed-size `payload-NNN.part` byte slices of one canonical tar, and the USB
 installer ISO as a direct asset. The manifest's `payload` block is the assembly
-plan (proposals/M8/PACKAGING.md §2.2); the signature over the manifest is the
+plan (documentation/roadmap/M8/PACKAGING.md §2.2); the signature over the manifest is the
 root of trust, so packing strictly precedes signing.
 
 The consumer side (download parts → verify → assemble → re-verify) lives in

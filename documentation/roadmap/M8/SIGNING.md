@@ -3,7 +3,7 @@
 **Status: approved and implemented 2026-10-19.** Release key v1 was generated on the
 build/signing box after approval; the trust set (`keys/release-keys.json` +
 `keys/release-v1.pub`) is committed and baked into the appliance and installer images.
-This document is the design-gate deliverable required by `proposals/M8/PLAN.md` §P1. It
+This document is the design-gate deliverable required by `PLAN.md` §P1. It
 covers the key ceremony, the modular signer interface, the verifier's trust model,
 rotation, and the threat model. Key **custody and escrow are decided and held
 privately**.

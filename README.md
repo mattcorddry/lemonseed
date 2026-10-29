@@ -1,86 +1,76 @@
-# Lemonseed
+# Lemonseed: Home AI Appliance
 
-Lemonseed is a **local home AI appliance**: a NixOS-based, read-only SquashFS image with A/B updates, a web installer, and a small control plane. The goal is private LAN chat and related workloads on ordinary PC hardware (NVIDIA and AMD Strix Halo APUs supported today), without depending on cloud AI for core use.
+Lemonseed provides an appliance image that enables you to run your own LLM and AI applications at your home or office, without sharing any of your data with the large AI or Cloud corporations. Lemonseed is open source, and is built with a number of open source projects including Lemonade Server, Open WebUI, Docker, NixOS, and many others. Open source software ensures that there are no back doors or secret exfiltration of your data.
 
-This repository builds the appliance artifacts, the USB/EFI installer, and the bring-up tooling. Deeper design lives in [DESIGN.md](./DESIGN.md). Agent/process conventions live in [AGENTS.md](./AGENTS.md).
+## Getting Started
 
-## Getting started
+The Lemonseed install process is simple; create a USB stick which starts the Lemonseed Installer on the PC hardware of your choice. Lemonseed is compatible with a range of PC hardware, including GPUs from AMD and NVIDIA. Lemonseed does not support M-series Macintosh computers or ARM processor based PCs. See the Recommended Hardware section below for more information. Unlike some other image installers, the Lemonseed install process is purely web based; you might not need a keyboard + monitor attached to the PC that you plan to use for Lemonseed.
 
-```bash
-make
-```
+| Note: Lemonseed erases the operating system and all data that exists on the PC you use; do not run the Lemonseed installer on a PC that has data you want to preserve! |
+| :---- |
 
-That prints the available targets. Common ones:
+### Step 1: Make a bootable USB stick
 
-| Command | What it does |
-|---------|----------------|
-| `make build-production` | Appliance SquashFS + kernel (+ initrd) → `out/latest` |
-| `make build-qemu` | QEMU smoke profile → `out/latest-qemu` |
-| `make run-qemu` | Build QEMU image if needed, then boot a serial console |
-| `make build-installer` | EFI/USB installer ISO → `out/latest-installer` |
-| `make release` | Build + pack + sign + stage a release → `out/release-<version>/` |
-| `make dev-httpd-start` / `-stop` | Serve `./out` over HTTP (Docker busybox) for `--url` testing |
-| `make test` | Unit tests — update, repart, control-plane (no root) |
-| `make test-qemu` | QEMU boot + HTTP API smoke (`/healthz`, `/api/status`) |
-| `sudo make repart-test` | Loopback GPT/repart smoke (requires root) |
-| `make update-test` | Loopback A/B updater smoke (no root) |
+The Lemonseed installer is approximately 1.2GB in size; you will need a USB stick of at least 2GB capacity.
 
-You need [Nix](https://nixos.org/download/) with flakes enabled. See `nix-install.sh` if you are setting up a build host from scratch.
+1. Download the Lemonseed installer image `lemonseed-installer.iso` from the [Releases](https://github.com/mattcorddry/lemonseed/releases) page.  
+2. Install an app that can write ISO images to USB sticks. We recommend [Balena Etcher](https://etcher.balena.io/).  
+3. Use Etcher or other application to write the downloaded `lemonseed-installer.iso` to the USB stick. Note: you cannot simply copy the `lemonseed-installer.iso` file to the USB stick – you must use an imaging application.
 
-## Tree overview
+### Step 2: Boot the PC from the USB stick
 
-```
-boot/           GRUB config (A/B slot selection)
-control-plane/  Appliance HTTP control plane (setup + status)
-installer/      USB installer pipeline + web UI
-nixos/          NixOS modules (appliance + installer)
-  modules/      Storage, A/B root, NVIDIA, lemond, gateway, …
-  installer/    Live installer image config
-scripts/        Packaging, QEMU, repart, update, and test helpers
-partitions.yaml Disk layout for systemd-repart
-flake.nix       Nix flake (nixpkgs 26.05)
-Makefile        Entry point for builds and smoke tests
-```
+1. With the PC turned off, insert the new USB stick into an empty USB port on the PC  
+2. Power on the PC. If there is no operating system on the PC already, it will boot from the USB stick automatically.  
+   * *Note: If there is already an operating system on the PC, you will need to force it to boot from the USB stick. Consult the instruction manual for your specific PC hardware model. [This video](https://www.youtube.com/watch?v=fNbyTs1Ev3I) provides a good overview if you have Windows 11 on the PC. This will require you to connect a monitor + keyboard to the PC.*
 
-Build outputs land under `out/` (gitignored). Signing: the release **trust set**
-(`keys/release-keys.json` + the public keys it lists) is tracked and baked into the
-appliance and installer images, so every update and install verifies the release
-signature before trusting any hash. The private ceremony key lives only on the signing
-box; `make keys` still creates local test keys for development.
+### Step 3: Install Lemonseed
 
-## Sign-in
+1. The Lemonseed installer is web based. From a computer on your local network, connect to [`http://lemonseed.local`](http://lemonseed.local).  
+2. The installer will prompt you with a few questions, then install Lemonseed onto the hard drive in your PC. It will prompt you to remove the USB stick and automatically reboot when finished.  
+   * *Note: The Lemonseed appliance operating system is downloaded from the internet at this point; on a slow internet connection, the download may take awhile.*  
+3. When Lemonseed boots for the first time, you will set up a name for the appliance, an administrator account and password, and other system settings. You will also select which Large Language Model (LLM) to download. The Lemonseed will complete setup and download the LLM, which can take awhile.
 
-The appliance is served over **plain HTTP on your LAN** and always will be: it is reached by
-`*.local` mDNS name, so there is no FQDN for a public certificate, and self-signed certs or
-importing a private CA are worse UX on household devices than no TLS at all.
+### Recommended hardware
 
-Because the transport cannot be trusted, **the password is never sent to the appliance**.
-Setup derives a salt and a verifier in your browser; signing in proves you can reproduce a
-value derived from the password, without transmitting it ([SRP-6a](https://datatracker.ietf.org/doc/html/rfc5054)).
-The control plane never holds, and never could send, your password. Details in
-[DESIGN.md](./DESIGN.md) §3.3.
+Lemonseed runs on ordinary x86-64 PC hardware with a capable GPU:
 
-Two honest consequences: sign-in requires JavaScript (there is no server-side fallback), and
-the minimum password length is enforced by the browser, because a server that cannot see the
-password cannot police it. And two things this does *not* buy: the session cookie is still a
-bearer token over HTTP, and an attacker already positioned on your network could rewrite the
-login page rather than just sniff it. Anyone with physical access still owns the box.
+* **NVIDIA** discrete GPUs.
+* **AMD** Ryzen AI Max+ 395 (“Strix Halo”) APUs, whose shared memory serves as GPU memory.
 
-If you forget the **admin** password there is no email link and no reset page: you boot the
-USB installer, keep your data, and tick **Reset admin credentials**, which reopens the
-first-boot setup. Forgetting any other account's password is an admin's job — they hand you a
-one-time password, and it makes you choose a new one before you get signed in at all. The
-mechanism is in [DESIGN.md](./DESIGN.md) §9.
+Support for AMD discrete graphics cards is implemented but not yet validated on real hardware. Lemonseed does not run on ARM-based PCs or Macintosh computers. The installer will check your hardware (disk, memory and GPU) and tell you if it does not meet Lemonseed’s requirements.
 
-## Updates
+## Using Lemonseed
 
-The appliance checks GitHub releases weekly (fuzzed; nothing is ever installed
-unattended) and offers the newest release on its **channel** — `stable` for most
-homes, `beta` for early builds and brand-new hardware. The channel is chosen at
-install time and changeable in Settings; switching channels never downgrades the box.
-Every update is signature-verified against the keys baked into the image before a
-single byte is trusted.
+Your Lemonseed is now running a Large Language Model and other AI services; it can be used for chat conversations, rendering and editing images, searching the internet for answers, etc. It will do most of what a public AI system (e.g. Google Gemini, ChatGPT) can do, but it will run slower and won’t match the intelligence level of the more advanced “Frontier” AI systems (e.g. GPT 6 or Claude Fable). This is simply due to the AI hardware; public AI runs in power-sucking datacenters on multimillion-dollar AI hardware.
 
-## Status
+### Connecting to Lemonseed
 
-Pre-release. Docs and packaging will expand when we are ready to publish broadly.
+Lemonseed can be reached using the name you set during setup. For example, if you named your Lemonseed `Larry`, then you can reach the Lemonseed from your home network at [`http://larry.local`](http://larry.local). You may notice that your connection to the Lemonseed is not encrypted (the URL does not start with `https://`). This is because it is impossible to generate a trusted SSL certificate for a URL that ends in `.local`. To ensure that your password cannot be seen from other people on your network, Lemonseed uses an advanced login technique that never sends your password to the Lemonseed appliance.
+
+Lemonseed does not yet support remote access; this is a capability we plan to release soon.
+
+### Chat with Lemonseed
+
+The default screen that appears when you log in to your Lemonseed is the open source [Open-WebUI](https://docs.openwebui.com/) chat interface, which provides a rich chat experience powered by the LLM that Lemonseed is running. Open-WebUI can also read files that you upload, search the web for answers to questions, and has basic speech capabilities. There are many more options in Open-WebUI – we recommend reading their documentation to learn more.
+
+### Use Modules
+
+Modules are optional add-on applications that run on the Lemonseed appliance alongside its core services. Open WebUI itself — the chat interface you use every day — is one such module, and the same mechanism will be used for future add-ons as the collection grows. The appliance pins each module to a specific, reviewed version, and modules are installed, updated and (if necessary) repaired for you by the Lemonseed software.
+
+### Manage Settings
+
+The gear icon in the upper right corner opens the Settings panel for your Lemonseed. In this panel you can change a range of settings, update the Lemonseed software when new releases are published, and change the Large Language Model that Lemonseed runs. The settings page has a number of panels:
+
+* **General:** View and update the Lemonseed software, understand the current Lemonseed hardware and LLM health, and reboot or shut down the Lemonseed.  
+* **AI Models:** Select the Large Language Model (LLM) that Lemonseed runs on your appliance. Lemonseed can only run one LLM at a time, but it can store multiple LLMs so that switching back and forth does not require repeated downloads. Lemonseed provides a short description of the strengths and origin of each LLM available.  
+* **Users & Groups:** Manage users and groups on Lemonseed. This enables you to share Lemonseed with your family or friends and control the level of access each user has. This is also how you can set up content filters for more sensitive users.  
+* **Open WebUI:** The Lemonseed control plane controls a few settings in Open WebUI to ensure that the two can communicate. If you are having problems with Open WebUI, you can force a resynchronization or reset settings here.  
+* **Modules:** Lemonseed appliance capabilities can be expanded with the use of Modules, which can be configured in this panel.
+
+### Manage Profile
+
+Your user profile on Lemonseed can be updated by clicking on the User icon in the upper right corner. Clicking this icon enables you to log out, or to edit your profile. Currently the profile includes your name and password; more settings will be added as the Lemonseed project evolves.
+
+## Contributing
+
+We welcome contributions to this project! Please review [the documentation](./documentation/README.md) to learn more about how Lemonseed is built, and [our backlog](./documentation/roadmap/BACKLOG.md) for the work ahead of us.

@@ -1,7 +1,7 @@
 # AGENTS.md — Lemonseed agent guide
 
 Guidance for AI agents (and humans) working in this repository. Prefer this file
-plus `DESIGN.md` over inventing process. When they conflict, **DESIGN.md** wins
+plus `documentation/DESIGN.md` over inventing process. When they conflict, **DESIGN.md** wins
 on product/architecture; **this file** wins on how to change code and close a sprint.
 
 ## Project snapshot
@@ -14,7 +14,7 @@ Lemonseed is a **NixOS appliance** (read-only SquashFS, A/B updates) with:
 - **Data plane** — PostgreSQL (+ pgvector) and Valkey on user-data
 - **Modules** — Docker apps (e.g. Open WebUI) managed by the control plane
 
-Read `DESIGN.md` before changing milestones, auth, storage, or UX routing.
+Read `documentation/DESIGN.md` before changing milestones, auth, storage, or UX routing.
 
 ## Operating principles
 
@@ -113,9 +113,9 @@ When coming back to the user, include briefly:
 
 | Doc | Role |
 |-----|------|
-| `DESIGN.md` | Product and architecture decisions **as built**, plus the consolidated backlog |
+| `README.md` | End-user entry: install, first boot, using Lemonseed |
+| `documentation/README.md` | Developer docs entry: build + test commands, repo tree |
+| `documentation/DESIGN.md` | Product and architecture decisions **as built**, plus the consolidated backlog |
 | `AGENTS.md` | How agents should work and close sprints |
-| `README.md` | Human-oriented project entry |
-| `RELEASE.md` | The release runbook: build/sign VM setup, per-release workflow, publish + verify, channel flip, BM drill |
-| `proposals/M*/` | Milestone design records — the reasoning and phase plans behind each milestone. Historical: `DESIGN.md` wins on current behavior |
-| `Requirements.md` | Historical requirements — defer to DESIGN when unsure |
+| `documentation/RELEASE.md` | The release runbook: build/sign machine setup, per-release workflow, publish + verify, channel flip, BM drill |
+| `documentation/roadmap/` | Milestone design records (`M*/`) and `BACKLOG.md` — the reasoning and phase plans behind each milestone. Historical: `DESIGN.md` wins on current behavior |

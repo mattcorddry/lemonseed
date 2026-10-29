@@ -506,7 +506,7 @@ def write_raw(
 # --- Release payload assembly (M8 P2) -------------------------------------------------
 # A sharded release ships payload-NNN.part byte slices of one canonical tar;
 # the signed manifest carries both the chunk list and the reassembled artifacts'
-# hashes. See proposals/M8/PACKAGING.md. The tarball is never stored: the parts
+# hashes. See documentation/roadmap/M8/PACKAGING.md. The tarball is never stored: the parts
 # are streamed once to hash, once to extract, so peak disk use is 1x the
 # extracted payload, under `download_dir` on /var (SSD-backed), never tmpfs.
 

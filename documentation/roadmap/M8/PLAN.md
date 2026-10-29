@@ -105,7 +105,7 @@ malicious `root.squashfs` that passes every check we run today.
   signature. Worst case is selecting among *our* signed releases (downgrade/upgrade
   confusion), never arbitrary code.
 
-**Design-gate deliverable:** `proposals/M8/SIGNING.md` — key generation, the modular
+**Design-gate deliverable:** `SIGNING.md` — key generation, the modular
 signer interface, rotation, and the threat model. Key **custody and escrow are decided
 and held privately**; `SIGNING.md` records only that escrow
 exists (D-escrow). The key is generated only after this is approved; generating it
@@ -507,7 +507,7 @@ boot menu or the web UI.
   detail (D-37). This does not protect a running, unlocked box, and it does not bring
   TLS back.
 
-**Design-gate deliverable:** `proposals/M8/ENCRYPTED-USER-DATA.md` — the migration
+**Design-gate deliverable:** `ENCRYPTED-USER-DATA.md` — the migration
 plan, the installer UX (Hardware password prompt and copy), the recovery story under
 encryption (including the lost-hardware-password floor: reinstall with data loss), and
 what the installer changes.

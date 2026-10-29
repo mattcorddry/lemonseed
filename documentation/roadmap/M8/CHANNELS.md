@@ -1,6 +1,6 @@
 # M8 P3 — Update & install channels: GitHub releases
 
-**Status: approved and shipped.** Implements `proposals/M8/PLAN.md` §P3 with the four
+**Status: approved and shipped.** Implements `PLAN.md` §P3 with the four
 review decisions below. P1 (signed manifest, fail-closed verifier) and P2 (sharded
 payload, `make release`) are prerequisites and are shipped; this phase moved the
 channel from a flat HTTP directory on `dev-server` to **GitHub releases**,

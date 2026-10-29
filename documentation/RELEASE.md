@@ -104,7 +104,7 @@ everyone else proceeds directly to Part 3 for local testing of their work.
 1. **Make the release key available to the signing environment.** The private
    half of the production key never exists as a file on the machine; it lives
    in signing hardware and is used through the `pkcs11` signing backend (see
-   [proposals/M8/SIGNING.md](./proposals/M8/SIGNING.md)). Setup means: the
+   [roadmap/M8/SIGNING.md](./roadmap/M8/SIGNING.md)). Setup means: the
    hardware is present and authorized, and the openssl pkcs11 provider and its
    PKCS#11 module are installed (`sign.sh` discovers both by globbing the
    usual library directories and fails legibly when they are missing).

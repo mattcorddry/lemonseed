@@ -10,7 +10,7 @@
 # Note the production release key is NOT generated here: it is generated in a
 # temporary directory on the signing machine during the key ceremony, imported
 # into the signing hardware, and only its public half (keys/lemonseed-release.pub)
-# is committed. See proposals/M8/SIGNING.md.
+# is committed. See documentation/roadmap/M8/SIGNING.md.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -57,4 +57,4 @@ openssl pkey -in "${PRIV}" -pubout -out "${PUB}"
 chmod 0600 "${PRIV}"
 echo "Wrote ${PRIV} and ${PUB}"
 echo "Next: add {\"version\": N, \"algorithm\": \"ecdsa-p256\", \"file\": \"${NAME}.pub\"}" \
-  "to ${OUT_DIR}/release-keys.json (see proposals/M8/SIGNING.md §2)."
+  "to ${OUT_DIR}/release-keys.json (see documentation/roadmap/M8/SIGNING.md §2)."

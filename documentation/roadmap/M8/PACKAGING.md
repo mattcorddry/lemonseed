@@ -1,6 +1,6 @@
 # M8 P2 — Packaging: sharded payload, installer size gate, `make release`
 
-**Status: approved and shipped.** Implements `proposals/M8/PLAN.md` §P2. P1's signing
+**Status: approved and shipped.** Implements `PLAN.md` §P2. P1's signing
 root of trust is a prerequisite and is shipped; this phase defines the **release asset
 format** the signature protects and the **assembly path** consumers run before trusting
 anything.

@@ -1,17 +1,17 @@
 # Lemonseed Appliance — Design
 
-Status: **living design, as built** — M1–M5 shipped; M6 landed through **M6.6** (Open WebUI durable config + control-plane reconciliation, AMD Vulkan support, model picker, session & error contract; 2026-10). M7 has begun: **P2 (SRP-6a sign-in), P3 (household accounts + audit) and P4 (groups + OWUI guards) are built** — as APIs; the portal screens over them are not. LiteLLM friendly model names and the portal power controls remain in **M7**.
+Status: **living design, as built** — M1–M5 shipped; M6 landed through **M6.6** (Open WebUI durable config + control-plane reconciliation, AMD Vulkan support, model picker, session & error contract; 2026-10). **M7 closed 2026-10-19** (SRP-6a sign-in, household accounts + audit, groups + OWUI guards, power controls, self-service profile). **M8 shipped** (signed GitHub releases, release channels, N-1 rollback, data-at-rest follow-ups). See §2 for the milestone history.
 
-Related: [Requirements.md](./Requirements.md), [AGENTS.md](./AGENTS.md) (how to change code and close a sprint).
+Related: [AGENTS.md](../AGENTS.md) (how to change code and close a sprint).
 
 **How to read this repo's docs**
 
 | Document | Role |
 |----------|------|
-| `DESIGN.md` (this file) | How the product works **as built**, plus the consolidated backlog. The product/architecture contract. |
+| `documentation/DESIGN.md` (this file) | How the product works **as built**, plus the consolidated backlog. The product/architecture contract. |
 | `AGENTS.md` | Engineering process: conventions, test lifecycle, command map. |
-| `proposals/M*/` | **Milestone design records** — the reasoning, alternatives and phase plans behind each milestone. Historical: where they disagree with this file, **this file wins** on current behavior. |
-| `Requirements.md` | Historical requirements. Defer to this file when unsure. |
+| `documentation/roadmap/M*/` | **Milestone design records** — the reasoning, alternatives and phase plans behind each milestone. Historical: where they disagree with this file, **this file wins** on current behavior. |
+| `documentation/RELEASE.md` | The release runbook: build/sign machine setup, per-release workflow, publish + verify. |
 
 This document captures architectural decisions. The product intent it serves is framed in §0 below; this file translates that intent into buildable decisions and records what the appliance actually does today.
 
@@ -71,7 +71,7 @@ Lemonseed is a **local, multi-user home AI hub** — not a cloud client and not 
 
 ## 2. Milestone history
 
-Shipped milestones are summarized here; the reasoning and phase plans live in `proposals/`.
+Shipped milestones are summarized here; the reasoning and phase plans live in `roadmap/`.
 
 | Milestone | Deliverable | Design record |
 |-----------|-------------|---------------|
@@ -79,19 +79,19 @@ Shipped milestones are summarized here; the reasoning and phase plans live in `p
 | **M1 — Artifacts** | Flake + Makefile → `root.squashfs`, `vmlinuz`, `initrd.img`, `manifest.json`, optional `.sig` | — |
 | **M2 — Bootable skeleton** | LVM PV → storage provisioner → btrfs `@etc`/`@var`; stub control plane; QEMU userdata disk | — |
 | **M3 — Partition & A/B tooling** | `partitions.yaml` → `out/repart.d`; `boot/grub.cfg`; slot-aware root; `lemonseed-ab` + lock-in; in-place updater | — |
-| **M4 — USB installer** | Install + portal + first-boot setup; preserve known user-data on reinstall (M4.1) | [`proposals/M4/USB-INSTALLER.md`](./proposals/M4/USB-INSTALLER.md) |
-| **M5 — Hardware-aware local chat** | `lemond` + NVIDIA/CUDA; inventory + catalog planner + CP pull/load/pin; portal “Getting Ready” | [`proposals/M5/HARDWARE-AWARE-CHAT.md`](./proposals/M5/HARDWARE-AWARE-CHAT.md) |
-| **M6.1 — Open WebUI as primary UX** | OWUI module on Postgres, Lemonade backend, Lemonseed shell + iframe | [`proposals/M6/OPEN-WEBUI-UX.md`](./proposals/M6/OPEN-WEBUI-UX.md) |
+| **M4 — USB installer** | Install + portal + first-boot setup; preserve known user-data on reinstall (M4.1) | [`roadmap/M4/USB-INSTALLER.md`](./roadmap/M4/USB-INSTALLER.md) |
+| **M5 — Hardware-aware local chat** | `lemond` + NVIDIA/CUDA; inventory + catalog planner + CP pull/load/pin; portal “Getting Ready” | [`roadmap/M5/HARDWARE-AWARE-CHAT.md`](./roadmap/M5/HARDWARE-AWARE-CHAT.md) |
+| **M6.1 — Open WebUI as primary UX** | OWUI module on Postgres, Lemonade backend, Lemonseed shell + iframe | [`roadmap/M6/OPEN-WEBUI-UX.md`](./roadmap/M6/OPEN-WEBUI-UX.md) |
 | **M6.2 — Edge auth** | CP-native login (signed session cookies), nginx `auth_request` gate, trusted-header identity into OWUI | same record, §M6.2 |
 | **M6.3a — Policy seeding** | Open WebUI env seeds for household defaults (autocomplete off, workspace off, identity prompt, …) | same record |
-| **M6.3b — Durable config + reconciliation** | OWUI `config` table authoritative; manifest-driven reconcile engine; nginx write guards; admin reset window | [`proposals/M6/OWUI-DURABLE-CONFIG-M63B.md`](./proposals/M6/OWUI-DURABLE-CONFIG-M63B.md) + `OWUI-POLICY-ENGINE.md`, `OWUI-PHASE4-PORTAL-GUARDS.md`, `OWUI-PHASE4B-ENFORCEMENT.md` |
-| **M6.4 — AMD GPU support** | Vulkan backend (Mesa RADV) for dGPU + Strix iGPU; runtime backend dispatch. **Validated on real Strix Halo hardware** (Ryzen AI Max+ 395 APU, shared-memory iGPU); the `ttm.pages_limit` shared-memory split and GTT-sized reporting both work end to end. **Not yet validated: AMD dGPU (PCIe card)** — implemented and unit-covered, but no discrete AMD card has been booted. QEMU is CPU-only, so no automated test loads a model through Vulkan | [`proposals/M6/AMD-VULKAN-M64.md`](./proposals/M6/AMD-VULKAN-M64.md) |
-| **M6.5 — Model picker** | Portal model picker (families + best-fit), model disk-space maintenance | [`proposals/M6/MODEL-PICKER-M65.md`](./proposals/M6/MODEL-PICKER-M65.md) |
-| **M6.6 — Session & error contract** | Sliding sessions in Valkey + Postgres generation counter, one XHR status contract (`portalFetch`: 401 → `/login` in the top frame, 403 surfaced, 5xx capped backoff), `/api/status` public subset + gated `/api/system`, branded gateway error pages + self-reload, one shared stylesheet root, container-image pins | [`proposals/M6/SESSION-AND-ERROR-CONTRACT-M66.md`](./proposals/M6/SESSION-AND-ERROR-CONTRACT-M66.md) |
-| **M7 P2 — SRP-6a sign-in** | Password never crosses the wire: SRP challenge/verify CP routes + client-side enrollment, browser-side SHA-256 with KAT self-check, bcrypt login path **deleted** (`POST /login` → 405), Valkey-backed sign-in rate limit, schema v5 (since folded into the baseline, §3.3) | [`proposals/M7/PLAN.md`](./proposals/M7/PLAN.md) |
-| **M7 P3 — Household accounts** | `usermgmt.py` as the only writer of `users`; account CRUD + self-service profile routes; OWUI mirror keyed on `users.owui_id`; append-only `audit_log` + journald copy with a 365-day sweep; schema **v6** over a v5 baseline (pre-baseline databases now **require a reinstall**). Portal: a **People** panel in Settings (accounts, groups, audit log) and a self-service **My Profile** page at `/profile/` | [`proposals/M7/USERS-AND-GROUPS.md`](./proposals/M7/USERS-AND-GROUPS.md) |
+| **M6.3b — Durable config + reconciliation** | OWUI `config` table authoritative; manifest-driven reconcile engine; nginx write guards; admin reset window | [`roadmap/M6/OWUI-DURABLE-CONFIG-M63B.md`](./roadmap/M6/OWUI-DURABLE-CONFIG-M63B.md) + `OWUI-POLICY-ENGINE.md`, `OWUI-PHASE4-PORTAL-GUARDS.md`, `OWUI-PHASE4B-ENFORCEMENT.md` |
+| **M6.4 — AMD GPU support** | Vulkan backend (Mesa RADV) for dGPU + Strix iGPU; runtime backend dispatch. **Validated on real Strix Halo hardware** (Ryzen AI Max+ 395 APU, shared-memory iGPU); the `ttm.pages_limit` shared-memory split and GTT-sized reporting both work end to end. **Not yet validated: AMD dGPU (PCIe card)** — implemented and unit-covered, but no discrete AMD card has been booted. QEMU is CPU-only, so no automated test loads a model through Vulkan | [`roadmap/M6/AMD-VULKAN-M64.md`](./roadmap/M6/AMD-VULKAN-M64.md) |
+| **M6.5 — Model picker** | Portal model picker (families + best-fit), model disk-space maintenance | [`roadmap/M6/MODEL-PICKER-M65.md`](./roadmap/M6/MODEL-PICKER-M65.md) |
+| **M6.6 — Session & error contract** | Sliding sessions in Valkey + Postgres generation counter, one XHR status contract (`portalFetch`: 401 → `/login` in the top frame, 403 surfaced, 5xx capped backoff), `/api/status` public subset + gated `/api/system`, branded gateway error pages + self-reload, one shared stylesheet root, container-image pins | [`roadmap/M6/SESSION-AND-ERROR-CONTRACT-M66.md`](./roadmap/M6/SESSION-AND-ERROR-CONTRACT-M66.md) |
+| **M7 P2 — SRP-6a sign-in** | Password never crosses the wire: SRP challenge/verify CP routes + client-side enrollment, browser-side SHA-256 with KAT self-check, bcrypt login path **deleted** (`POST /login` → 405), Valkey-backed sign-in rate limit, schema v5 (since folded into the baseline, §3.3) | [`roadmap/M7/PLAN.md`](./roadmap/M7/PLAN.md) |
+| **M7 P3 — Household accounts** | `usermgmt.py` as the only writer of `users`; account CRUD + self-service profile routes; OWUI mirror keyed on `users.owui_id`; append-only `audit_log` + journald copy with a 365-day sweep; schema **v6** over a v5 baseline (pre-baseline databases now **require a reinstall**). Portal: a **People** panel in Settings (accounts, groups, audit log) and a self-service **My Profile** page at `/profile/` | [`roadmap/M7/USERS-AND-GROUPS.md`](./roadmap/M7/USERS-AND-GROUPS.md) |
 | **M7 P4 — Groups** | Group CRUD routes with `groups.system` protecting `admin`/`users`, `group_attributes` with the key set declared in code, membership mirrored to OWUI through `X-Forwarded-Groups`, and **every** OWUI account guard on `enforce` — create, edit and delete all refused at the edge, so the Open WebUI user panel is read-only end to end (D-17b) | same record |
-| **M7 P5 — Power controls & update affordances** | SYSTEM panel power buttons (interlocked, going-away marker), **Software update** box: check job + download/write/reboot with the updater's stdout percentages, a 100% finish line plus a short reboot grace so the dialog can say "Update finished" before the box goes down, **Retry/Cancel** on failure, long hashes wrapped; per-request access trail in its own journald channel (`-t appliance-control-plane-access`, real client + user); nginx proxy-headers hash sized for the gate; GPU kernel modules load only on hardware presence (udev modalias rules, vendor 1002/10de). **M7 closed 2026-10-19** — "Beyond P1–P5" (LiteLLM friendly model names; modules definition + PoC) moved to future milestones | [`proposals/M7/PLAN.md`](./proposals/M7/PLAN.md) |
+| **M7 P5 — Power controls & update affordances** | SYSTEM panel power buttons (interlocked, going-away marker), **Software update** box: check job + download/write/reboot with the updater's stdout percentages, a 100% finish line plus a short reboot grace so the dialog can say "Update finished" before the box goes down, **Retry/Cancel** on failure, long hashes wrapped; per-request access trail in its own journald channel (`-t appliance-control-plane-access`, real client + user); nginx proxy-headers hash sized for the gate; GPU kernel modules load only on hardware presence (udev modalias rules, vendor 1002/10de). **M7 closed 2026-10-19** — "Beyond P1–P5" (LiteLLM friendly model names; modules definition + PoC) moved to future milestones | [`roadmap/M7/PLAN.md`](./roadmap/M7/PLAN.md) |
 
 M6.1–M6.5 are all landed. **M6.4's coverage differs by AMD platform.** The **Strix Halo APU**
 path (Ryzen AI Max+ 395 class — one chip, CPU + GPU, memory shared between them) is
@@ -102,11 +102,11 @@ booted on the appliance. The distinction matters because the two paths have diff
 semantics — the APU's model budget comes from a GRUB `ttm.pages_limit` carve-out of system
 RAM, a dGPU's from its own VRAM. Separately, no *automated* test exercises Vulkan at all: the
 QEMU profile pins `llamacppBackend = "cpu"`. See
-[`proposals/M6/AMD-VULKAN-M64.md`](./proposals/M6/AMD-VULKAN-M64.md).
+[`roadmap/M6/AMD-VULKAN-M64.md`](./roadmap/M6/AMD-VULKAN-M64.md).
 
-M6 close-out also carries **P0** (lint gate + test determinism; `make lint` is now the gate, and the suspected suite flake was disproven) and **P7** (build cycle time; [`proposals/M6/BUILD-CYCLE-TIME-P7.md`](./proposals/M6/BUILD-CYCLE-TIME-P7.md)).
+M6 close-out also carries **P0** (lint gate + test determinism; `make lint` is now the gate, and the suspected suite flake was disproven) and **P7** (build cycle time; [`roadmap/M6/BUILD-CYCLE-TIME-P7.md`](./roadmap/M6/BUILD-CYCLE-TIME-P7.md)).
 
-**Moved out of M6 into M7:** **users & groups management** (formerly M6.2b — which also owns flipping the two account guards from `advertise` to `enforce`; **all three account guards, create included, are now `enforce`**, §3.5), **LiteLLM friendly model names**, and **portal power controls** (reboot / shutdown / update-check / logout / the merged SYSTEM panel). Sprint pulls are listed in [`proposals/M7/PLAN.md`](./proposals/M7/PLAN.md), which holds M7 feature work only.
+**Moved out of M6 into M7:** **users & groups management** (formerly M6.2b — which also owns flipping the two account guards from `advertise` to `enforce`; **all three account guards, create included, are now `enforce`**, §3.5), **LiteLLM friendly model names**, and **portal power controls** (reboot / shutdown / update-check / logout / the merged SYSTEM panel). Sprint pulls are listed in [`roadmap/M7/PLAN.md`](./roadmap/M7/PLAN.md), which holds M7 feature work only.
 
 ---
 
@@ -206,7 +206,7 @@ Portal settings render as **two URLs**: `/settings/` is the shell (nav + iframe)
 **As built:**
 
 - **Sign-in is SRP-6a — the password never crosses the wire** (M7 P2; decision `D1` and
-  `P2` in [`proposals/M7/PLAN.md`](./proposals/M7/PLAN.md)). Two CP routes, both open at
+  `P2` in [`roadmap/M7/PLAN.md`](./roadmap/M7/PLAN.md)). Two CP routes, both open at
   the gateway: `POST /_lemonseed/api/srp/challenge {username} → {cid, salt, B}` and
   `POST /_lemonseed/api/srp/verify {cid, A, M1} → {M2, target}` plus the session cookie.
   `control-plane/srp.py` is pure math (`pow`/`hmac`/`hashlib`, stdlib only) over the
@@ -272,7 +272,7 @@ Portal settings render as **two URLs**: `/settings/` is the shell (nav + iframe)
 - **A non-admin has exactly one surface, and it is not Settings.** `/settings/` is admin-gated, so every signed-in page carries an account popover (`stub.ACCOUNT_JS`) that shows who you are, hides the gear for members, and holds *Log out* and *Edit Profile*; **My Profile** at `/profile/` edits your own display name and address and changes your own password. Both screens call the same `stub.ROTATE_JS` helper, so the People panel and the profile page cannot drift into two different rotation sequences. Rows are built with `textContent` and never `innerHTML`, and a one-time code is generated with `crypto.getRandomValues` over an unambiguous 31-character alphabet (`ACCOUNTS_JS.OTP_ALPHABET`, no `i`/`l`/`1`/`o`/`0`), shown once.
 - **Admin gating** for `/settings/` and privileged APIs is enforced **in the CP** from `X-Forwarded-Groups`, not in nginx (`auth.ADMIN_SNIPPET` is intentionally empty: nginx `if` runs in the rewrite phase, before `auth_request` sets its variables).
 
-**M6.6 — session and error contract** (the reasoning and the build deviations from the first draft: [`proposals/M6/SESSION-AND-ERROR-CONTRACT-M66.md`](./proposals/M6/SESSION-AND-ERROR-CONTRACT-M66.md) and [`proposals/M6/GATEWAY-ERROR-AND-PULL-CONTRACT-M66.md`](./proposals/M6/GATEWAY-ERROR-AND-PULL-CONTRACT-M66.md)):
+**M6.6 — session and error contract** (the reasoning and the build deviations from the first draft: [`roadmap/M6/SESSION-AND-ERROR-CONTRACT-M66.md`](./roadmap/M6/SESSION-AND-ERROR-CONTRACT-M66.md) and [`roadmap/M6/GATEWAY-ERROR-AND-PULL-CONTRACT-M66.md`](./roadmap/M6/GATEWAY-ERROR-AND-PULL-CONTRACT-M66.md)):
 
 - **One XHR status contract** for every portal request. `stub.PORTAL_FETCH_JS` defines a single `portalFetch()` that every control-plane call in the shell and the settings iframe goes through, and it labels each request `X-Requested-With: fetch` — which is how the gateway knows to answer an XHR with a real **401** + JSON instead of a **302** that `fetch()` follows into login HTML at HTTP 200 (the reason `if (!res.ok)` could never fire). The contract: **401** → `window.top.location = '/login?rd=…'`; **403** → render `detail`, never redirect ("not you" and "not yours" are different failures); **5xx** → capped backoff (three tries), then surface. Only **GET** is retried — a reset or reconcile whose response was lost must not run twice. Three calls stay outside it, each for a stated reason: the setup page's `/api/boot` poll and the login form's own `POST /login` (both pre-auth; a 401 on login through `portalFetch` would reload the login page forever), and the `/_app/version.json` reachability probe (retrying and auth-navigating would hide the failure it exists to detect). `control-plane/test_portal_fetch.py` **executes** the shipped JS in a V8 context with `fetch`/`window` stubbed rather than asserting on its text.
 - **The status surface is split.** `/api/status` answers pre-login and now returns only what the installer handoff and the gateway's not-ready page need (`status`, `role`, `version`, `setup_complete`, `setup.mdns_name`, `portal_url`). Everything else — account counts, telemetry, chat, module and data-plane state, the session-store dot — moved to **`/api/system`**, which is session-gated. Household facts such as how many admins exist were readable by any device on the LAN before this. `status_public()` lists keys rather than subtracting them from the full snapshot, so a field added to the full snapshot cannot leak by default. Spawning the background workers is no longer an unauthenticated side effect either; they still start unconditionally at CP startup.
@@ -293,7 +293,7 @@ The systemd oneshot units (`lemonseed-postgres`, `lemonseed-valkey`) are a boot 
 
 ### 3.5 Open WebUI integration contract
 
-This is the most delicate boundary in the product: Open WebUI is simultaneously *the* household UX and a third-party app with its own admin UI, database and release cadence. The full design record is `proposals/M6/OWUI-DURABLE-CONFIG-M63B.md`; what follows is the contract as it runs today.
+This is the most delicate boundary in the product: Open WebUI is simultaneously *the* household UX and a third-party app with its own admin UI, database and release cadence. The full design record is `roadmap/M6/OWUI-DURABLE-CONFIG-M63B.md`; what follows is the contract as it runs today.
 
 **Authority: the database, after first boot.** OWUI's Postgres `config` table is authoritative. Environment variables are **bootstrap-only** — only keys OWUI reads at import time, before it can query config:
 
@@ -561,11 +561,11 @@ Mount flags principle: **`noexec` / `nodev` / `nosuid` wherever practical**; `/v
 
 ### Build cache & cycle time
 
-Measured 2026-10-09 (full numbers in [`proposals/M6/BUILD-CYCLE-TIME-P7.md`](./proposals/M6/BUILD-CYCLE-TIME-P7.md)); the load-bearing facts:
+Measured 2026-10-09 (full numbers in [`roadmap/M6/BUILD-CYCLE-TIME-P7.md`](./roadmap/M6/BUILD-CYCLE-TIME-P7.md)); the load-bearing facts:
 
 - **The version string does not invalidate the GPU stack.** `llamaCppCuda` (`nixos/modules/lemond.nix`) is version-pure: the CUDA and npm-deps `.drv` paths are byte-identical at `APPLIANCE_VERSION=0.0.0-dev` and `20261009.07`, and the version string appears zero times in the CUDA derivation.
 - **`appliance-artifacts` must pin the system closure explicitly.** `mksquashfs` output is opaque to nix's reference scanner, so `root-<version>.squashfs` advertises 113 references and *none* of them the toplevel. Before P7 the artifacts output referenced only the three image files, so `scripts/nix-gc.sh` — which `scripts/package.sh` runs at the end of every build — collected the just-built toplevel together with the locally compiled CUDA llama.cpp, forcing a from-source GPU recompile on the next build. `nixos/modules/artifacts.nix` now writes the toplevel path into `$out/closure-root`; nix detects a plain-text store path, so the build root keeps the closure warm. (A plain-text store path is detected; a compressed one is not — that asymmetry *is* the whole mechanism.)
-- **`--impure` makes any tracked edit dirty the build.** `scripts/package.sh` builds `.#artifacts` with `--impure`, so `self` is the dirty git tree: editing a `proposals/*.md` changes the toplevel and the squashfs. Benchmarks taken on a dirty tree are not repeatable.
+- **`--impure` makes any tracked edit dirty the build.** `scripts/package.sh` builds `.#artifacts` with `--impure`, so `self` is the dirty git tree: editing a `roadmap/*.md` changes the toplevel and the squashfs. Benchmarks taken on a dirty tree are not repeatable.
 - **Only `cache.nixos.org` is configured** (`nix show-config`: `substituters = https://cache.nixos.org/`, `max-jobs = 1`, so a ~109-derivation plan is serialized). `llamaCppCuda` is defined in-tree, so no binary cache will ever cover it — pinning it locally (above) is the only protection.
 
 ### Outputs (HTTP-ready layout)
@@ -596,7 +596,7 @@ installer) / the installer's ESP stub / stable, in that order.
 
 `make dev-httpd-start` / `-stop` (D-C3) serve `./out` over HTTP from a small busybox
 container (`busybox:latest`) for local `--url` testing — static files only, bound to the primary
-interface's own address, high port 8083. As built (M8 P2), a release **is** a sharded asset set: `make release` stages `out/release-<version>/` containing the signed `manifest.json`, the payload cut into fixed **1 GiB** `payload-NNN.part` parts (a canonical pax tar of `vmlinuz`, `initrd.img` and `root.squashfs`; the final part is a remainder), and the USB installer ISO as its own direct asset recorded in the manifest. The tar is **not gzipped**: the SquashFS is already zstd-compressed and dominates the payload, so a second compression layer costs assemble-time CPU for no size win. The manifest is both the assembly plan (chunk names, order, hashes) and the root of trust (output names, lengths, SHA-256); consumers verify the signature, then each part, then the concatenated tar, then re-verify every extracted file before the A/B slot flips. Design and decisions: [`proposals/M8/PACKAGING.md`](./proposals/M8/PACKAGING.md).
+interface's own address, high port 8083. As built (M8 P2), a release **is** a sharded asset set: `make release` stages `out/release-<version>/` containing the signed `manifest.json`, the payload cut into fixed **1 GiB** `payload-NNN.part` parts (a canonical pax tar of `vmlinuz`, `initrd.img` and `root.squashfs`; the final part is a remainder), and the USB installer ISO as its own direct asset recorded in the manifest. The tar is **not gzipped**: the SquashFS is already zstd-compressed and dominates the payload, so a second compression layer costs assemble-time CPU for no size win. The manifest is both the assembly plan (chunk names, order, hashes) and the root of trust (output names, lengths, SHA-256); consumers verify the signature, then each part, then the concatenated tar, then re-verify every extracted file before the A/B slot flips. Design and decisions: [`roadmap/M8/PACKAGING.md`](./roadmap/M8/PACKAGING.md).
 
 ### Signing
 - **As built (M8 P1, scheme updated in M8):** the root of trust is a **detached
@@ -679,7 +679,7 @@ interface's own address, high port 8083. As built (M8 P2), a release **is** a sh
 | Edge auth | **CP-native login** at the nginx boundary: signed stateless session cookie, `auth_request` → CP, identity via `X-Forwarded-*` set **only** from the verify response. Modules stay auth-naive; OWUI's own login is disabled |
 | Credential on the wire | **SRP-6a** (§3.3), because the appliance is HTTP-only forever: the password is never transmitted, only proof of knowing it. Closes passive sniffing and credential reuse. **Does not** close an active on-path attacker who rewrites the login page — that needs TLS, which is deliberately out of scope, so anyone claiming this makes the LAN trusted is overselling it. The bearer cookie is likewise still a bearer cookie over HTTP: SRP protects the credential, not the session |
 | Password policy | **Client-side only, and that is a real weakening.** Enrollment derives the verifier in the browser, so the server never holds the password and cannot apply a rule to it: the minimum-8 check belongs to `stub.SRP_ENROLL_JS` and its rotation twins, and a client that skips the JS can pick any verifier it likes. A server-side policy would require seeing the password, which is the exact property SRP was adopted to give up. There is no server-side length, complexity or reuse check, and there cannot be one under this design |
-| Account recovery | A forgotten **admin** password is recovered by USB reinstall with preserve-user-data + **Reset admin credentials** checked (D-20): the installer writes `/var/lib/lemonseed/reset-admin` **into the target's user-data** (D-27 — the ESP handoff never worked; see `proposals/M6/OPEN-WEBUI-UX.md`), the CP consumes it at boot, `/setup` reopens, and every former admin row is overwritten or deleted rather than left able to sign in (D-20a). No in-portal admin recovery exists or will be built: anything that can set a verifier without the old password is reachable by the whole LAN. A **user** password reset is an admin action (`usermgmt.admin_reset_password`, D-10): the admin's **browser** generates the one-time password and posts only its verifier, so the OTP never crosses the network; the target gets `password_reset_required`, and `srp/verify` answers `M2` with **no session cookie** until they rotate (D-11) — an unrotated credential cannot produce a session at all, for the portal, the APIs or Open WebUI. The accepted cost, stated plainly (D-13): the admin knows the OTP and can sign in as that user until they rotate |
+| Account recovery | A forgotten **admin** password is recovered by USB reinstall with preserve-user-data + **Reset admin credentials** checked (D-20): the installer writes `/var/lib/lemonseed/reset-admin` **into the target's user-data** (D-27 — the ESP handoff never worked; see `roadmap/M6/OPEN-WEBUI-UX.md`), the CP consumes it at boot, `/setup` reopens, and every former admin row is overwritten or deleted rather than left able to sign in (D-20a). No in-portal admin recovery exists or will be built: anything that can set a verifier without the old password is reachable by the whole LAN. A **user** password reset is an admin action (`usermgmt.admin_reset_password`, D-10): the admin's **browser** generates the one-time password and posts only its verifier, so the OTP never crosses the network; the target gets `password_reset_required`, and `srp/verify` answers `M2` with **no session cookie** until they rotate (D-11) — an unrotated credential cannot produce a session at all, for the portal, the APIs or Open WebUI. The accepted cost, stated plainly (D-13): the admin knows the OTP and can sign in as that user until they rotate |
 | Audit trail | Append-only `audit_log` in Postgres plus a journald line per event (§3.3); actor taken from the session, detail masked and value-free, 365-day retention swept from the data-plane supervisor tick |
 | OWUI write surface | Manifest-declared guards rendered to nginx; enforced sections return JSON 403 with a human `detail` |
 | Secrets | CP-provisioned per-module DB credentials; OWUI API key restricted to the manifest's endpoint set; no secrets in the world-writable tree |
@@ -694,9 +694,14 @@ interface's own address, high port 8083. As built (M8 P2), a release **is** a sh
 
 ```
 .
-├── DESIGN.md                 # this file — as-built contract + backlog
+├── README.md                 # end-user entry: install, first boot, using Lemonseed
 ├── AGENTS.md                 # engineering process + test lifecycle
-├── README.md, Requirements.md
+├── documentation/
+│   ├── README.md             # developer docs entry (build + test commands, tree)
+│   ├── DESIGN.md             # this file — as-built contract + decision log
+│   ├── RELEASE.md            # release runbook (build/sign/publish)
+│   └── roadmap/              # milestone design records (§2) + BACKLOG.md +
+│                             #   forward-looking ideas
 ├── Makefile, flake.nix (defines `mkAppliance` + the appliance / appliance-qemu
 │   / installer outputs), flake.lock
 ├── partitions.yaml           # layout source of truth (§5)
@@ -734,8 +739,8 @@ interface's own address, high port 8083. As built (M8 P2), a release **is** a sh
 │                             # run-unit-tests.sh, check-untracked.sh, nix-gc.sh,
 │                             # sign.sh, gen-keys.sh, and their test_*.py
 ├── assets/brand/             # brand marks / favicon
-├── proposals/                # milestone design records (§2) + forward-looking ideas
-├── keys/                     # optional local test keys (gitignored contents)
+├── keys/                     # release trust set (release-keys.json + the public
+│                             #   keys it lists, tracked) + optional local test keys
 └── out/                      # build outputs (gitignored)
 ```
 
@@ -743,7 +748,7 @@ interface's own address, high port 8083. As built (M8 P2), a release **is** a sh
 
 ## 11. Backlog (consolidated review)
 
-Moved to [BACKLOG](BACKLOG.md)
+Moved to [BACKLOG](./roadmap/BACKLOG.md)
 
 ---
 
@@ -755,13 +760,13 @@ Moved to [BACKLOG](BACKLOG.md)
 4. ~~**Planned reboot vs `boot_once`:** **answered.**~~ Only GRUB writes `boot_attempted`, so an ordinary reboot silently completes an armed one-shot upgrade. The portal therefore never issues a bare reboot while an update is staged: it offers **"Reboot into the new version X"** (default/highlighted) versus **"Reboot without updating"**, so the two intents stay distinct (M7 P5). *(Superseded during M7 P5 as built — D4: the update flow reboots by itself, so the choice dialog is gone.)*
 5. ~~**Graceful data-plane shutdown:** **resolved empirically**~~ (2026-10-11): `shutdown -h`, `shutdown -r` and the ACPI power button all shut the current image down and bring Postgres back clean. An explicit ordered-stop assertion in QEMU is still worth adding alongside the M7 P5 power controls, but it is no longer an open correctness question.
 6. ~~**Session revocation mechanism:** **answered**~~ — a per-user **generation counter in Postgres** that `session-verify` compares against the token, not a per-box secret rotation. Cheap per event, no global logout on a single revoke, and it answers "who is still signed in" as a side effect (M6.6).
-7. ~~**Portal XHR error contract:** **answered**~~ — one rule for every portal request: **401** redirects `window.top` to `/login?rd=…`, **403** is surfaced as "signed in, but not permitted" and never redirected, **5xx** is retried with backoff. See §3.3 and [`proposals/M6/SESSION-AND-ERROR-CONTRACT-M66.md`](./proposals/M6/SESSION-AND-ERROR-CONTRACT-M66.md).
+7. ~~**Portal XHR error contract:** **answered**~~ — one rule for every portal request: **401** redirects `window.top` to `/login?rd=…`, **403** is surfaced as "signed in, but not permitted" and never redirected, **5xx** is retried with backoff. See §3.3 and [`roadmap/M6/SESSION-AND-ERROR-CONTRACT-M66.md`](./roadmap/M6/SESSION-AND-ERROR-CONTRACT-M66.md).
 8. **`lemond` packaging:** from-source Nix today; whether to flake-input `nix-amd-ai` later for AMD only, or vendor a slim copy.
 9. **Heterogeneous and Multi-GPU planner:** inventory-ready schema now; scheduling later.
 10. **Per-key OWUI policy values:** the manifest framework is locked; mode / cadence / value for each dotted key is decided per method as each config section is implemented.
 11. **OWUI egress guardrails:** durable config lets an OWUI admin add external model connections (family-data egress), and the writers are now guarded. Open product call: keep exactly one connection, or move to per-connection selective management and grant power users their own?
 12. **Removed-user OWUI history:** day one is an immediate OWUI delete on delete. Open: adopt the tombstoned 7-day-undelete flow, and how it squares with jurisdictional right-to-erasure timelines.
-13. **Encryption:** deferred; document a LUKS/migration plan before friends-and-family data. See `proposals/AUTH-TOTP.md`.
+13. **Encryption:** deferred; document a LUKS/migration plan before friends-and-family data. See `roadmap/AUTH-TOTP.md`.
 
 ---
 
@@ -801,7 +806,7 @@ Moved to [BACKLOG](BACKLOG.md)
 | Edge auth (M6.2) | **CP-native login** (signed HMAC-SHA256 session cookie, branded page). Replaces Authelia (whose hardcoded `https` requirements were unfixable on an HTTP-only LAN). nginx `auth_request` → CP `/_lemonseed/session-verify`; identity headers set **only** from that response. Cookie: `Path=/; HttpOnly; SameSite=Lax`, no `Secure` by design. State in Valkey: **sliding** 1 h idle window under a 10 h absolute ceiling, keyed by boot id; `users.token_generation` gives real revocation; the gate **fails closed** if the store is down. |
 | Admin gating | Enforced in the **CP** from `X-Forwarded-Groups`; the nginx admin include is intentionally empty because nginx `if` runs before `auth_request` sets its variables |
 | CP authority | **CP + Postgres is the source of truth** (accounts = standard **users + groups**, many:many, Linux-style; elevation = `admin` group, no singular owner); config files / env / secrets are derived and regenerated |
-| Admin bootstrap | **Single `/setup` path** (synchronous; name + timezone + admin creds) — first admin only while the `admin` group is empty; lockout = preserve-reinstall + “Reset admin credentials” marker (physical access) clears the `admin` group so `/setup` reopens. M7 P3 corrected **where** that marker is written: the installer writes `@var/lib/lemonseed/reset-admin` **into the target's user-data filesystem**, which it already has mounted at `/run/lemonseed-install-user-data`; the ESP handoff described in the M6 record never worked and is deleted (D-27, see `proposals/M6/OPEN-WEBUI-UX.md`). The reset also **deletes** former admins whose username changed, which an upsert alone would leave able to sign in (D-20a), and the CP publishes `admins.json` so the installer can name the accounts it is about to reset rather than asking for consent in the abstract (D-28). [2026-10, M7 P3] |
+| Admin bootstrap | **Single `/setup` path** (synchronous; name + timezone + admin creds) — first admin only while the `admin` group is empty; lockout = preserve-reinstall + “Reset admin credentials” marker (physical access) clears the `admin` group so `/setup` reopens. M7 P3 corrected **where** that marker is written: the installer writes `@var/lib/lemonseed/reset-admin` **into the target's user-data filesystem**, which it already has mounted at `/run/lemonseed-install-user-data`; the ESP handoff described in the M6 record never worked and is deleted (D-27, see `roadmap/M6/OPEN-WEBUI-UX.md`). The reset also **deletes** former admins whose username changed, which an upsert alone would leave able to sign in (D-20a), and the CP publishes `admins.json` so the installer can name the accounts it is about to reset rather than asking for consent in the abstract (D-28). [2026-10, M7 P3] |
 | OWUI config authority (M6.3b) | **DB after first boot.** OWUI's Postgres `config` table is authoritative; env = bootstrap-only (the import-time set in §3.5 plus a CP env-generation marker). The CP reconciles via OWUI's admin API from a versioned manifest (`control-plane/owui-policy.json`) declaring per-key mode + cadence + `reason`, so behavior stays legible outside Python. |
 | OWUI interaction modes | Two orthogonal axes: **mode** per entity kind (`initial_setup`, `managed`, and for collections `selective_management` / `full_management`) and **cadence** (`at_boot` / `on_upgrade` / `manual`) bounding re-assertion. `initial_setup` must mean "delivered as env at first boot", because v0.11.0 seeds *every* known key into the table at first boot. |
 | OWUI entity ownership | By **CP-defined id**, namespaced by a reserved display name (`^Lemonseed.*$`), collision-swept at reconcile. Chosen over UUID-based ownership because v0.11.0 `ModelForm.id` is a client-supplied string we write, so ids cannot churn across upgrades/reinstalls; a wiped DB makes our entities *missing* and the reconciler re-creates them under the same ids. |
@@ -825,9 +830,9 @@ Moved to [BACKLOG](BACKLOG.md)
 | Destructive-action confirms | Typed "type the word to continue" interstitials are reserved for **data-destroying** actions (settings reset, user delete). Reboot, shutdown and update are data-safe, so they get an explainer plus a confirm — no typing. |
 | mDNS Docker-fabric fix | avahi 0.8 matches `allow-interfaces`/`deny-interfaces` with exact `strcasecmp` (no wildcards), so the static deny list never excluded `docker0`/`br-*`/`veth*`; Docker bridge/veth churn then triggered a false host-name conflict and avahi **renamed itself** (`lemonseed1.local` → `lemonseed1-2.local`), breaking discovery. The daemon now runs against a runtime-patchable conf (see §7): an allow-list of non-virtual NICs is generated at every daemon start, and `lemonseed-avahi-watch` reclaims the name when avahi renames it while it is actually free. `add-service-cookie=yes` was considered and rejected (in 0.8 the cookie is only published in service TXT records; the conflict path never reads it). [2026-10, M8] |
 | Release channel | **GitHub releases** since M8 P3: discovery is one `GET /releases` per check; `stable` = newest non-draft non-prerelease, `beta` = newest non-draft release; assets ride the CDN. The channel is *only* GitHub's prerelease flag (D-C1) — the signed manifest describes the payload, so a flip is a metadata edit, and switching channels never downgrades (D-C2). The setting lives in the CP settings table (`cp_meta`), materialized to `/var/lib/lemonseed/channel` for the DB-free root jobs; the installer seeds it. The old `dev-server` origin survives only as a `--url` value. |
-| Release payload (M8 P2) | **All appliance artifacts ship as one canonical tar cut into fixed 1 GiB `payload-NNN.part` parts**, never gzipped — the SquashFS is already zstd-compressed, so a second layer wins nothing. `manifest.json` stays outside the tar and describes both the chunks and the outputs; the installer ISO ships as its own direct asset. `make release` builds → packs → signs → self-verifies → stages `out/release-<version>/`; the hand-run SCP (`push-image-to-website.sh`) is removed (D23) and publishing becomes P4's GitHub-release job. Design: [`proposals/M8/PACKAGING.md`](./proposals/M8/PACKAGING.md). [2026-10, M8 P2] |
+| Release payload (M8 P2) | **All appliance artifacts ship as one canonical tar cut into fixed 1 GiB `payload-NNN.part` parts**, never gzipped — the SquashFS is already zstd-compressed, so a second layer wins nothing. `manifest.json` stays outside the tar and describes both the chunks and the outputs; the installer ISO ships as its own direct asset. `make release` builds → packs → signs → self-verifies → stages `out/release-<version>/`; the hand-run SCP (`push-image-to-website.sh`) is removed (D23) and publishing becomes P4's GitHub-release job. Design: [`roadmap/M8/PACKAGING.md`](./roadmap/M8/PACKAGING.md). [2026-10, M8 P2] |
 | N-1 rollback (M8 P6, D2/D30) | A **slot-version registry** (`/var/lib/lemonseed/slot-versions.json`) + grubenv version labels back `lemonseed-update rollback`: a boot-pointer flip via `lemonseed-ab lock-in`, gated on the inactive slot holding exactly the prior release at or above the running release's declared floor (**`rollback.min_rollback_version` in the signed manifest**, default the release's date minus the 30-day horizon; `MIN_ROLLBACK_VERSION=<v>` pins it for a one-way-door change). Re-offers at or below the fled-to version are suppressed until a strictly newer release ships; the panel mirrors the gate with an audited rollback button; older releases return only via `apply --force`. Rollback undoes the root, never the data. [2026-10, M8 P6] |
-| Auth without TLS | The appliance is reached by mDNS name over **plain HTTP**, so TLS is not available: there is no FQDN for a public cert, browsers reject self-signed certs and re-block them, and importing a private CA is beyond a home user. Because the transport cannot be trusted, the design goal becomes **never put the plaintext password on the wire at all** — a PAKE (SRP-6a) rather than client-side hashing, which is only obfuscation. See `proposals/M7/PLAN.md` D1. |
+| Auth without TLS | The appliance is reached by mDNS name over **plain HTTP**, so TLS is not available: there is no FQDN for a public cert, browsers reject self-signed certs and re-block them, and importing a private CA is beyond a home user. Because the transport cannot be trusted, the design goal becomes **never put the plaintext password on the wire at all** — a PAKE (SRP-6a) rather than client-side hashing, which is only obfuscation. See `roadmap/M7/PLAN.md` D1. |
 | SRP rollout | **SRP-only, no migration path** (chosen over shipping SRP alongside bcrypt, and over a one-time migrate-on-next-sign-in). Reason: a mixed tree is a tree with two auth paths, one of which is the thing we are removing; and there is **no install base**, so a breaking change is free today and expensive later. bcrypt cannot yield an SRP verifier (one-way), so "migrate on next sign-in" would have kept the plaintext POST alive indefinitely. Consequence: **all existing test machines need a fresh reinstall**, and A/B rollback across the boundary cannot sign anyone in (§11). |
 | Password policy | **Client-side, in `SRP_ENROLL_JS`.** This is a consequence, not a preference: enrollment derives the verifier in the browser, so the server never holds the password and cannot apply a rule to it. A server-side policy would require the server to see the password, which is the property we just gave up. Stated plainly so nobody later reads the missing server check as an oversight. |
 | Lint gate | `make lint` (ruff from nixpkgs, config in `ruff.toml`) over `control-plane/ scripts/ installer/`, kept **out of** `make test` so unit tests stay offline. Curated rule selection; permanent documented exclusions are `UP045` (conflicts with AGENTS.md's `Optional` guidance), `TRY004` (those `ValueError`s are deliberately caught by the enclosing handler — `TypeError` would turn 400s into 500s), and `external = [BLE001, N802, PLC0415]` so the call-site `noqa` documentation stays without enabling the rules. |
@@ -845,4 +850,4 @@ Moved to [BACKLOG](BACKLOG.md)
 
 ---
 
-*Historical review checklists for M1/M5/M6 live in [`proposals/M6/REVIEW-CHECKLISTS.md`](./proposals/M6/REVIEW-CHECKLISTS.md).*
+*Historical review checklists for M1/M5/M6 live in [`roadmap/M6/REVIEW-CHECKLISTS.md`](./roadmap/M6/REVIEW-CHECKLISTS.md).*

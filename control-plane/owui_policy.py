@@ -7,8 +7,8 @@ the engine — a strict loader/validator, resolvers, a *pure* planner (the
 entire mode-semantics surface), entity handlers, and the CP-side state store
 + last-known-good (LKG) snapshot.
 
-Layering (proposals/M6/OWUI-DURABLE-CONFIG-M63B.md /
-proposals/M6/OWUI-POLICY-ENGINE.md §5):
+Layering (documentation/roadmap/M6/OWUI-DURABLE-CONFIG-M63B.md /
+documentation/roadmap/M6/OWUI-POLICY-ENGINE.md §5):
 
     load_manifest()  strict; a bad file means keep the last-good manifest and
                      write nothing.

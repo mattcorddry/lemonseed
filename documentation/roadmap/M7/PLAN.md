@@ -94,7 +94,7 @@ We have a users *table* and no users *feature*.
   owns OWUI groups, anything an admin creates in OWUI's own UI loses our users at their
   next sign-in.
 
-### Deliverable: `proposals/M7/USERS-AND-GROUPS.md`
+### Deliverable: `USERS-AND-GROUPS.md`
 
 Answering, in writing, with trade-offs and the decision recorded:
 
@@ -235,7 +235,7 @@ substitute for fixing the password path, for two reasons. TOTP still needs an
 *identifier* — you must say which user you are before a code means anything — and it
 demands a recovery path, and printed backup codes are passwords wearing a different
 name. It also puts a shared-hardware problem on a household box. Decide it in the
-security milestone next to TLS, where `proposals/AUTH-TOTP.md` already lives.
+security milestone next to TLS, where `../AUTH-TOTP.md` already lives.
 
 **Gate: you approve this document, then P3 starts.** Anything left undecided here becomes a
 P3 blocker rather than an improvised choice mid-build. **P2 (SRP-6a) is not blocked on it**
@@ -548,7 +548,7 @@ the CP owns groups and OWUI mirrors them.
 
 **Built, and this gate is now closed.** `make test` + QEMU cover group CRUD, the system-group
 immutability rules and the guards. The `M6.2b` tripwire this gate was really about is **gone**:
-the retired label appears nowhere outside `proposals/` any more, because the manifest reason it
+the retired label appears nowhere outside `roadmap/` any more, because the manifest reason it
 was pinned to is no longer advisory. `test_owui_policy.py` now asserts the split in both
 directions — **all 7 guards `enforce`, none `advertise`** — and keeps a weaker, forward-looking
 rule in its place: any guard that is ever made advisory again has to say `until` something in
@@ -751,7 +751,7 @@ Two honest caveats:
   Whether `SCP_PATH` and the vhost root line up is therefore settled by the next real
   publish (push, then fetch `${URI}/manifest.json`), not by reading the hosting panel —
   which is a release-time check, not an open design question. `SCP_PATH` is unchanged.
-- `proposals/M4/USB-INSTALLER.md` still names `https://lemonseed.ai/releases/stable/`. That is
+- `../M4/USB-INSTALLER.md` still names `https://lemonseed.ai/releases/stable/`. That is
   a historical milestone record, so I left it; `DESIGN.md` is the contract.
 
 This also raises the stakes on signing, which is M8's first job: an internal HTTP origin with
@@ -942,7 +942,7 @@ Too large to sit inside P5, as you said. Pulled out whole so nothing is lost:
 **M6.4 AMD support is untested on AMD hardware.** The Vulkan backend is unit-covered, but
 `nixos/modules/qemu-test.nix` sets `lemonseed.lemond.llamacppBackend = "cpu"`, so no
 automated test has ever loaded a model through Vulkan, and no AMD GPU has been available
-for the tier-D check in `proposals/M6/AMD-VULKAN-M64.md`. Treat the AMD path as
+for the tier-D check in `../M6/AMD-VULKAN-M64.md`. Treat the AMD path as
 *implemented, unvalidated*. If an AMD box appears, that tier-D checklist is the whole
 test plan and needs no new code. *(Update at M7 close: the Strix Halo box is now the
 primary bare-metal test machine — Vulkan, shared-memory carve-out and boot-time `amdgpu`

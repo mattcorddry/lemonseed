@@ -4,7 +4,7 @@ Why this exists: the appliance is HTTP-only forever (no FQDN, no usable CA), so
 the previous design put the plaintext password in a JSON body where anyone on the
 LAN could read it. SRP-6a is the one PAKE that needs no dependencies and no
 build pipeline — native ``pow(g, x, N)`` here, native ``BigInt`` in the browser —
-and it removes the credential from the wire. See ``proposals/M7/PLAN.md`` D1 for
+and it removes the credential from the wire. See ``documentation/roadmap/M7/PLAN.md`` D1 for
 the option ranking, and note what SRP does **not** buy: the session cookie is
 still a bearer token on plaintext HTTP, and an active on-path attacker can still
 rewrite the login page.

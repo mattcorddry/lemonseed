@@ -14,7 +14,7 @@ Two properties are load-bearing:
 * **Keys die with the boot.** The key carries the boot id, so an appliance reboot
   signs everyone out even though ``valkey-server --save 60 1`` restores its
   snapshot. That is an accepted tradeoff, not a goal; the alternatives are
-  recorded in ``proposals/M6/SESSION-AND-ERROR-CONTRACT-M66.md`` (D2).
+  recorded in ``documentation/roadmap/M6/SESSION-AND-ERROR-CONTRACT-M66.md`` (D2).
 
 No Valkey in unit tests: the client is imported lazily and mocked, so ``make
 test`` needs no Valkey, no Docker, no Postgres (AGENTS.md).

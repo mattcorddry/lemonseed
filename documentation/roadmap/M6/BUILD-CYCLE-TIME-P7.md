@@ -104,7 +104,7 @@ stack from source again. That is the entire reported symptom.
 
 Compounding but independent: `--impure` (`package.sh:52-55`) makes `self` the
 **dirty git tree** (`9b594d1…-dirty`, 37 changed paths), so any tracked-file edit —
-including `proposals/*.md` — changes the toplevel and the image. Measurements taken
+including `roadmap/*.md` — changes the toplevel and the image. Measurements taken
 on a dirty tree are not repeatable, and this invalidates independently of the
 version string.
 

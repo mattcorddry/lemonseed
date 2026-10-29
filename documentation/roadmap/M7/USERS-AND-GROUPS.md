@@ -1,7 +1,7 @@
 # M7 P1 — Users & Groups: design record
 
 **Status: approved (rev 2).** This document is P1's deliverable
-(`proposals/M7/PLAN.md` P1 §Deliverable). It is a **decision record**, not a
+(`PLAN.md` P1 §Deliverable). It is a **decision record**, not a
 research note: every numbered decision is made here. §11 has no open items, so
 **P3 is unblocked and building.** Rev 2 folds in the review decisions: no
 `password_hash` in the new schema, no backfill or pre-M7 compatibility code
