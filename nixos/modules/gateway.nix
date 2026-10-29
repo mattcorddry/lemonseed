@@ -572,6 +572,12 @@ in
         proxyPass = "http://127.0.0.1:8080";
         extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
+      # Release channel (M8 P3/P5): a settings change, admin-only — it decides
+      # which release the next check resolves to.
+      locations."= /_lemonseed/api/update/channel" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
       # Internal auth_request target (never LAN-facing). The CP verifies the
       # signed session cookie and returns 200 + X-Forwarded-* headers (read via
       # auth_request_set in the gate snippet) or 401.

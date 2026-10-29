@@ -140,6 +140,8 @@ class SnapshotTests(_Files):
             encoding="utf-8",
         )
         self.assertEqual(updates.snapshot("2026.03")["rollback_kind"], "back")
+        # The select renders the configured channel either way.
+        self.assertEqual(updates.snapshot("2026.03")["channel"], "stable")
 
 
 class RollbackTests(_Files):

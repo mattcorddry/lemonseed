@@ -3773,6 +3773,32 @@ class UpdateHttpTests(unittest.TestCase):
             code, body = self._post("/_lemonseed/api/update/rollback", {}, self.ADMIN)
         self.assertEqual(code, 409)
         self.assertIn("no version recorded", body.get("detail", ""))
+
+    @mock.patch.object(stub.audit, "record")
+    @mock.patch.object(updates.settings, "set_setting", return_value=True)
+    def test_the_channel_switch_stores_and_audits(self, store: mock.Mock, record: mock.Mock) -> None:
+        """M8 P3/P5: the channel is a settings change — validated, stored in
+        cp_meta, materialized for the root jobs, and audited with the channel
+        named (names of things changed, never values... except a channel)."""
+        code, body = self._post("/_lemonseed/api/update/channel", {"channel": "beta"}, self.ADMIN)
+        self.assertEqual(code, 200)
+        self.assertEqual(body["channel"], "beta")
+        store.assert_called_once_with("release_channel", "beta")
+        record.assert_called_once_with("matt", "appliance", "update.channel", {"channel": "beta"})
+
+    def test_an_invalid_channel_is_a_bad_request(self) -> None:
+        with mock.patch.object(updates.settings, "set_setting") as store:
+            code, body = self._post("/_lemonseed/api/update/channel", {"channel": "canary"}, self.ADMIN)
+        self.assertEqual(code, 400)
+        self.assertIn("stable", body.get("error", ""))
+        store.assert_not_called()
+
+    @mock.patch.object(stub.audit, "record")
+    def test_a_failed_store_is_a_server_error(self, record: mock.Mock) -> None:
+        with mock.patch.object(updates.settings, "set_setting", return_value=False):
+            code, body = self._post("/_lemonseed/api/update/channel", {"channel": "beta"}, self.ADMIN)
+        self.assertEqual(code, 500)
+        self.assertIn("release channel", body.get("error", ""))
         record.assert_not_called()
 
     @mock.patch.object(stub, "schedule_power")

@@ -177,6 +177,7 @@ def snapshot(running: str) -> dict[str, Any]:
         # newer release, and the affordance is a roll *forward*. The label
         # follows the direction; the operation is the same boot-pointer flip.
         "rollback_kind": ("forward" if prior > running else "back") if prior else "back",
+        "channel": settings.get_setting("release_channel", "stable") or "stable",
         "checked_at": str(latest_record.get("checked_at") or ""),
         "job": job,
         "failed": failed_update(running),

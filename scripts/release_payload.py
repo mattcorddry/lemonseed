@@ -226,7 +226,13 @@ def _verify_release_dir(release_dir: Path, trust_dir: str | None) -> None:
         raise ReleaseError(f"no manifest in {release_dir}")
     key = lemonseed_verify.verify_manifest_files(manifest_path, directory=Path(trust_dir) if trust_dir else None)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    lemonseed_verify.check_signing_metadata(manifest)
+    # The metadata cross-check must consult the SAME trust set the signature
+    # just verified against — a --trust-dir override that never reaches it
+    # would compare the named key against a default directory the build
+    # machine does not even have (lemonbuild has no /usr/share/lemonseed).
+    lemonseed_verify.check_signing_metadata(
+        manifest, directory=Path(trust_dir) if trust_dir else None
+    )
     print(f"OK: manifest signature verifies (key {key.name})")
 
     payload = manifest.get("payload") or {}

@@ -3606,6 +3606,7 @@ UPDATE_JS = r"""
   const install = document.getElementById('update-install');
   const priorRow = document.getElementById('version-prior-row');
   const rollback = document.getElementById('update-rollback');
+  const channelSelect = document.getElementById('update-channel');
   if (!note || !failedBox || !checkButton || !install || !priorRow || !rollback) return;
 
   // The one status line under the buttons. It was named after the power
@@ -3652,6 +3653,8 @@ UPDATE_JS = r"""
     document.getElementById('version-prior-name').textContent =
       forward ? 'Newer version' : 'Prior version';
     rollback.textContent = forward ? 'Roll forward' : 'Roll back';
+    channelSelect.value = s.channel || 'stable';
+    channelSelect.disabled = working;
     // Hidden while a failed-update banner is up: the failed attempt is what
     // the other slot holds, and rolling back onto it makes no sense until the
     // banner is dismissed (Retry or Cancel).
@@ -3855,6 +3858,29 @@ UPDATE_JS = r"""
     }
   });
 
+  // The channel switch is a settings change, not an update: it takes effect
+  // on the next check, and switching to Beta is confirmed because early
+  // releases are the point of the channel.
+  channelSelect.addEventListener('change', async () => {
+    const value = channelSelect.value;
+    const current = (known && known.channel) || 'stable';
+    if (!value || value === current) return;
+    if (value === 'beta') {
+      const go = await dialogConfirm('Switch to the Beta channel?',
+        'The Lemonseed Beta release channel contains early releases that may '
+        + 'not be fully tested; use at your own risk.',
+        {confirmLabel: 'Switch to Beta', cancelLabel: 'Remain on Stable'});
+      if (!go) { channelSelect.value = 'stable'; return; }
+    }
+    const ui = await post('/_lemonseed/api/update/channel', {channel: value});
+    if (!ui.ok) {
+      channelSelect.value = current;
+      noteIt(ui.data.detail || 'The appliance refused to change the channel.', true);
+      return;
+    }
+    refresh();
+  });
+
   // One attempt: open the progress box, start the job, watch it. A failed job
   // hands the user Retry/Cancel; Retry comes back here with the retry flag,
   // which makes the updater cancel the leftover attempt record before it
@@ -3997,6 +4023,7 @@ lights and no network, until someone presses the power button on the box.</p>
 <div class="row"><span class="name">Current Version</span><span class="state" id="version-running">{running_version}</span></div>
 <div class="row" id="version-prior-row" hidden><span class="name" id="version-prior-name">Prior version</span><span class="state" id="version-prior">—</span></div>
 <div class="row"><span class="name">Latest available</span><span class="state" id="version-latest">checking…</span></div>
+<div class="row"><span class="name">Release channel</span><span class="state"><select id="update-channel"><option value="stable">Stable</option><option value="beta">Beta</option></select></span></div>
 <p class="owui-status bad" id="update-failed" hidden></p>
 <div class="owui-actions">
 <button type="button" id="update-check">Check now</button>
@@ -5136,6 +5163,34 @@ class Handler(BaseHTTPRequestHandler):
         audit.record(self._actor() or audit.ACTOR_CP, "appliance", "update.rollback")
         self._json(202, {"state": "running", "kind": "rollback"})
 
+    def _handle_update_channel_post(self, raw: bytes) -> None:
+        """POST /_lemonseed/api/update/channel — switch the release channel.
+
+        Admin-gated like every other update action. The settings store
+        validates, stores in cp_meta, and materializes
+        /var/lib/lemonseed/channel for the DB-free root jobs; the next check
+        resolves through the new channel.
+        """
+        try:
+            data = json.loads(raw.decode() or "{}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._json(400, {"error": "bad request"})
+            return
+        channel = data.get("channel") if isinstance(data, dict) else None
+        if channel not in ("stable", "beta"):
+            self._json(400, {"error": "channel must be 'stable' or 'beta'"})
+            return
+        if not updates.settings.set_setting("release_channel", channel):
+            self._json(500, {"error": "could not save the release channel"})
+            return
+        audit.record(
+            self._actor() or audit.ACTOR_CP,
+            "appliance",
+            "update.channel",
+            {"channel": channel},
+        )
+        self._json(200, {"channel": channel})
+
     # ------------------------------------------------------------------
     # QEMU e2e GC helpers (test-only; admin-gated like the model choice).
     # The disk-space guard is exercised end-to-end by scripts/qemu-api-smoke-test.sh
@@ -5596,6 +5651,11 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_admin():
                 return
             self._handle_update_rollback_post()
+            return
+        if path == "/_lemonseed/api/update/channel":
+            if not self._require_admin():
+                return
+            self._handle_update_channel_post(raw)
             return
         if path != "/setup":
             self._json(404, {"error": "not found"})

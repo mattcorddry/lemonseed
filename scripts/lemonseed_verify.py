@@ -203,13 +203,16 @@ def verify_manifest_files(
     return verify_manifest(manifest, signature, directory)
 
 
-def check_signing_metadata(manifest: dict[str, Any]) -> None:
+def check_signing_metadata(
+    manifest: dict[str, Any], directory: Path | None = None
+) -> None:
     """Cross-check the signed manifest's own signing block, legibly.
 
     Called after the signature has verified: the metadata is inside the signed
     bytes, so a mismatch means the signer recorded something the trust set does
     not carry (e.g. a key retired from the image) — worth naming, not silently
-    passing.
+    passing. ``directory`` must be the same trust set the signature verified
+    against — the publisher's ``--trust-dir`` override, else the baked default.
     """
     signing = manifest.get("signing") or {}
     if not signing.get("enabled"):
@@ -224,9 +227,9 @@ def check_signing_metadata(manifest: dict[str, Any]) -> None:
         )
     public_key = signing.get("public_key")
     if public_key:
-        directory = trust_dir()
-        if not (directory / str(public_key)).is_file():
+        trust = directory or trust_dir()
+        if not (trust / str(public_key)).is_file():
             raise VerificationError(
                 f"release manifest names signing key {public_key!r} but the baked "
-                f"trust set at {directory} does not contain it — refusing"
+                f"trust set at {trust} does not contain it — refusing"
             )
