@@ -372,6 +372,59 @@ class ResetAdminCopyTests(unittest.TestCase):
         self.assertIn("reset_admin_credentials", app_js)
 
 
+class DiscoveryRefusalTests(unittest.TestCase):
+    """M8 P3: the USB carries no appliance image — it downloads one from the
+    resolved channel. A test build published nowhere must be refused with the
+    product sentence, the technical reason in detail, and retry/reboot safe."""
+
+    def test_an_unpublished_set_is_a_product_sentence_with_detail(self) -> None:
+        with mock.patch.object(install, "artifact_dir", return_value=None), mock.patch.object(
+            install, "image_base_url", return_value=None
+        ), mock.patch.object(
+            install.lemonseed_artifacts, "resolve_release_base", return_value=None
+        ):
+            with self.assertRaises(install.InstallError) as ctx:
+                install.acquire_artifacts(None, channel="stable")
+        # The user sees the product sentence; the technical reason (which
+        # channel, what to override) rides in detail for the debug disclosure.
+        self.assertEqual(
+            str(ctx.exception),
+            "Unable to find the release files for Lemonseed AI. "
+            "No changes were made to your system.",
+        )
+        self.assertIn("No releases found on the stable channel at", ctx.exception.detail)
+
+    def test_the_worker_surfaces_sentence_detail_and_safe_buttons(self) -> None:
+        """The source failure is the one error phase where retry/reboot are
+        safe: nothing was written, so the buttons come on and the technical
+        reason rides in detail, not in the product sentence."""
+        import server
+
+        err = install.ReleaseSourceError("no release on channel 'stable'")
+        with mock.patch.object(server, "run_install", side_effect=err):
+            server.install_worker("/dev/sda", False, False, "stable")
+        st = server.get_state()
+        self.assertEqual(st["phase"], "error")
+        self.assertEqual(
+            st["error"],
+            "Unable to find the release files for Lemonseed AI. "
+            "No changes were made to your system.",
+        )
+        self.assertEqual(st["detail"], "no release on channel 'stable'")
+        self.assertTrue(st["can_reboot"])
+
+        # Any other failure may have half-written the target: the buttons stay
+        # off and the technical text is all there is.
+        with mock.patch.object(
+            server, "run_install", side_effect=install.InstallError("write failed")
+        ):
+            server.install_worker("/dev/sda", False, False, "stable")
+        st = server.get_state()
+        self.assertEqual(st["error"], "write failed")
+        self.assertFalse(st["detail"])
+        self.assertFalse(st["can_reboot"])
+
+
 class InstallWiringTests(unittest.TestCase):
     """run_install must hand the reset intent to user-data, not to the ESP."""
 

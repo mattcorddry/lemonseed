@@ -66,6 +66,23 @@ sha256_initrd="$(sha256sum "${OUT_DIR}/initrd.img" | awk '{print $1}')"
 size_vmlinuz="$(stat -c %s "${OUT_DIR}/vmlinuz")"
 size_squashfs="$(stat -c %s "${OUT_DIR}/root.squashfs")"
 size_initrd="$(stat -c %s "${OUT_DIR}/initrd.img")"
+# The rollback floor rides inside the signed bytes (M8 P6, D30): the earliest
+# version a rollback may target. A one-way-door change pins it explicitly via
+# MIN_ROLLBACK_VERSION; the default is this release's date minus the horizon.
+if [[ -n "${MIN_ROLLBACK_VERSION:-}" ]]; then
+  rollback_floor="${MIN_ROLLBACK_VERSION}"
+else
+  rollback_floor="$(ROOT="${ROOT}/scripts" VERSION="${VERSION}" python3 -c '
+import os, sys
+sys.path.insert(0, os.environ["ROOT"])
+import lemonseed_artifacts
+print(lemonseed_artifacts.rollback_floor(os.environ["VERSION"]) or "")
+')"
+fi
+rollback_json=""
+if [[ -n "${rollback_floor}" ]]; then
+  rollback_json="  \"rollback\": {\"min_rollback_version\": \"${rollback_floor}\"},"
+fi
 
 cat >"${OUT_DIR}/manifest.json" <<EOF
 {
@@ -74,6 +91,7 @@ cat >"${OUT_DIR}/manifest.json" <<EOF
   "arch": "x86_64",
   "profile": "${PROFILE}",
   "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+${rollback_json}
   "artifacts": {
     "vmlinuz": {
       "path": "vmlinuz",

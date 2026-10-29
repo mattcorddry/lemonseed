@@ -11,8 +11,10 @@ import shutil
 import subprocess
 import tarfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,12 @@ import lemonseed_verify
 from lemonseed_verify import VerificationError
 
 ProgressFn = Callable[..., None]
+
+# The default rollback floor (M8 P6): a release may be rolled back to while it
+# is no older than this many days. The released manifest declares its floor
+# explicitly (PACKAGING.md §2.2); this constant is the pack-time default and
+# the fallback for manifests written before the field existed.
+ROLLBACK_HORIZON_DAYS = 30
 
 # The release channel is GitHub releases (M8 P3, D8/D23): `lemonseed.ai` sits
 # behind Cloudflare, which forbids serving large objects through its proxy, so
@@ -95,6 +103,25 @@ def releases_api_url() -> str:
     return os.environ.get("LEMONSEED_RELEASES_API") or RELEASES_API_DEFAULT
 
 
+def rollback_floor(version: str, horizon_days: int = ROLLBACK_HORIZON_DAYS) -> str | None:
+    """The rollback floor a release declares: its version date − horizon.
+
+    Versions are ``YYYYMMDD.NN`` date stamps, so the floor renders as
+    ``YYYYMMDD.00`` and compares lexicographically against the versions it
+    gates. A version that does not start with a parseable date stamp (test
+    sets like ``smoke-a``) has no computable floor — ``None`` means the caller
+    skips the check rather than refusing.
+    """
+    head = version.split(".", 1)[0]
+    if len(head) != 8 or not head.isdigit():
+        return None
+    try:
+        day = date(int(head[:4]), int(head[4:6]), int(head[6:8])) - timedelta(days=horizon_days)
+    except ValueError:
+        return None
+    return f"{day.strftime('%Y%m%d')}.00"
+
+
 def resolve_release_base(channel: str) -> tuple[str, str] | None:
     """GitHub discovery (D5): the release *this channel* resolves to.
 
@@ -102,10 +129,14 @@ def resolve_release_base(channel: str) -> tuple[str, str] | None:
     ``releases/download/<tag>/`` — plus the tag, or ``None`` when no release
     qualifies. ``None`` means "up to date", not an error (D-C2: the channel
     filters candidates; the version comparison decides). Drafts are never
-    candidates; prereleases qualify for beta only.
+    candidates; prereleases qualify for beta only. Refusals name the failed
+    request — URL, HTTP status, DNS, timeout — and nothing else: they are the
+    installer's technical-details line, not a support article.
     """
+    api_url = releases_api_url()
+    api_host = urllib.parse.urlsplit(api_url).hostname or api_url
     try:
-        with _urlopen(releases_api_url()) as resp:
+        with _urlopen(api_url) as resp:
             releases = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 403:
@@ -115,9 +146,14 @@ def resolve_release_base(channel: str) -> tuple[str, str] | None:
                 "60/hour, shared by every appliance behind your IP). "
                 f"Try again {retry}."
             ) from exc
-        raise ArtifactError(f"GitHub release API error: {exc}") from exc
+        raise ArtifactError(f"{api_url} returned HTTP/{exc.code}") from exc
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        raise ArtifactError(f"Could not reach the GitHub release API: {exc}") from exc
+        reason = str(getattr(exc, "reason", None) or exc).lower()
+        if "name" in reason and ("resolve" in reason or "service" in reason) or "getaddrinfo" in reason:
+            raise ArtifactError(f"DNS lookup failed for {api_host}") from exc
+        if "timed out" in reason or "timeout" in reason:
+            raise ArtifactError(f"Connection timeout contacting {api_host}") from exc
+        raise ArtifactError(f"Could not connect to {api_host}: {exc}") from exc
     if not isinstance(releases, list):
         raise ArtifactError("GitHub release API returned an unexpected answer (not a list)")
 

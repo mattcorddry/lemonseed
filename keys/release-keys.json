@@ -1,11 +1,17 @@
 {
-  "version": 2,
+  "version": 3,
   "keys": [
     {
       "version": 1,
       "algorithm": "ecdsa-p256",
       "file": "lemonseed-release.pub",
       "fingerprint": "9ce7567b223d7116"
+    },
+    {
+      "version": 2,
+      "algorithm": "ecdsa-p256",
+      "file": "test.pub",
+      "fingerprint": "34124ad7b7a994db"
     }
   ]
 }

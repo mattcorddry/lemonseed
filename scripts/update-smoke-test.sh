@@ -60,6 +60,11 @@ export LEMONSEED_RELEASE_KEYS_DIR="${ROOT}/keys/qemu"
 # smoke needs the same template or the arm step refuses.
 export LEMONSEED_GRUB_CFG="${ROOT}/boot/grub.cfg"
 export LEMONSEED_AB="${ROOT}/scripts/lemonseed-ab.sh"
+# The updater's bookkeeping stays in the workdir: a smoke run must not leave
+# attempt records or a slot registry in the host's /var/lib/lemonseed.
+export LEMONSEED_ATTEMPT_FILE="${WORKDIR}/update-attempt.json"
+export LEMONSEED_LATEST_FILE="${WORKDIR}/latest-update.json"
+export LEMONSEED_SLOT_VERSIONS_FILE="${WORKDIR}/slot-versions.json"
 
 # Env the root-spawned updater stages need (the packaged updater exports these;
 # the smoke reproduces that environment explicitly).
@@ -67,6 +72,10 @@ SUDO_ENV=(
   env "PATH=${PATH}" "PYTHONPATH=${PYTHONPATH}"
   "LEMONSEED_AB=${LEMONSEED_AB}" "LEMONSEED_RELEASE_KEYS_DIR=${LEMONSEED_RELEASE_KEYS_DIR}"
   "LEMONSEED_GRUB_CFG=${LEMONSEED_GRUB_CFG}"
+  "LEMONSEED_ATTEMPT_FILE=${LEMONSEED_ATTEMPT_FILE}"
+  "LEMONSEED_LATEST_FILE=${LEMONSEED_LATEST_FILE}"
+  "LEMONSEED_SLOT_VERSIONS_FILE=${LEMONSEED_SLOT_VERSIONS_FILE}"
+  "LEMONSEED_DOWNLOAD_DIR=${WORKDIR}/dl"
 )
 
 sign_manifest() {  # sign_manifest <dir> — add signing metadata, sign in place
@@ -277,6 +286,84 @@ if echo "${STATUS2}" | grep -q 'boot_once=b'; then
 fi
 sudo umount "${WORKDIR}/esp"
 
+# Rollback round trip (M8 P6, D2/D30): the apply put smoke-b on slot B and
+# recorded it; fleeing back is a boot-pointer flip, not a write. The updater
+# stages run as root (same as apply), with the slot registry and attempt
+# record isolated to the workdir via the LEMONSEED_* env above.
+echo "==> rollback to slot B (the prior slot)"
+sudo "${SUDO_ENV[@]}" python3 - <<'PY'
+import os, sys
+from unittest import mock
+
+sys.path.insert(0, os.environ["PYTHONPATH"])
+import lemonseed_update as update
+
+# The panel's *cancel* runs this before any new verb; the attempt record left
+# by the apply above is landed success, and the rollback must proceed.
+update.clear_attempt()
+with mock.patch.object(update, "current_slot", return_value="a"), mock.patch.object(
+    update, "cmdline_slot", return_value="a"
+), mock.patch.object(update, "running_version", return_value="smoke-a"):
+    rc = update.cmd_rollback(reboot=False, force=False)
+    assert rc == 0, rc
+print("rollback ok")
+PY
+
+# The flip: default is now the prior slot, no boot_once pending, and the
+# grubenv carries the version label the boot menu expands.
+sudo mount -t vfat -o rw,umask=000 "${ESP}" "${WORKDIR}/esp"
+STATUS_RB="$(bash "${ROOT}/scripts/lemonseed-ab.sh" status --esp "${WORKDIR}/esp")"
+echo "${STATUS_RB}"
+echo "${STATUS_RB}" | grep -q 'boot_default=b'
+if echo "${STATUS_RB}" | grep -q 'boot_once=b'; then
+  echo "FAIL: rollback left boot_once pending" >&2
+  exit 1
+fi
+grep -q "slot_b_version=smoke-b" "${WORKDIR}/esp/grub/grubenv"
+sudo umount "${WORKDIR}/esp"
+python3 -c '
+import json, os
+from pathlib import Path
+registry = json.loads(Path(os.environ["LEMONSEED_SLOT_VERSIONS_FILE"]).read_text(encoding="utf-8"))
+assert registry["slots"]["b"]["version"] == "smoke-b", registry
+assert registry["rolled_back_version"] == "smoke-a", registry
+print("registry honest after rollback")
+'
+
+# Re-apply B (--force is the deliberate override of the rollback marker's
+# suppression), then cancel so the fixture ends clean.
+echo "==> re-applying smoke-b over the rolled-back state"
+sudo "${SUDO_ENV[@]}" python3 - "${WORKDIR}/artifacts-b" <<'PY'
+import os, sys
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, os.environ["PYTHONPATH"])
+import lemonseed_update as update
+
+with mock.patch.object(update, "current_slot", return_value="a"), mock.patch.object(
+    update, "cmdline_slot", return_value="a"
+), mock.patch.object(update, "running_version", return_value="smoke-a"):
+    rc = update.cmd_apply(None, sys.argv[1], reboot=False, force=True)
+    assert rc == 0, rc
+print("re-apply ok")
+PY
+sudo "${SUDO_ENV[@]}" python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+import lemonseed_update as update
+update.cmd_cancel()
+print("cancel ok")
+' "${PYTHONPATH}"
+python3 -c '
+import json, os
+from pathlib import Path
+registry = json.loads(Path(os.environ["LEMONSEED_SLOT_VERSIONS_FILE"]).read_text(encoding="utf-8"))
+assert registry["rolled_back_version"] is None, registry
+assert registry["slots"]["b"]["version"] == "smoke-b", registry
+print("apply cleared the rollback marker")
+'
+
 # Checksum mismatch refusal.
 python3 - "${WORKDIR}/artifacts-bad" <<'PY'
 import hashlib, json, sys
@@ -326,4 +413,4 @@ else
   exit 1
 fi
 
-echo "OK: update smoke passed (slot B armed, cancel restores A default, bad checksum refused)"
+echo "OK: update smoke passed (slot B armed, rollback flips the default back, re-apply clears the marker, bad checksum refused)"

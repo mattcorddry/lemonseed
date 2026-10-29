@@ -20,6 +20,11 @@
   const rebootBtn = document.getElementById("reboot");
   const waitBox = document.getElementById("wait-box");
   const errEl = document.getElementById("err");
+  const errActions = document.getElementById("err-actions");
+  const errDetail = document.getElementById("err-detail");
+  const errDetailBody = document.getElementById("err-detail-body");
+  const retryBtn = document.getElementById("retry");
+  const errRebootBtn = document.getElementById("err-reboot");
   const barEl = document.querySelector(".bar");
 
   let selected = null;
@@ -158,11 +163,7 @@
 
   function applyStatus(st) {
     phaseTitle.textContent =
-      st.phase === "await_usb"
-        ? "Almost done"
-        : st.phase === "error"
-          ? "Install failed"
-          : "Installing";
+      st.phase === "await_usb" ? "Almost done" : "Installing";
     phaseMsg.textContent = st.message || "";
     const pct = Math.max(0, Math.min(100, st.progress || 0));
     barFill.style.width = pct + "%";
@@ -173,7 +174,18 @@
     } else {
       errEl.classList.add("hidden");
     }
-    if (st.can_reboot) rebootBox.classList.remove("hidden");
+    // Error actions ride the product sentence: the technical reason (DNS,
+    // HTTP status, which channel was searched) stays behind the disclosure.
+    const failed = st.phase === "error";
+    errActions.classList.toggle("hidden", !failed);
+    if (failed && st.detail) {
+      errDetail.classList.remove("hidden");
+      errDetailBody.textContent = st.detail;
+    } else {
+      errDetail.classList.add("hidden");
+      errDetailBody.textContent = "";
+    }
+    if (st.can_reboot && st.phase === "await_usb") rebootBox.classList.remove("hidden");
     else rebootBox.classList.add("hidden");
   }
 
@@ -315,6 +327,33 @@
       /* host will drop mid-request once sysrq-b fires */
     }
     startWaitingForAppliance();
+  });
+
+  // A failed install that changed nothing (release files not found) goes back
+  // to the disk form: the selections are still there, and Install re-runs the
+  // preflight. Rebooting is equally safe — the box boots the installer again.
+  retryBtn.addEventListener("click", async () => {
+    progressPanel.classList.add("hidden");
+    diskPanel.classList.remove("hidden");
+    try {
+      renderDisks(await fetch("/api/disks", { cache: "no-store" }).then((r) => r.json()));
+    } catch (_) {
+      /* keep the selections the form already has */
+    }
+  });
+
+  errRebootBtn.addEventListener("click", async () => {
+    errRebootBtn.disabled = true;
+    phaseMsg.textContent = "Rebooting…";
+    try {
+      await fetch("/api/reboot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+    } catch (_) {
+      /* host will drop mid-request once sysrq-b fires */
+    }
   });
 
   fetch("/api/disks")

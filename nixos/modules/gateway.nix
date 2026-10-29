@@ -566,6 +566,12 @@ in
         proxyPass = "http://127.0.0.1:8080";
         extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
+      # Rollback (M8 P6, D30): boots the prior slot. Admin-only, like the rest
+      # of the update affordance.
+      locations."= /_lemonseed/api/update/rollback" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
       # Internal auth_request target (never LAN-facing). The CP verifies the
       # signed session cookie and returns 200 + X-Forwarded-* headers (read via
       # auth_request_set in the gate snippet) or 401.

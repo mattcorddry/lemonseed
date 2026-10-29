@@ -3757,6 +3757,24 @@ class UpdateHttpTests(unittest.TestCase):
         install.assert_called_once_with(retry=True)
         record.assert_called_once_with("matt", "appliance", "update.retry")
 
+    @mock.patch.object(stub.audit, "record")
+    def test_rollback_answers_202_and_audits_the_action(self, record: mock.Mock) -> None:
+        with mock.patch.object(updates, "start_rollback", return_value=None) as rollback:
+            code, body = self._post("/_lemonseed/api/update/rollback", {}, self.ADMIN)
+        self.assertEqual(code, 202)
+        self.assertEqual(body["kind"], "rollback")
+        rollback.assert_called_once_with("2026.02")
+        record.assert_called_once_with("matt", "appliance", "update.rollback")
+
+    @mock.patch.object(stub.audit, "record")
+    def test_an_ineligible_rollback_is_refused_and_not_audited(self, record: mock.Mock) -> None:
+        with mock.patch.object(updates, "start_rollback",
+                               return_value="the other slot has no version recorded"):
+            code, body = self._post("/_lemonseed/api/update/rollback", {}, self.ADMIN)
+        self.assertEqual(code, 409)
+        self.assertIn("no version recorded", body.get("detail", ""))
+        record.assert_not_called()
+
     @mock.patch.object(stub, "schedule_power")
     def test_power_is_refused_while_an_install_is_in_flight(self, power: mock.Mock) -> None:
         with mock.patch.object(updates, "in_flight",

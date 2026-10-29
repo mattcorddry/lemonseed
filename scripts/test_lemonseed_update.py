@@ -188,6 +188,7 @@ class UpdateLogicTests(unittest.TestCase):
                         "initrd.img": Path("/dev/null"),
                     },
                     "a",
+                    version="2026.02",
                     force=True,
                 )
             self.assertIn("active slot", str(ctx.exception))
@@ -313,6 +314,9 @@ class UpdateApplyTests(unittest.TestCase):
             esp_dir = root / "esp"
             (esp_dir / "EFI" / "lemonseed").mkdir(parents=True)
             (esp_dir / "grub").mkdir(parents=True)
+            # The installer seeds grubenv on a real ESP; the version-var
+            # writes (M8 P6) expect it to exist.
+            (esp_dir / "grub" / "grubenv").write_bytes(b"env")
             # Minimal grubenv via helper script path
             ab = root / "ab.sh"
             ab.write_text(
@@ -350,6 +354,8 @@ class UpdateApplyTests(unittest.TestCase):
                     return subprocess.run(
                         cmd, check=check, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
                     )
+                if cmd[0] == "grub-editenv":
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
                 raise AssertionError(f"unexpected command: {cmd}")
 
             with mock.patch.object(update, "AB_HELPER", str(ab)), mock.patch.object(
@@ -372,6 +378,10 @@ class UpdateApplyTests(unittest.TestCase):
                 update, "GRUB_CFG_FALLBACK", root / "no-such-fallback.cfg"
             ), mock.patch.object(
                 update, "ATTEMPT_FILE", root / "update-attempt.json"
+            ), mock.patch.object(
+                update, "running_version", return_value="t8"
+            ), mock.patch.object(
+                update, "SLOT_VERSIONS_FILE", root / "slot-versions.json"
             ), mock.patch.object(
                 artifacts.subprocess,
                 "check_output",
@@ -397,6 +407,11 @@ class UpdateApplyTests(unittest.TestCase):
                 self.assertEqual(attempt["intended_version"], "u1")
                 self.assertEqual(attempt["target_slot"], "b")
                 self.assertIn("attempted_at", attempt)
+                # Slot-version bookkeeping (M8 P6): the applied release is on
+                # record for the target slot, the running one self-healed.
+                saved = json.loads((root / "slot-versions.json").read_text(encoding="utf-8"))
+                self.assertEqual(saved["slots"]["b"]["version"], "u1")
+                self.assertEqual(saved["slots"]["a"]["version"], "t8")
 
     def test_apply_refuses_the_version_already_running(self) -> None:
         """Reinstalling the running version is not an update; refuse it with
@@ -424,23 +439,28 @@ class UpdateApplyTests(unittest.TestCase):
             "root.squashfs": Path("/nonexistent/root.squashfs"),
         }
         err = io.StringIO()
-        with mock.patch.object(update, "require_root"), \
-                mock.patch.object(update, "preflight"), \
-                mock.patch.object(update, "current_slot", return_value="a"), \
-                mock.patch.object(update, "inactive_slot", return_value="b"), \
-                mock.patch.object(update, "acquire_artifacts",
-                                  return_value=(files, "v9", {})), \
-                mock.patch.object(update, "running_version", return_value="v8"), \
-                mock.patch.object(update, "write_inactive_slot"), \
-                mock.patch.object(update, "record_attempt"), \
-                mock.patch.object(update, "REBOOT_GRACE_S", 0.05), \
-                mock.patch.object(update, "run",
-                                  side_effect=lambda cmd, **k: reboots.append(cmd)), \
-                mock.patch.object(update.time, "sleep",
-                                  side_effect=lambda s: slept.append(s)):
-            with contextlib.redirect_stdout(err):
-                self.assertEqual(update.cmd_apply(url=None, directory=None,
-                                                  reboot=True, force=False), 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(update, "require_root"), \
+                    mock.patch.object(update, "preflight"), \
+                    mock.patch.object(update, "current_slot", return_value="a"), \
+                    mock.patch.object(update, "inactive_slot", return_value="b"), \
+                    mock.patch.object(update, "acquire_artifacts",
+                                      return_value=(files, "v9", {})), \
+                    mock.patch.object(update, "running_version", return_value="v8"), \
+                    mock.patch.object(update, "write_inactive_slot"), \
+                    mock.patch.object(update, "record_attempt"), \
+                    mock.patch.object(update, "ATTEMPT_FILE", Path(tmp) / "attempt.json"), \
+                    mock.patch.object(update, "SLOT_VERSIONS_FILE",
+                                      Path(tmp) / "slot-versions.json"), \
+                    mock.patch.object(update, "cleanup_payload"), \
+                    mock.patch.object(update, "REBOOT_GRACE_S", 0.05), \
+                    mock.patch.object(update, "run",
+                                      side_effect=lambda cmd, **k: reboots.append(cmd)), \
+                    mock.patch.object(update.time, "sleep",
+                                      side_effect=lambda s: slept.append(s)):
+                with contextlib.redirect_stdout(err):
+                    self.assertEqual(update.cmd_apply(url=None, directory=None,
+                                                      reboot=True, force=False), 0)
         finished = [ln for ln in err.getvalue().splitlines() if "100%" in ln]
         self.assertTrue(any("Update finished" in ln for ln in finished), err.getvalue())
         self.assertEqual(slept, [0.05])
@@ -528,16 +548,21 @@ class UpdateSwitchTests(unittest.TestCase):
             self.assertIn("refusing the downgrade", str(ctx.exception))
 
     def test_force_still_writes_the_older_release(self) -> None:
-        with mock.patch.object(update, "require_root"), mock.patch.object(
-            update, "preflight"
-        ), mock.patch.object(update, "current_slot", return_value="a"), mock.patch.object(
-            update, "inactive_slot", return_value="b"
-        ), mock.patch.object(
-            update, "acquire_artifacts", return_value=({}, "2026.01", {})
-        ), mock.patch.object(update, "running_version", return_value="2026.02"), mock.patch.object(
-            update, "write_inactive_slot"
-        ), mock.patch.object(update, "record_attempt"), mock.patch.object(update, "cleanup_payload"):
-            self.assertEqual(self._apply(channel="stable", force=True), 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(update, "require_root"), mock.patch.object(
+                update, "preflight"
+            ), mock.patch.object(update, "current_slot", return_value="a"), mock.patch.object(
+                update, "inactive_slot", return_value="b"
+            ), mock.patch.object(
+                update, "acquire_artifacts", return_value=({}, "2026.01", {})
+            ), mock.patch.object(update, "running_version", return_value="2026.02"), mock.patch.object(
+                update, "write_inactive_slot"
+            ), mock.patch.object(update, "record_attempt"), mock.patch.object(
+                update, "ATTEMPT_FILE", Path(tmp) / "attempt.json"
+            ), mock.patch.object(
+                update, "SLOT_VERSIONS_FILE", Path(tmp) / "slot-versions.json"
+            ), mock.patch.object(update, "cleanup_payload"):
+                self.assertEqual(self._apply(channel="stable", force=True), 0)
 
     def test_url_and_channel_are_a_usage_error(self) -> None:
         with mock.patch.object(update, "require_root"):
@@ -562,6 +587,273 @@ class UpdateSwitchTests(unittest.TestCase):
             ), mock.patch.object(update, "run"), mock.patch.object(update, "require_root"):
                 update.cmd_cancel()
             self.assertFalse(attempt.exists())
+
+
+class UpdateRollbackTests(unittest.TestCase):
+    """M8 P6 (D2/D30): rollback is a boot-pointer flip gated by the registry.
+
+    The verb is N-1 only, and the inactive slot must hold exactly the prior
+    release — a newer re-apply over it means there is nothing to flee to.
+    """
+
+    def _rollback(self, *, force: bool = False) -> int:
+        return update.cmd_rollback(reboot=False, force=force)
+
+    def test_rollback_flips_the_boot_pointer_and_marks_the_fled_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            attempt = root / "update-attempt.json"
+            attempt.write_text("{}", encoding="utf-8")
+            registry = root / "slot-versions.json"
+            registry.write_text(
+                json.dumps(
+                    {
+                        "slots": {
+                            "a": {"version": "2026.03"},
+                            "b": {"version": "2026.02"},
+                        },
+                        "rolled_back_version": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            esp_dir = root / "esp"
+            esp_dir.mkdir()
+            locked: list[list[str]] = []
+            with mock.patch.object(update, "require_root"), mock.patch.object(
+                update, "preflight"
+            ), mock.patch.object(update, "current_slot", return_value="a"), mock.patch.object(
+                update, "inactive_slot", return_value="b"
+            ), mock.patch.object(update, "running_version", return_value="2026.03"), mock.patch.object(
+                update, "SLOT_VERSIONS_FILE", registry
+            ), mock.patch.object(update, "ATTEMPT_FILE", attempt), mock.patch.object(
+                update, "ensure_esp_mounted", return_value=esp_dir
+            ), mock.patch.object(
+                update, "umount_esp"
+            ), mock.patch.object(
+                update, "run", side_effect=lambda cmd, **k: locked.append(cmd)
+            ):
+                self.assertEqual(self._rollback(), 0)
+            self.assertEqual(locked, [[update.AB_HELPER, "lock-in", "b", "--esp", str(esp_dir)]])
+            self.assertFalse(attempt.exists())
+            saved = json.loads(registry.read_text(encoding="utf-8"))
+            self.assertEqual(saved["rolled_back_version"], "2026.03")
+
+    def test_rollback_refuses_when_the_other_slot_has_no_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = Path(tmp) / "slot-versions.json"
+            registry.write_text(
+                json.dumps({"slots": {"a": {"version": "2026.03"}}, "rolled_back_version": None}),
+                encoding="utf-8",
+            )
+            with mock.patch.object(update, "require_root"), mock.patch.object(
+                update, "preflight"
+            ), mock.patch.object(update, "current_slot", return_value="a"), mock.patch.object(
+                update, "inactive_slot", return_value="b"
+            ), mock.patch.object(update, "running_version", return_value="2026.03"), mock.patch.object(
+                update, "SLOT_VERSIONS_FILE", registry
+            ):
+                with self.assertRaises(update.UpdateError) as ctx:
+                    self._rollback()
+            self.assertIn("no version is recorded for slot b", str(ctx.exception))
+
+    def test_rollback_refuses_when_the_other_slot_holds_the_running_version(self) -> None:
+        """A re-apply of the running release over the other slot leaves nothing
+        older to boot: the flip would be a no-op dressed up as a rollback."""
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = Path(tmp) / "slot-versions.json"
+            registry.write_text(
+                json.dumps(
+                    {
+                        "slots": {
+                            "a": {"version": "2026.03"},
+                            "b": {"version": "2026.03"},
+                        },
+                        "rolled_back_version": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(update, "require_root"), mock.patch.object(
+                update, "preflight"
+            ), mock.patch.object(update, "current_slot", return_value="a"), mock.patch.object(
+                update, "inactive_slot", return_value="b"
+            ), mock.patch.object(update, "running_version", return_value="2026.03"), mock.patch.object(
+                update, "SLOT_VERSIONS_FILE", registry
+            ):
+                with self.assertRaises(update.UpdateError) as ctx:
+                    self._rollback()
+            self.assertIn("nothing to roll back to", str(ctx.exception))
+
+    def test_rollback_refuses_below_the_declared_floor(self) -> None:
+        """The running release's manifest declares its rollback floor (D30);
+        a prior below it is a one-way door --force must open deliberately."""
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = Path(tmp) / "slot-versions.json"
+            registry.write_text(
+                json.dumps(
+                    {
+                        "slots": {
+                            "a": {"version": "20260310.01", "min_rollback_version": "20260309.00"},
+                            "b": {"version": "20260101.01"},
+                        },
+                        "rolled_back_version": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            patches = [
+                mock.patch.object(update, "require_root"),
+                mock.patch.object(update, "preflight"),
+                mock.patch.object(update, "current_slot", return_value="a"),
+                mock.patch.object(update, "inactive_slot", return_value="b"),
+                mock.patch.object(update, "running_version", return_value="20260310.01"),
+                mock.patch.object(update, "SLOT_VERSIONS_FILE", registry),
+            ]
+            with contextlib.ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                with self.assertRaises(update.UpdateError) as ctx:
+                    self._rollback()
+            self.assertIn("below the floor 20260309.00", str(ctx.exception))
+            self.assertIn("20260101.01", str(ctx.exception))
+            # --force is the operator's escape hatch, as the message says.
+            with contextlib.ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                stack.enter_context(
+                    mock.patch.object(update, "ensure_esp_mounted", return_value=Path(tmp) / "esp")
+                )
+                stack.enter_context(mock.patch.object(update, "umount_esp"))
+                stack.enter_context(mock.patch.object(update, "run"))
+                stack.enter_context(
+                    mock.patch.object(update, "ATTEMPT_FILE", Path(tmp) / "attempt.json")
+                )
+                self.assertEqual(self._rollback(force=True), 0)
+            saved = json.loads(registry.read_text(encoding="utf-8"))
+            self.assertEqual(saved["rolled_back_version"], "20260310.01")
+
+    def test_rollback_falls_back_to_the_computed_floor_for_a_legacy_manifest(self) -> None:
+        """A slot record without min_rollback_version (pre-D30 apply) uses the
+        30-day horizon computed from the running version's date stamp."""
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = Path(tmp) / "slot-versions.json"
+            registry.write_text(
+                json.dumps(
+                    {
+                        "slots": {
+                            "a": {"version": "20260310.01"},
+                            "b": {"version": "20260101.01"},
+                        },
+                        "rolled_back_version": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(update, "require_root"), mock.patch.object(
+                update, "preflight"
+            ), mock.patch.object(update, "current_slot", return_value="a"), mock.patch.object(
+                update, "inactive_slot", return_value="b"
+            ), mock.patch.object(update, "running_version", return_value="20260310.01"), mock.patch.object(
+                update, "SLOT_VERSIONS_FILE", registry
+            ):
+                with self.assertRaises(update.UpdateError) as ctx:
+                    self._rollback()
+            self.assertIn("below the floor 20260208.00", str(ctx.exception))
+
+    def test_record_slot_version_writes_the_floor_and_self_heals(self) -> None:
+        """Every apply records both slots — the target with its declared floor,
+        the running one self-healed — so boxes installed before the registry
+        converge after one update."""
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = Path(tmp) / "slot-versions.json"
+            with mock.patch.object(update, "SLOT_VERSIONS_FILE", registry):
+                update.record_slot_version("b", "2026.03", min_rollback_version="20260211.00")
+                update.record_slot_version("a", "2026.02")
+                update.clear_rolled_back()  # a no-op when the marker is unset
+            saved = json.loads(registry.read_text(encoding="utf-8"))
+            self.assertEqual(saved["slots"]["b"]["version"], "2026.03")
+            self.assertEqual(saved["slots"]["b"]["min_rollback_version"], "20260211.00")
+            self.assertEqual(saved["slots"]["a"]["version"], "2026.02")
+            self.assertNotIn("min_rollback_version", saved["slots"]["a"])
+            self.assertIn("written_at", saved["slots"]["b"])
+            self.assertIsNone(saved["rolled_back_version"])
+
+    def test_set_then_clear_rolled_back_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = Path(tmp) / "slot-versions.json"
+            with mock.patch.object(update, "SLOT_VERSIONS_FILE", registry):
+                update.set_rolled_back("2026.02")
+                saved = json.loads(registry.read_text(encoding="utf-8"))
+                self.assertEqual(saved["rolled_back_version"], "2026.02")
+                update.clear_rolled_back()
+                saved = json.loads(registry.read_text(encoding="utf-8"))
+                self.assertIsNone(saved["rolled_back_version"])
+
+    def test_check_suppresses_offers_at_or_below_the_rolled_back_version(self) -> None:
+        """After fleeing to 2026.02, the channel offering 2026.03 (already
+        fled from) is *not* an update; only a strictly newer release is."""
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = Path(tmp) / "slot-versions.json"
+            registry.write_text(
+                json.dumps({"slots": {}, "rolled_back_version": "2026.02"}),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                update, "resolve_release_base", return_value=None
+            ), mock.patch.object(update, "running_version", return_value="2026.02"), mock.patch.object(
+                update, "SLOT_VERSIONS_FILE", registry
+            ):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    update.cmd_check(None, "stable", record=False)
+            self.assertIn("rolled_back=2026.02", out.getvalue())
+            self.assertIn("update_available=false", out.getvalue())
+
+
+class UpdateStatusVersionTests(unittest.TestCase):
+    """M8 P6: with the registry, `status` answers "what am I running and what
+    would rollback boot?" — both slots, the running one marked."""
+
+    def test_status_reports_both_slot_versions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = Path(tmp) / "slot-versions.json"
+            registry.write_text(
+                json.dumps(
+                    {
+                        "slots": {
+                            "a": {"version": "2026.03"},
+                            "b": {"version": "2026.02"},
+                        },
+                        "rolled_back_version": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            out = io.StringIO()
+            with mock.patch.object(update, "current_slot", return_value="a"), mock.patch.object(
+                update, "ab_status", return_value={}
+            ), mock.patch.object(update, "SLOT_VERSIONS_FILE", registry):
+                with contextlib.redirect_stdout(out):
+                    update.cmd_status()
+            self.assertIn("slot_a_version=2026.03 (running)", out.getvalue())
+            self.assertIn("slot_b_version=2026.02", out.getvalue())
+
+    def test_a_slot_without_a_record_reads_as_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = Path(tmp) / "slot-versions.json"
+            registry.write_text(
+                json.dumps({"slots": {}, "rolled_back_version": None}),
+                encoding="utf-8",
+            )
+            out = io.StringIO()
+            with mock.patch.object(update, "current_slot", return_value="a"), mock.patch.object(
+                update, "ab_status", return_value={}
+            ), mock.patch.object(update, "SLOT_VERSIONS_FILE", registry):
+                with contextlib.redirect_stdout(out):
+                    update.cmd_status()
+            self.assertIn("slot_a_version=unknown (running)", out.getvalue())
+            self.assertIn("slot_b_version=unknown", out.getvalue())
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -663,6 +955,31 @@ class DiscoveryTests(unittest.TestCase):
                 artifacts.resolve_release_base("stable")
         self.assertIn("60/hour", str(ctx.exception))
         self.assertIn("42", str(ctx.exception))
+
+    def test_a_http_failure_names_the_url_and_status(self) -> None:
+        _holder, patch = self._serve(b"[]", status=404)
+        with patch:
+            with self.assertRaises(artifacts.ArtifactError) as ctx:
+                artifacts.resolve_release_base("stable")
+        self.assertIn("returned HTTP/404", str(ctx.exception))
+
+    def test_a_dns_failure_names_the_host(self) -> None:
+        def fake_urlopen(url, timeout=60):
+            raise urllib.error.URLError("[Errno -2] Name or service not known")
+
+        with mock.patch.object(artifacts, "_urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(artifacts.ArtifactError) as ctx:
+                artifacts.resolve_release_base("stable")
+        self.assertIn("DNS lookup failed for api.github.com", str(ctx.exception))
+
+    def test_a_timeout_names_the_host(self) -> None:
+        def fake_urlopen(url, timeout=60):
+            raise TimeoutError("The read operation timed out")
+
+        with mock.patch.object(artifacts, "_urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(artifacts.ArtifactError) as ctx:
+                artifacts.resolve_release_base("stable")
+        self.assertIn("Connection timeout contacting api.github.com", str(ctx.exception))
 
     def test_a_release_without_a_manifest_asset_is_skipped_legibly(self) -> None:
         broken = [

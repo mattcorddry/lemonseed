@@ -382,7 +382,7 @@ Bare metal rides BM-1.
 
 ---
 
-## P6 — N-1 rollback
+## P6 — N-1 rollback (as built)
 
 ### Problem
 
@@ -391,29 +391,55 @@ rollback primitives (`lemonseed-ab set-once`/`lock-in`) exist but are untested f
 purpose. M7 P5's arm-time `update-attempt.json` records the slot we just wrote, never
 the one we boot.
 
-### Proposal
+### Design (D2/D30, as approved)
 
-- **Per-slot version tagging at write time.** Every slot write records
-  `{version, slot, written_at}` durably beside the arm-time record, and the ESP boot
-  entries are labelled so the GRUB screen names the version on each slot (D2).
-- **N-1 rollback via GRUB and CLI (D2).** A `lemonseed-update rollback` subcommand that
-  boots the *previous* slot through the tested primitives, plus one GRUB menu entry per
-  slot so physical access is enough. **No safety checks and no rollback UI** in this
-  milestone: the M7-auth-boundary hazard (a pre-M7 slot cannot sign anyone in) is real
-  but out of scope, so the CLI-side schema-boundary guard is **backlogged**
-  (`BACKLOG.md`, rollback schema-boundary guard) — and no equivalent check is possible
-  from GRUB anyway, which is precisely why the boot-menu path is the escape hatch.
+- **Slot-version registry.** `/var/lib/lemonseed/slot-versions.json`, written by every
+  apply (target slot with the release's declared rollback floor; running slot
+  self-healed), by the installer for slot a, read by the rollback verb and the control
+  plane's panel: `{"slots": {a: {version, written_at, min_rollback_version?}, …},
+  "rolled_back_version"}`. Bookkeeping, never a boot risk — unreadable reads as empty.
+- **`lemonseed-update rollback [--reboot] [--force]`.** A boot-pointer flip through the
+  tested `lemonseed-ab lock-in <inactive>` primitive — no download, no slot writes.
+  Eligibility (both the CP panel's cheap gate and the root-side verb): knowable slot;
+  nothing pending; the inactive slot holds exactly the prior release (a newer re-apply
+  over it means nothing to flee to); and the prior sits at or above the running
+  release's declared floor. Deliberately N-1: older releases return via an explicit
+  `apply --force` at an older set.
+- **`MIN_ROLLBACK_VERSION` (D30).** The floor rides inside the signed manifest
+  (`rollback.min_rollback_version`, written by `release_payload.py pack` and by
+  `package.sh` for the flat appliance set; `MIN_ROLLBACK_VERSION=<v>` through
+  `release.sh` pins it for a one-way-door release). Default at pack time: the release's
+  own date minus the 30-day horizon (`lemonseed_artifacts.ROLLBACK_HORIZON_DAYS`);
+  legacy manifests without the field fall back to the same computed floor at rollback
+  time. The horizon refusal is hard — `--force` is the CLI's explicit override.
+- **GRUB labels.** `boot/grub.cfg` titles are "Boot Lemonseed version {version} (slot
+  {slot})", expanded from grubenv vars (`slot_a_version`/`slot_b_version`) written at
+  every apply; the installer seeds slot a's. In-config "unknown" fallbacks keep the
+  menu legible on boxes installed before the registry existed.
+- **Re-offer suppression.** `rolled_back_version` marks the version the operator fled
+  to; `check` and the panel offer nothing at or below it until a strictly newer release
+  is published. An explicit `apply --force` overrides it, and any successful apply
+  clears the marker.
+- **Web UI (scope added at review).** SYSTEM panel gains a "Prior version" row and a
+  "Roll back to prior version" button, shown only when the registry says eligible and
+  no failed-update banner is up; POST `/_lemonseed/api/update/rollback` runs the job
+  (kind `rollback`, updater `rollback --reboot`), audited as `update.rollback` —
+  panel actions audit; CLI actions log to journald only.
 - **Caveat stated, not hidden:** a rollback undoes the *root*, never the data —
   anything a newer CP wrote to shared user-data (and an operator-triggered OWUI
   `config` TRUNCATE) is not undone by reverting the slot.
 
 ### Tests
 
-- Every apply writes the slot version record; the GRUB entries name both slots.
-- QEMU rollback round-trip: A → update (B) → roll back (A) → appliance healthy on the
-  old version, banner/report legible, data plane intact.
-- Rollback is exercised as part of **BM-1's per-release checklist** (P4), not just
-  once.
+- Every apply writes the slot version record (target + self-healed running slot); the
+  GRUB entries name both slots.
+- Unit: updater eligibility matrix, registry writes, suppression; CP eligibility
+  matrix, snapshot prior/suppression, HTTP 202/409 + audit.
+- Loopback smoke (`update-smoke-test.sh`): apply → cancel → **rollback** (boot_default
+  flips to the prior slot, registry honest, grubenv labels render) → re-apply with
+  `--force` (marker cleared).
+- QEMU: signing + update smokes green (the rollback verb rides the same lock-in
+  primitive those smokes exercise).
 
 ### Gate
 
@@ -562,6 +588,7 @@ mid-build:
 | **D27** | **Hardware password lifecycle:** generated at install with the existing **N-words-with-dashes** scheme; presented during the new-install LUKS-format step with copy explaining the TPM replacement/erasure case; stored in the CP DB and viewable in Settings → Advanced; the installer **prompts for it** on preserve-reinstall when the TPM cannot decrypt; **no rotation** in this milestone; and if the TPM seal is gone and the password is lost, the only recovery is **USB reinstall with data loss**. |
 | **D28** | **Release-channel decisions (M8 P3):** the channel is *only* the GitHub prerelease flag — the signed manifest describes the payload, never the audience, so a beta → stable flip is a metadata edit and the re-sign/rebuild machinery originally proposed was dropped as too heavyweight for the narrow concern (residual risk accepted: repo write access can re-badge, but it could publish anything anyway). Switching channels **never downgrades**; the version comparison is the only update decision. The setting lives in the CP settings table (`cp_meta`) behind a minimal `get_setting`/`set_setting` wrapper, materialized to `/var/lib/lemonseed/channel` for the DB-free root jobs; the installer seeds the file (preserve) or the ESP command line (fresh), and the CP adopts the seed. Stable with only prereleases published is *up to date*, not an error. |
 | **D29** | **Signing cutover (M8, post-P4 review):** the signature scheme is **ECDSA NIST P-256, SHA-256 over the exact manifest bytes, DER-encoded** — recorded as `detached-ecdsa-p256` and enforced by the verifier; the `detached-ed25519` generation was fully superseded in one cut (no install base, single trust-set generation — set `version` 2, key file `lemonseed-release.pub` with its public fingerprint in the JSON). Production signing is **hardware-backed via `SIGN_MODE=pkcs11`**: the key never exists as a file, and every signature requires the token's own authorization (PIN and/or physical presence — not bypassable). Where the signing environment is a separate host from the build machine, **`SIGN_MODE=offline`** finalizes the signing block without a signature; the detached signature is produced out of band and the completed set must pass `make release-verify` before publishing. `SIGN_MODE=file` with `keys/test` (via `make keys`) keeps milestone iteration independent of the production key; the verifier notes randomized ECDSA (no deterministic-nonce assumption, no `s` normalization). Key custody and the signing environment remain private; only the scheme and the generic openssl primitives are public. |
+| **D30** | **Rollback floor (M8 P6, review):** the 30-day horizon became **`MIN_ROLLBACK_VERSION`** declared by the *release itself* (`rollback.min_rollback_version` in the signed manifest — written by `release_payload.py pack` and `package.sh`; a one-way-door release pins it via `MIN_ROLLBACK_VERSION=<v>` through `release.sh`). Default at pack time: the release's date minus the horizon; legacy manifests fall back to the same computed floor at rollback time. The refusal is hard; `--force` is the CLI override. This also amends **D2**: the safety checks (registry-gated eligibility) and the **web rollback UI** shipped in P6 rather than being deferred — the schema-boundary guard alone stays backlogged (D21). |
 
 ## Open questions
 

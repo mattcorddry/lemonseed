@@ -59,6 +59,11 @@ All entries should be tagged with [BL] for Backlog (no milestone assigned) or [M
 - **OTP-disclosure copy (D-13):** the People panel promises forced rotation but does not say that the admin who generated a one-time code could sign in as that user until rotation — an accepted cost that the UI has not yet said. **[BL]**
 - **Guarded paths answer 403 before the auth gate (T4-A):** nginx `if` + `return` runs in the rewrite phase, before `auth_request`, so an expired admin session on a guarded path sees "managed by Lemonseed" instead of a sign-in prompt; the anonymous-caller fallback is the open item (§3.5 invariant 2). **[BL]**
 - **About Lemonseed:** create a page separate from admin settings that is open to all users and shows more info about lemonseed. Not just system status (version, uptime, load graph, etc) but also has a short blurb about what Lemonseed is with a link to https://lemonseed.ai. It should also have an "Open Source Software" section that has logos, 1-sentence descriptions, and links for the major open source technology underneath Lemonseed. It must include Lemonade-Server, llama-server, open-webui, and probably postgres and valkey. Modules' metadata should include open source package descriptions, so we can have an "Open Source Modules" sub-section that can enumerate all installed modules' open source provenance. **[M9]**
+- **Fresh and consistent web UI:** The current lemonseed web UI is a very boring and typical LLM-generated CSS. We should work on
+  a new UI that embodies our mission and integrates with the OWUI interface (potentially even changing OWUI the CSS in the process).
+  We should also develop a simple website at https://lemonseed.ai/ that shares the look and feel of the appliance and provides an overview
+  of what we've built, as well as simple documentation and getting started pathway. Since I'm not a UI expert, we might consider
+  the new [Hallmark](https://github.com/Nutlope/hallmark) skill if we can leverage it from our Zed environment. **[M10]**
 
 ## Backlog: Modules & infrastructure
 - **Module catalog specs:** define a Lemonseed **module configuration file** (one file per module in a catalog directory in-tree): execution params (docker-compose fragment / pinned image), UX (logo, name, description, help), and dependencies (Postgres, Valkey, future object store). Catalog entries are what users see and what the CP downloads/sets up. The catalog needs its own **test/release cycle**, and should be hostable on lemonseed.ai/github so new offerings and versions can arrive without a full appliance upgrade. See [MODULES-FRAMEWORK.md](proposals/MODULES-FRAMEWORK.md) for more details. **[M9]**
@@ -83,7 +88,9 @@ All entries should be tagged with [BL] for Backlog (no milestone assigned) or [M
 - **Cloud service / DynDNS:** remote access + Let's Encrypt; see [`proposals/CLOUD-SERVICE.md`](./proposals/CLOUD-SERVICE.md). **[BL]**
 - **Installer stream-to-disk:** partition first, stream SquashFS to `root-a`, avoid multi-GB RAM staging on the live ISO. **[BL]**
 - **Rollback schema-boundary guard (CLI):** refuse `lemonseed-update rollback` when the target slot's schema floor is below the live CP database version — a rollback across the M7 auth boundary cannot sign anyone in. Deliberately backlogged: M8 ships rollback without it, and no equivalent check is possible from GRUB. **[BL]**
+- **ESP grub.cfg template lag:** the updater refreshes the ESP `grub.cfg` from the **running** system's template (`/usr/share/lemonseed/grub.cfg`), so a template change shipped in release N only reaches the ESP with the apply to N+1 — boot-menu labels lag one release. Fix would be shipping `grub.cfg` inside the release payload (as a payload entry or direct asset) so the apply copies the *incoming* template; touched only when the template changes, so the lag is accepted for now. Immediate refresh on a box: copy `/usr/share/lemonseed/grub.cfg` over the ESP's `grub/grub.cfg`. **[BL]**
 - **Registry reachability preflight (hardening):** the preflight exists; keep improving the surfaced message and the retry/backoff behavior so a dead WAN link never looks like a broken appliance. **[M8]**
+- **Hermes Agents:** Add a module for hermes agents. We will need to either: (a) run a Docker container for each user on our system, or (b) use [Hermes Multiplexing](https://hermes-agent.nousresearch.com/docs/user-guide/multi-profile-gateways#alternative-one-gateway-for-all-profiles-multiplexing).  In the (a) case, we should do lazy activation; only launch a Hermes agent when a user activates it via the web UI module page. Once it has been activated once for the user, it should stay running (even after reboots) until the user deactivates it, since Hermes is designed for background / always-on work. Hermes should be preconfigured for our LLM as well as our MCP, and we should think about what storage systems it can access. **[M10]**
 
 ## Backlog: Other
 - **Validate the AMD dGPU path on real hardware:** the Vulkan backend, `select_backend` dispatch
@@ -100,3 +107,9 @@ All entries should be tagged with [BL] for Backlog (no milestone assigned) or [M
 - **ARM builds:** Support for the ARM CPU and NEON GPU platform. **[BL]**
 - **Secure Boot:** Load kernel certificates into the TPM root of trust, enable secure boot where hardware support exists for it. **[BL]**
 - **Offline installs:** Support for the full startup payload (LLM model, container images, etc) on the USB stick, enabling offline installation without an internet connection. Useful for larger volume installs. **[BL]**
+- **VGA console boot experience:** (Low priority) Improve the UI for users who have a KVM attached to the appliance: enable an EFI boot
+  splash screen with our logo and color scheme, overlaying status messages into a "status box" in the lower half of the page. This should
+  include boot progress during bootup, hostname & IP in normal operations, and setup progress during USB setup. **[BL]**
+- **Hardware diagnostics boot option:** Provide some kind of hardware diagnostic boot target at the GRUB menu; this could be as simple
+  as memtest86+, or it could be something that boots into a real Linux kernel and runs more expansive hardware tests. Useful for users
+  who are experiencing hardware instability problems. GPU health tests would be amazing if possible. **[BL]**

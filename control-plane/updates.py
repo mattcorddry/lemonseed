@@ -31,6 +31,7 @@ import settings
 UPDATER = "lemonseed-update"  # packaged in nixos/packages/lemonseed-update.nix
 ATTEMPT_FILE = Path("/var/lib/lemonseed/update-attempt.json")
 LATEST_FILE = Path("/var/lib/lemonseed/latest-update.json")
+SLOT_VERSIONS_FILE = Path("/var/lib/lemonseed/slot-versions.json")
 CMDLINE = Path("/proc/cmdline")
 
 # The interlock refuses while one of these runs; each names itself.
@@ -109,6 +110,37 @@ def clear_attempt() -> None:
     ATTEMPT_FILE.unlink(missing_ok=True)
 
 
+def rollback_eligibility(running: str) -> tuple[bool, str]:
+    """(eligible, reason) for the panel's rollback affordance (M8 P6, D30).
+
+    The slot-version registry is the authority: the other slot must hold a
+    recorded version that differs from the running one and sits at or above
+    the running release's declared rollback floor. The updater's own verb
+    re-checks everything root-side — this is the panel's cheap gate so an
+    ineligible button is hidden, not pressed.
+    """
+    registry = _read_json(SLOT_VERSIONS_FILE) or {}
+    slots = registry.get("slots") if isinstance(registry.get("slots"), dict) else {}
+    booted = booted_slot()
+    other = "b" if booted == "a" else ("a" if booted == "b" else "")
+    if not other:
+        return False, "the active slot could not be determined"
+    entry = slots.get(other)
+    prior = str((entry or {}).get("version") or "") if isinstance(entry, dict) else ""
+    if not prior:
+        return False, "the other slot has no version recorded — nothing to roll back to"
+    if prior == running:
+        return False, "the prior version is the one already running"
+    floor_entry = slots.get(booted or "") or {}
+    floor = str((floor_entry or {}).get("min_rollback_version") or "")
+    if floor and prior < floor:
+        return False, (
+            f"the prior version {prior} is below the rollback floor {floor} "
+            f"declared by {running}"
+        )
+    return True, ""
+
+
 def snapshot(running: str) -> dict[str, Any]:
     """Everything the SYSTEM panel's Version section renders, in one read."""
     with _job_lock:
@@ -117,11 +149,34 @@ def snapshot(running: str) -> dict[str, Any]:
     latest = str(latest_record.get("latest") or "")
     # Versions are date stamps, so a stale record (written before the last
     # update landed) compares below the running version and must not offer a
-    # downgrade — only a strictly newer channel version is "available".
+    # downgrade — only a strictly newer channel version is "available". A
+    # rollback marker suppresses offers at or below the version the operator
+    # fled to (M8 P6, D30), until a strictly newer one is published.
+    registry = _read_json(SLOT_VERSIONS_FILE) or {}
+    slots = registry.get("slots") if isinstance(registry.get("slots"), dict) else {}
+    booted = booted_slot()
+    other = "b" if booted == "a" else ("a" if booted == "b" else "")
+    prior = str((slots.get(other) or {}).get("version") or "")
+    rolled_back = str(registry.get("rolled_back_version") or "")
+    eligible, reason = rollback_eligibility(running)
+    available = (
+        bool(latest)
+        and latest != running
+        and latest > running
+        and not (rolled_back and latest <= rolled_back)
+    )
     return {
         "running": running,
         "latest": latest,
-        "available": bool(latest) and latest != running and latest > running,
+        "available": available,
+        "prior": prior,
+        "rolled_back": rolled_back,
+        "rollback_eligible": eligible,
+        "rollback_reason": reason,
+        # The other slot is not always older: after a rollback it holds the
+        # newer release, and the affordance is a roll *forward*. The label
+        # follows the direction; the operation is the same boot-pointer flip.
+        "rollback_kind": ("forward" if prior > running else "back") if prior else "back",
         "checked_at": str(latest_record.get("checked_at") or ""),
         "job": job,
         "failed": failed_update(running),
@@ -139,7 +194,7 @@ def in_flight() -> Optional[str]:
     with _job_lock:
         kind = str(_job.get("kind") or "")
         state = str(_job.get("state") or "idle")
-    if kind == "install" and state in ("running", "downloading", "writing", "rebooting"):
+    if kind in ("install", "rollback") and state in ("running", "downloading", "writing", "rebooting"):
         return _JOB_BUSY
     return None
 
@@ -178,6 +233,21 @@ def start_install(*, retry: bool = False) -> Optional[str]:
         command.extend(["--channel", channel])
     commands.append(command)
     return _start("install", commands)
+
+
+def start_rollback(running: str) -> Optional[str]:
+    """Boot the prior slot and reboot (M8 P6, D30). ``None`` when started.
+
+    The verb is a boot-pointer flip through the same tested primitives apply
+    uses, so the job shape is identical — including the reboot tail the panel
+    watches. The eligibility gate mirrors the updater's own (the registry is
+    the authority on both sides); the updater refuses again root-side, and a
+    refusal lands in the job status, not in a silently broken slot.
+    """
+    eligible, reason = rollback_eligibility(running)
+    if not eligible:
+        return reason
+    return _start("rollback", [[UPDATER, "rollback", "--reboot"]])
 
 
 def _start(kind: str, commands: list[list[str]]) -> Optional[str]:

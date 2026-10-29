@@ -25,9 +25,18 @@
   isoImage.edition = lib.mkForce "installer";
   isoImage.makeEfiBootable = true;
   isoImage.makeUsbBootable = true;
-  # No “press Enter” splash — boot the installer immediately.
-  isoImage.appendToMenuLabel = "";
-  boot.loader.timeout = lib.mkForce 0;
+  # Plain 80x25 text boot menu: no NixOS splash art, no gfxterm, no odd VGA
+  # modes. The menu stays reachable (any key within the timeout) because the
+  # web installer's source overrides are kernel command-line parameters
+  # (lemonseed.image=, lemonseed.artifacts=) a developer edits via GRUB's 'e'
+  # (RELEASE.md §4). The entry reads "Install Lemonseed AI".
+  isoImage.forceTextMode = true;
+  isoImage.grubTheme = lib.mkForce null;
+  isoImage.prependToMenuLabel = "Install ";
+  isoImage.appendToMenuLabel = lib.mkForce "";
+  system.nixos.distroName = "Lemonseed AI";
+  system.nixos.label = lib.mkForce "";
+  boot.loader.timeout = lib.mkForce 3;
 
   # Installer is a mutable live system (not the read-only appliance).
   users.mutableUsers = false;

@@ -3604,7 +3604,9 @@ UPDATE_JS = r"""
   const failedBox = document.getElementById('update-failed');
   const checkButton = document.getElementById('update-check');
   const install = document.getElementById('update-install');
-  if (!note || !failedBox || !checkButton || !install) return;
+  const priorRow = document.getElementById('version-prior-row');
+  const rollback = document.getElementById('update-rollback');
+  if (!note || !failedBox || !checkButton || !install || !priorRow || !rollback) return;
 
   // The one status line under the buttons. It was named after the power
   // panel's powerNote and the rename never landed here — hence the silent
@@ -3641,6 +3643,20 @@ UPDATE_JS = r"""
     const working = busy(s);
     install.disabled = !s.available || working;
     checkButton.disabled = working;
+    priorRow.hidden = !s.prior;
+    if (s.prior) document.getElementById('version-prior').textContent = s.prior;
+    // The other slot is not always older: after a rollback it holds the newer
+    // release, so the affordance reads Roll forward and the row is the newer
+    // version, not the prior one.
+    const forward = s.rollback_kind === 'forward';
+    document.getElementById('version-prior-name').textContent =
+      forward ? 'Newer version' : 'Prior version';
+    rollback.textContent = forward ? 'Roll forward' : 'Roll back';
+    // Hidden while a failed-update banner is up: the failed attempt is what
+    // the other slot holds, and rolling back onto it makes no sense until the
+    // banner is dismissed (Retry or Cancel).
+    rollback.hidden = !s.rollback_eligible || !!s.failed;
+    rollback.disabled = working;
     if (working) {
       noteIt(job.detail || 'Working…');
       if (!poll) poll = setInterval(refresh, 2000);
@@ -3705,7 +3721,8 @@ UPDATE_JS = r"""
   // Retry/Cancel (bare-metal review, BM-4) because at that point the job is
   // over — Hide made sense while something was still running, and the
   // server-side retry path cancels the leftover attempt record first.
-  function openProgressDialog(onRetry) {
+  function openProgressDialog(onRetry, headline) {
+    const heading = headline || 'Updating the appliance';
     const line = document.createElement('p');
     line.className = 'dialog-copy';
     line.textContent = 'Starting the update…';
@@ -3716,7 +3733,7 @@ UPDATE_JS = r"""
     bar.appendChild(fill);
     let close = null;
     dialog({
-      title: 'Updating the appliance',
+      title: heading,
       body: (function () {
         const wrap = document.createElement('div');
         wrap.appendChild(line);
@@ -3816,6 +3833,26 @@ UPDATE_JS = r"""
                                    {confirmLabel: 'Install'});
     if (!go) return;
     runUpdate(false);
+  });
+
+  rollback.addEventListener('click', async () => {
+    if (!known || !known.rollback_eligible) return;
+    const forward = known.rollback_kind === 'forward';
+    const verb = forward ? 'Roll forward' : 'Roll back';
+    const copy = 'The appliance will boot release ' + known.prior
+      + ' and reboot automatically. Chats, models and settings are preserved; '
+      + 'the release you are leaving stays published, but update checks will '
+      + 'not offer it again until a newer one appears.';
+    const go = await dialogConfirm(verb + ' to ' + known.prior + '?', copy,
+                                   {confirmLabel: verb});
+    if (!go) return;
+    const ui = openProgressDialog(function () {},
+      forward ? 'Rolling the appliance forward…' : 'Rolling back the appliance…');
+    if (await post('/_lemonseed/api/update/rollback')) {
+      watchInstall(ui);
+    } else {
+      ui.fail(note.textContent || 'The appliance refused to start the rollback.');
+    }
   });
 
   // One attempt: open the progress box, start the job, watch it. A failed job
@@ -3958,11 +3995,13 @@ lights and no network, until someone presses the power button on the box.</p>
 <section class="panel" id="software-update">
 <h2>Software update</h2>
 <div class="row"><span class="name">Current Version</span><span class="state" id="version-running">{running_version}</span></div>
+<div class="row" id="version-prior-row" hidden><span class="name" id="version-prior-name">Prior version</span><span class="state" id="version-prior">—</span></div>
 <div class="row"><span class="name">Latest available</span><span class="state" id="version-latest">checking…</span></div>
 <p class="owui-status bad" id="update-failed" hidden></p>
 <div class="owui-actions">
 <button type="button" id="update-check">Check now</button>
 <button type="button" id="update-install" disabled>Download and install</button>
+<button type="button" id="update-rollback" hidden>Roll back</button>
 </div>
 <p class="owui-status" id="update-note" hidden></p>
 </section>
@@ -5082,6 +5121,21 @@ class Handler(BaseHTTPRequestHandler):
         audit.record(self._actor() or audit.ACTOR_CP, "appliance", action)
         self._json(202, {"state": "running", "kind": "install"})
 
+    def _handle_update_rollback_post(self) -> None:
+        """POST /_lemonseed/api/update/rollback — boot the prior slot (M8 P6).
+
+        The updater's verb does the eligibility checks root-side (the registry
+        is the authority) and the job surfaces any refusal verbatim; auditing
+        here keeps the panel's actions on the same footing as install.
+        """
+        running = appliance_version()
+        reason = updates.start_rollback(running)
+        if reason:
+            self._json(409, {"detail": reason, "reason": "ineligible or in flight"})
+            return
+        audit.record(self._actor() or audit.ACTOR_CP, "appliance", "update.rollback")
+        self._json(202, {"state": "running", "kind": "rollback"})
+
     # ------------------------------------------------------------------
     # QEMU e2e GC helpers (test-only; admin-gated like the model choice).
     # The disk-space guard is exercised end-to-end by scripts/qemu-api-smoke-test.sh
@@ -5537,6 +5591,11 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_admin():
                 return
             self._handle_update_post(raw)
+            return
+        if path == "/_lemonseed/api/update/rollback":
+            if not self._require_admin():
+                return
+            self._handle_update_rollback_post()
             return
         if path != "/setup":
             self._json(404, {"error": "not found"})

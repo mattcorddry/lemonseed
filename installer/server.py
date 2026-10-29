@@ -19,7 +19,13 @@ from typing import Any
 from urllib.parse import urlparse
 
 from disks import list_candidate_disks, pick_default
-from install import InstallError, attach_admin_rosters, image_base_url, run_install
+from install import (
+    InstallError,
+    ReleaseSourceError,
+    attach_admin_rosters,
+    image_base_url,
+    run_install,
+)
 from preflight import MIN_DISK_BYTES, evaluate_host
 
 HOST = os.environ.get("LEMONSEED_INSTALLER_HOST", "0.0.0.0")
@@ -37,6 +43,7 @@ _state: dict[str, Any] = {
     "progress": 0,
     "message": "Waiting to start",
     "error": None,
+    "detail": None,
     "disk": None,
     "can_reboot": False,
     "version": None,
@@ -67,11 +74,17 @@ def install_worker(
             channel=channel,
         )
     except InstallError as exc:
+        # ReleaseSourceError means nothing touched the disk: the product
+        # sentence goes to the UI, the technical reason to the debug detail,
+        # and retry/reboot are both safe. Every other failure may have
+        # half-written the target, so the buttons stay off.
+        source = isinstance(exc, ReleaseSourceError)
         _set(
             phase="error",
             error=str(exc),
+            detail=getattr(exc, "detail", None) or "",
             message="Install failed",
-            can_reboot=False,
+            can_reboot=source,
         )
         print(f"install error: {exc}", flush=True)
     except Exception as exc:  # noqa: BLE001 — surface to UI
@@ -102,6 +115,7 @@ def start_install(
                 "progress": 1,
                 "message": "Starting install",
                 "error": None,
+                "detail": None,
                 "disk": {"path": disk_path},
                 "preserve_user_data": preserve_user_data,
                 "reset_admin_credentials": reset_admin_credentials,
@@ -241,6 +255,14 @@ INDEX_HTML = """<!DOCTYPE html>
         <div class="spinner" role="status" aria-label="Waiting for appliance"></div>
       </div>
       <p id="err" class="err hidden"></p>
+      <div id="err-actions" class="hidden">
+        <details id="err-detail">
+          <summary>Technical details</summary>
+          <p id="err-detail-body"></p>
+        </details>
+        <button id="retry" class="cta">Try again</button>
+        <button id="err-reboot" class="cta">Reboot</button>
+      </div>
     </section>
   </main>
   <script src="/static/app.js"></script>

@@ -13,7 +13,8 @@ __pycache__/
 /keys/*.key
 /keys/*.pem
 /keys/*.priv
-/keys/test.pub
+/keys/*.priv
+!/keys/test.pub
 !/keys/.gitkeep
 # Editor / OS
 *.swp

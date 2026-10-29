@@ -22,11 +22,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import sys
 import tarfile
 from pathlib import Path
 from typing import Any
+
+import lemonseed_artifacts as artifacts
 
 # GitHub release limits (BACKLOG.md, GitHub-releases entry): each asset under
 # 2 GiB, at most 1000 assets per release. Defaults here; tests may shrink them.
@@ -123,9 +126,9 @@ def cmd_pack(args: argparse.Namespace) -> int:
     if not manifest_path.is_file():
         raise ReleaseError(f"no manifest to pack: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    artifacts = manifest.get("artifacts") or {}
+    entries = manifest.get("artifacts") or {}
     for key in PAYLOAD_KEYS:
-        if key not in artifacts:
+        if key not in entries:
             raise ReleaseError(f"manifest is missing the {key!r} artifact")
     if "payload" in manifest:
         raise ReleaseError("manifest already carries a payload block — pack is not idempotent")
@@ -191,6 +194,16 @@ def cmd_pack(args: argparse.Namespace) -> int:
             "length": length,
             "sha256": sha256_file(out_dir / installer.name),
         }
+
+    # The rollback floor rides inside the signed bytes (M8 P6, D30): the
+    # earliest version a rollback may target, defaulting to the release's own
+    # date minus the horizon. A one-way-door change pins it explicitly via
+    # MIN_ROLLBACK_VERSION (release.sh), disabling rollbacks past that line.
+    floor = os.environ.get("MIN_ROLLBACK_VERSION") or artifacts.rollback_floor(
+        str(manifest.get("version") or "")
+    )
+    if floor:
+        manifest["rollback"] = {"min_rollback_version": floor}
 
     manifest_path = out_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

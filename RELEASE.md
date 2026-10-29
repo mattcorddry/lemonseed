@@ -244,9 +244,13 @@ and a box on the stable channel tests the promoted release and keeps it.
    as failed after a manual rollback — that is the failed-update detector doing
    its job; `lemonseed-update cancel` clears it.
 
-   (The USB installer ISO can be pointed at the same set instead, via the
-   `lemonseed.image=` kernel command-line override or the
-   `LEMONSEED_IMAGE_BASE_URL` environment variable.)
+   (The USB installer ISO does not carry the appliance image — it downloads
+   one from the resolved release channel. To install an unpublished set, boot
+   the ISO and point it at the staged release: at the GRUB menu press `e`,
+   append `lemonseed.image=http://<dev-ip>:8083/release-<version>/` to the
+   `linux` line, and press F10 to boot. A locally mounted release directory
+   works too, via `lemonseed.artifacts=<dir>`. Production releases need no
+   override — the channel resolves them.)
 
 2. **Publish as a beta (prerelease).**
 

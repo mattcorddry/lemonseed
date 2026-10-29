@@ -411,6 +411,31 @@ Flow:
 
 Lock-in criteria are OS + control plane (+ Docker); **not** gated on model load. **Open issue** (§12): because only GRUB writes `boot_attempted`, a *planned* reboot taken while `boot_once` is armed silently **upgrades** to the new slot — the power-control work must resolve this.
 
+### Slot versions and N-1 rollback (M8 P6, D2/D30)
+
+Two durable records back the rollback affordance:
+
+- **Slot-version registry** — `/var/lib/lemonseed/slot-versions.json`, written by every
+  apply (the target slot with the release's declared rollback floor; the running slot
+  self-healed) and by the installer for slot a. The control plane and the updater's
+  `rollback` verb read it; unreadable reads as empty (bookkeeping never blocks a boot).
+- **GRUB version labels** — grubenv vars `slot_a_version` / `slot_b_version`, written at
+  every apply and seeded by the installer; `boot/grub.cfg` expands them into menu titles
+  of the form *Boot Lemonseed version {version} (slot {slot})*.
+
+`lemonseed-update rollback [--reboot]` flips `boot_default` to the inactive slot via
+`lemonseed-ab lock-in` — no download, no slot writes. It is refused unless the inactive
+slot holds exactly the prior release, nothing is pending, and the prior sits at or
+above the running release's declared floor: **`rollback.min_rollback_version`** in the
+signed manifest (default: the release's date minus the 30-day horizon;
+`MIN_ROLLBACK_VERSION=<v>` pins it for a one-way-door release). A successful rollback
+records `rolled_back_version`; update offers at or below it are suppressed (check,
+panel) until a strictly newer release is published, and any successful apply clears the
+marker. The panel exposes the same gate as a *Prior version* row with a rollback button
+(audited `update.rollback`); the CLI is the force path. Rollback is deliberately N-1 —
+older releases return via an explicit `apply --force` at an older set — and it undoes
+the *root*, never the data.
+
 ---
 
 ## 5. Partition configuration format
@@ -588,7 +613,13 @@ interface's own address, high port 8083. As built (M8 P2), a release **is** a sh
   production key), `pkcs11` signs with the hardware-backed production key
   through the openssl pkcs11 provider — the key never exists as a file, and
   every signature requires the token's own authorization. The interface never
-  changes: directory in, `manifest.json.sig` out.
+  changes: directory in, `manifest.json.sig` out. The baked trust set (set
+  version 3) lists **both** the production key and the local test key
+  (`keys/test.pub`, tracked; its private half stays gitignored and local to
+  the development machine), so a `SIGN_MODE=file` build verifies on any
+  appliance without a ceremony run — retiring the test key later is ordinary
+  rotation: drop it from `release-keys.json` and ship one production-signed
+  release.
 - **The verifier is one module, two callers:** `scripts/lemonseed_verify.py`, imported by
   `scripts/lemonseed_update.py` (`check`/`apply`) and the installer's vendored pipeline
   (`installer/install.py`). Verification is **verify-before-parse**: the detached
@@ -793,6 +824,7 @@ Moved to [BACKLOG](BACKLOG.md)
 | Destructive-action confirms | Typed "type the word to continue" interstitials are reserved for **data-destroying** actions (settings reset, user delete). Reboot, shutdown and update are data-safe, so they get an explainer plus a confirm — no typing. |
 | Release channel | **GitHub releases** since M8 P3: discovery is one `GET /releases` per check; `stable` = newest non-draft non-prerelease, `beta` = newest non-draft release; assets ride the CDN. The channel is *only* GitHub's prerelease flag (D-C1) — the signed manifest describes the payload, so a flip is a metadata edit, and switching channels never downgrades (D-C2). The setting lives in the CP settings table (`cp_meta`), materialized to `/var/lib/lemonseed/channel` for the DB-free root jobs; the installer seeds it. The old `dev-server` origin survives only as a `--url` value. |
 | Release payload (M8 P2) | **All appliance artifacts ship as one canonical tar cut into fixed 1 GiB `payload-NNN.part` parts**, never gzipped — the SquashFS is already zstd-compressed, so a second layer wins nothing. `manifest.json` stays outside the tar and describes both the chunks and the outputs; the installer ISO ships as its own direct asset. `make release` builds → packs → signs → self-verifies → stages `out/release-<version>/`; the hand-run SCP (`push-image-to-website.sh`) is removed (D23) and publishing becomes P4's GitHub-release job. Design: [`proposals/M8/PACKAGING.md`](./proposals/M8/PACKAGING.md). [2026-10, M8 P2] |
+| N-1 rollback (M8 P6, D2/D30) | A **slot-version registry** (`/var/lib/lemonseed/slot-versions.json`) + grubenv version labels back `lemonseed-update rollback`: a boot-pointer flip via `lemonseed-ab lock-in`, gated on the inactive slot holding exactly the prior release at or above the running release's declared floor (**`rollback.min_rollback_version` in the signed manifest**, default the release's date minus the 30-day horizon; `MIN_ROLLBACK_VERSION=<v>` pins it for a one-way-door change). Re-offers at or below the fled-to version are suppressed until a strictly newer release ships; the panel mirrors the gate with an audited rollback button; older releases return only via `apply --force`. Rollback undoes the root, never the data. [2026-10, M8 P6] |
 | Auth without TLS | The appliance is reached by mDNS name over **plain HTTP**, so TLS is not available: there is no FQDN for a public cert, browsers reject self-signed certs and re-block them, and importing a private CA is beyond a home user. Because the transport cannot be trusted, the design goal becomes **never put the plaintext password on the wire at all** — a PAKE (SRP-6a) rather than client-side hashing, which is only obfuscation. See `proposals/M7/PLAN.md` D1. |
 | SRP rollout | **SRP-only, no migration path** (chosen over shipping SRP alongside bcrypt, and over a one-time migrate-on-next-sign-in). Reason: a mixed tree is a tree with two auth paths, one of which is the thing we are removing; and there is **no install base**, so a breaking change is free today and expensive later. bcrypt cannot yield an SRP verifier (one-way), so "migrate on next sign-in" would have kept the plaintext POST alive indefinitely. Consequence: **all existing test machines need a fresh reinstall**, and A/B rollback across the boundary cannot sign anyone in (§11). |
 | Password policy | **Client-side, in `SRP_ENROLL_JS`.** This is a consequence, not a preference: enrollment derives the verifier in the browser, so the server never holds the password and cannot apply a rule to it. A server-side policy would require the server to see the password, which is the property we just gave up. Stated plainly so nobody later reads the missing server check as an oversight. |

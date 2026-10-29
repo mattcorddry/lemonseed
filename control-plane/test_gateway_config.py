@@ -403,6 +403,8 @@ class CpRouteExposureTests(unittest.TestCase):
         # job that reboots the appliance when it finishes (D4).
         "/_lemonseed/api/update": ("authGate", "adminGate"),
         "/_lemonseed/api/update/check": ("authGate", "adminGate"),
+        # The rollback affordance (M8 P6): boots the prior slot, same gate.
+        "/_lemonseed/api/update/rollback": ("authGate", "adminGate"),
         # /profile/ is the one *page* here. Pages are as easy to forget as APIs,
         # and forgetting this one would strand every non-admin: with no location
         # the catch-all hands it to Open WebUI, which answers 404.

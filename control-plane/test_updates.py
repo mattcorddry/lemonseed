@@ -28,6 +28,7 @@ class _Files(unittest.TestCase):
         patches = [
             mock.patch.object(updates, "ATTEMPT_FILE", root / "update-attempt.json"),
             mock.patch.object(updates, "LATEST_FILE", root / "latest-update.json"),
+            mock.patch.object(updates, "SLOT_VERSIONS_FILE", root / "slot-versions.json"),
             mock.patch.object(updates, "CMDLINE", root / "cmdline"),
             # The channel is whatever the settings table says; tests pin it to
             # stable unless they are about the channel itself (D-C4).
@@ -119,6 +120,146 @@ class SnapshotTests(_Files):
         )
         self.assertFalse(updates.snapshot("2026.02")["available"])
         self.assertFalse(updates.snapshot("2026.01")["available"])
+
+    def test_rollback_kind_follows_the_direction(self) -> None:
+        """After a rollback the other slot holds the *newer* release: the
+        affordance is a roll forward, and the label follows that direction
+        (the operation itself is the same boot-pointer flip)."""
+        self.write_cmdline("a")
+        updates.SLOT_VERSIONS_FILE.write_text(
+            json.dumps({"slots": {"a": {"version": "2026.02"},
+                                  "b": {"version": "2026.03"}},
+                        "rolled_back_version": None}),
+            encoding="utf-8",
+        )
+        self.assertEqual(updates.snapshot("2026.02")["rollback_kind"], "forward")
+        updates.SLOT_VERSIONS_FILE.write_text(
+            json.dumps({"slots": {"a": {"version": "2026.03"},
+                                  "b": {"version": "2026.02"}},
+                        "rolled_back_version": None}),
+            encoding="utf-8",
+        )
+        self.assertEqual(updates.snapshot("2026.03")["rollback_kind"], "back")
+
+
+class RollbackTests(_Files):
+    """M8 P6 (D30): the registry is the authority on both sides — this gate
+    hides an ineligible button, and the updater refuses again root-side."""
+
+    def write_registry(
+        self,
+        slots: dict,
+        rolled_back: str | None = None,
+    ) -> None:
+        payload: dict = {"slots": slots, "rolled_back_version": rolled_back}
+        updates.SLOT_VERSIONS_FILE.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_the_active_slot_must_be_knowable(self) -> None:
+        self.cmdline.write_text("console=tty0 root=fstab\n", encoding="utf-8")
+        eligible, reason = updates.rollback_eligibility("2026.03")
+        self.assertFalse(eligible)
+        self.assertIn("slot could not be determined", reason)
+
+    def test_an_unrecorded_other_slot_is_nothing_to_roll_back_to(self) -> None:
+        self.write_cmdline("a")
+        eligible, reason = updates.rollback_eligibility("2026.03")
+        self.assertFalse(eligible)
+        self.assertIn("no version recorded", reason)
+
+    def test_the_other_slot_holding_the_running_version_is_nothing_to_flee_to(self) -> None:
+        """A re-apply of the running release over the other slot (the case the
+        registry exists to catch): the flip would boot the same version."""
+        self.write_cmdline("a")
+        self.write_registry({"a": {"version": "2026.03"}, "b": {"version": "2026.03"}})
+        eligible, reason = updates.rollback_eligibility("2026.03")
+        self.assertFalse(eligible)
+        self.assertIn("already running", reason)
+
+    def test_a_prior_below_the_declared_floor_is_ineligible(self) -> None:
+        self.write_cmdline("a")
+        self.write_registry(
+            {
+                "a": {"version": "20260310.01", "min_rollback_version": "20260309.00"},
+                "b": {"version": "20260101.01"},
+            }
+        )
+        eligible, reason = updates.rollback_eligibility("20260310.01")
+        self.assertFalse(eligible)
+        self.assertIn("20260101.01", reason)
+        self.assertIn("20260309.00", reason)
+
+    def test_an_eligible_registry_names_the_prior(self) -> None:
+        self.write_cmdline("a")
+        self.write_registry(
+            {"a": {"version": "2026.03"}, "b": {"version": "2026.02"}}
+        )
+        eligible, reason = updates.rollback_eligibility("2026.03")
+        self.assertTrue(eligible)
+        self.assertEqual(reason, "")
+
+    def test_snapshot_carries_prior_and_suppression(self) -> None:
+        self.write_cmdline("a")
+        self.write_registry(
+            {"a": {"version": "2026.03"}, "b": {"version": "2026.02"}},
+            rolled_back="2026.02",
+        )
+        self.latest.write_text(
+            json.dumps({"latest": "2026.03", "running": "2026.03",
+                        "checked_at": "2026-03-01T00:00:00Z"}),
+            encoding="utf-8",
+        )
+        snap = updates.snapshot("2026.03")
+        self.assertEqual(snap["prior"], "2026.02")
+        self.assertEqual(snap["rolled_back"], "2026.02")
+        self.assertTrue(snap["rollback_eligible"])
+        # The version already fled from (2026.03) is not offered again; a
+        # strictly newer one is.
+        self.assertFalse(snap["available"])
+        self.latest.write_text(
+            json.dumps({"latest": "2026.04", "running": "2026.03",
+                        "checked_at": "2026-03-01T00:00:00Z"}),
+            encoding="utf-8",
+        )
+        self.assertTrue(updates.snapshot("2026.03")["available"])
+
+    def test_rollback_runs_the_updater_verb_with_reboot(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_popen(command, **_kwargs):
+            calls.append(command)
+
+            class Proc:
+                stdout = iter(["lemonseed-update: rebooting now", ""])
+                returncode = 0
+
+                def wait(self) -> int:
+                    return 0
+
+            return Proc()
+
+        self.write_cmdline("a")
+        self.write_registry(
+            {"a": {"version": "2026.03"}, "b": {"version": "2026.02"}}
+        )
+        updates._job.update(kind="", state="idle", detail="", progress=None)
+        with mock.patch.object(updates, "_interlock_reason", return_value=None), \
+                mock.patch.object(updates.chat_ready, "mark_reboot_pending"), \
+                mock.patch.object(updates.chat_ready, "clear_reboot_pending"), \
+                mock.patch.object(updates.subprocess, "Popen", side_effect=fake_popen):
+            self.assertIsNone(updates.start_rollback("2026.03"))
+            self.assertTrue(updates._job_thread.join(timeout=5) is None or True)
+        updates._job.update(kind="", state="idle", detail="", progress=None)
+        self.assertEqual(calls, [["lemonseed-update", "rollback", "--reboot"]])
+
+    def test_an_ineligible_rollback_never_starts_a_job(self) -> None:
+        updates._job.update(kind="", state="idle", detail="", progress=None)
+        self.write_cmdline("a")  # knowable slot, but no registry on disk
+        with mock.patch.object(updates.subprocess, "Popen") as popen:
+            reason = updates.start_rollback("2026.03")
+        updates._job.update(kind="", state="idle", detail="", progress=None)
+        self.assertIsNotNone(reason)
+        self.assertIn("no version recorded", reason)
+        popen.assert_not_called()
 
 
 class StartJobTests(_Files):

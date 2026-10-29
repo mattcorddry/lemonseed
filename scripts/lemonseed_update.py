@@ -34,6 +34,7 @@ from lemonseed_artifacts import (
     image_base_url,
     resolve_channel,
     resolve_release_base,
+    rollback_floor,
     sha256_device,
     sha256_file,
     write_raw,
@@ -46,6 +47,9 @@ GRUB_CFG = Path(os.environ.get("LEMONSEED_GRUB_CFG", "/etc/lemonseed/grub.cfg"))
 GRUB_CFG_FALLBACK = Path("/usr/share/lemonseed/grub.cfg")
 ATTEMPT_FILE = Path(os.environ.get("LEMONSEED_ATTEMPT_FILE", "/var/lib/lemonseed/update-attempt.json"))
 LATEST_FILE = Path(os.environ.get("LEMONSEED_LATEST_FILE", "/var/lib/lemonseed/latest-update.json"))
+SLOT_VERSIONS_FILE = Path(os.environ.get(
+    "LEMONSEED_SLOT_VERSIONS_FILE", "/var/lib/lemonseed/slot-versions.json"
+))
 VERSION_FILE = Path("/run/appliance/version")
 # The panel polls the job every 2s; rebooting the instant the word is printed
 # can outrun that poll, so the dialog freezes at the last write percent and
@@ -243,8 +247,17 @@ def write_inactive_slot(
     files: dict[str, Path],
     target_slot: str,
     *,
+    version: str,
     force: bool,
 ) -> None:
+    """Write the release into the inactive slot and arm the one-shot boot.
+
+    ``version`` rides along because the ESP boot menu names the version on
+    each slot (M8 P6, D2): the grubenv vars are the menu's data source, and
+    the write is the one moment both are known — the slot just written, and
+    the running one self-healed for boxes whose last update predates the
+    registry.
+    """
     refuse_dirty_state(force=force)
     active = current_slot()
     if target_slot == active:
@@ -293,6 +306,15 @@ def write_inactive_slot(
         grub_dir.mkdir(parents=True, exist_ok=True)
         atomic_copy(grub_src, grub_dir / "grub.cfg")
         log(f"updated ESP grub.cfg (from {grub_src})")
+        # The boot menu names the version on each slot (M8 P6, D2): the labels
+        # are grubenv vars the template expands, so the write is two env sets —
+        # the slot just written, and the running one. Non-fatal when the env
+        # block is missing: the menu falls back to the bare slot name.
+        env = grubenv_path(esp)
+        run(["grub-editenv", str(env), "set", f"slot_{target_slot}_version={version}"], check=False)
+        running = running_version()
+        if running != "unknown":
+            run(["grub-editenv", str(env), "set", f"slot_{active}_version={running}"], check=False)
         run([AB_HELPER, "set-once", target_slot, "--esp", str(esp)])
     finally:
         umount_esp()
@@ -306,6 +328,14 @@ def cmd_status() -> int:
     print(f"boot_default={status.get('boot_default', '')}")
     print(f"boot_once={status.get('boot_once', '')}")
     print(f"boot_attempted={status.get('boot_attempted', '')}")
+    # Slot versions from the registry (M8 P6): the honest answer to "what am I
+    # running and what would rollback boot?". A slot written before the
+    # registry existed reads as unknown.
+    registry = _read_slot_versions()
+    for slot in ("a", "b"):
+        version = str((registry["slots"].get(slot) or {}).get("version") or "unknown")
+        mark = " (running)" if slot == active else ""
+        print(f"slot_{slot}_version={version}{mark}")
     for label in ("root-a", "root-b", "ESP"):
         path = Path(f"/dev/disk/by-partlabel/{label}")
         print(f"part_{label}={'present' if path.exists() else 'missing'}")
@@ -331,7 +361,7 @@ def cmd_apply(
     active = current_slot()
     target = inactive_slot(active)
     log(f"active slot {active}; writing inactive slot {target}")
-    files, version, _manifest = acquire_artifacts(
+    files, version, manifest = acquire_artifacts(
         progress=progress,
         download_dir=DOWNLOAD_DIR,
         url=url,
@@ -353,10 +383,31 @@ def cmd_apply(
             f"the channel offers {version}, which is older than the running "
             f"{running}; refusing the downgrade (use --force to write it anyway)"
         )
+    # The rollback marker suppresses *offers* (check, panel); an explicit
+    # apply with --force is the operator overriding it deliberately.
+    rolled_back = str(_read_slot_versions().get("rolled_back_version") or "")
+    if rolled_back and version <= rolled_back and not force:
+        raise UpdateError(
+            f"the channel offers {version}, which was rolled back from; "
+            "use --force to apply it anyway"
+        )
     log(f"artifacts ready (version {version})")
-    write_inactive_slot(files, target, force=force)
+    write_inactive_slot(files, target, version=version, force=force)
     # boot_once is armed; the detector's input exists only from here on.
     record_attempt(version, target)
+    # Slot-version bookkeeping (M8 P6): the applied release is recorded for
+    # the target slot — with the rollback floor its manifest declares — and
+    # the running slot's record self-heals here for boxes whose last update
+    # predates this registry. A successful apply also clears the rollback
+    # marker: the operator just made a newer choice.
+    rollback_block = manifest.get("rollback") if isinstance(manifest, dict) else {}
+    if not isinstance(rollback_block, dict):
+        rollback_block = {}
+    floor = str(rollback_block.get("min_rollback_version") or "") or None
+    record_slot_version(target, version, min_rollback_version=floor)
+    if running != "unknown":
+        record_slot_version(active, running)
+    clear_rolled_back()
     # The payload is on its way to being the running system: the assembled
     # staging and the verified part cache are no longer needed (M8 P2).
     cleanup_payload(DOWNLOAD_DIR)
@@ -382,6 +433,66 @@ def cmd_cancel() -> int:
     finally:
         umount_esp()
     clear_attempt()
+    return 0
+
+
+def cmd_rollback(*, reboot: bool, force: bool) -> int:
+    """Boot the previous slot (M8 P6, D2): a boot-pointer flip, not a write.
+
+    The inactive slot still holds the release the last update replaced, so
+    rolling back means making it the default — no download, no writes to
+    either root, through the same ``lemonseed-ab lock-in`` primitive apply
+    arms. Deliberately N-1: older releases come back through an explicit
+    ``apply --force`` at an older set.
+
+    The registry gates what the flip may target. The inactive slot must hold
+    exactly the prior release — a newer re-apply over it means there is
+    nothing to roll back to — and the running release's declared rollback
+    floor (its manifest's ``rollback.min_rollback_version``) must include the
+    prior version, so one-way-door releases are not walked back through.
+    """
+    require_root()
+    # The same honesty rules as apply: a knowable slot, nothing pending, and
+    # a landed attempt record cleared rather than stacked under the flip.
+    preflight(force=force)
+    active = current_slot()
+    target = inactive_slot(active)
+    running = running_version()
+    registry = _read_slot_versions()
+    prior_entry = registry["slots"].get(target) or {}
+    prior = str(prior_entry.get("version") or "")
+    if not prior:
+        raise UpdateError(
+            f"no version is recorded for slot {target} — nothing to roll back to "
+            "(use the boot menu, or write that slot with an update first)"
+        )
+    if prior == running and not force:
+        raise UpdateError(
+            f"slot {target} already holds {prior}, the version you are running; "
+            "nothing to roll back to"
+        )
+    running_entry = registry["slots"].get(active) or {}
+    floor = str(running_entry.get("min_rollback_version") or "") or rollback_floor(running)
+    if floor and prior < floor and not force:
+        raise UpdateError(
+            f"rollback to {prior} is below the floor {floor} declared by the "
+            f"running release; use --force to roll back anyway"
+        )
+    esp = ensure_esp_mounted()
+    try:
+        run([AB_HELPER, "lock-in", target, "--esp", str(esp)])
+    finally:
+        umount_esp()
+    clear_attempt()
+    if running != "unknown":
+        set_rolled_back(running)
+    log(f"rolled back to {prior} (slot {target}); boot_default={target}")
+    log(f"update checks will not offer {running} again")
+    if reboot:
+        progress(phase="writing", message="Rollback finished; the appliance is about to reboot", progress=100)
+        log("rebooting now")
+        time.sleep(REBOOT_GRACE_S)
+        run(["systemctl", "reboot"], check=False)
     return 0
 
 
@@ -413,6 +524,75 @@ def record_attempt(version: str, target_slot: str) -> None:
 
 def clear_attempt() -> None:
     ATTEMPT_FILE.unlink(missing_ok=True)
+
+
+def _read_slot_versions() -> dict[str, Any]:
+    """The slot-version registry, else a fresh empty shape.
+
+    Unreadable or malformed JSON reads as no records: the registry is
+    bookkeeping, never a reason the box cannot boot. The rollback verb
+    re-derives what it can and refuses what it cannot.
+    """
+    try:
+        registry = json.loads(SLOT_VERSIONS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"slots": {}, "rolled_back_version": None}
+    if not isinstance(registry, dict) or not isinstance(registry.get("slots"), dict):
+        return {"slots": {}, "rolled_back_version": None}
+    registry.setdefault("rolled_back_version", None)
+    return registry
+
+
+def _write_slot_versions(registry: dict[str, Any]) -> None:
+    SLOT_VERSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SLOT_VERSIONS_FILE.with_name(SLOT_VERSIONS_FILE.name + ".new")
+    tmp.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(SLOT_VERSIONS_FILE)
+
+
+def record_slot_version(
+    slot: str,
+    version: str,
+    *,
+    min_rollback_version: str | None = None,
+    written_at: str | None = None,
+) -> None:
+    """Slot-version bookkeeping for the rollback verb and the boot menu (M8 P6).
+
+    One JSON beside the attempt record answers every rollback question — what
+    each slot holds, when it was written, and the rollback floor the running
+    release declares. Written by every apply (both slots: the target with the
+    applied release, the running one self-healed from /run), by the installer
+    for slot a, and read by the rollback verb and the control plane's panel.
+    """
+    registry = _read_slot_versions()
+    entry: dict[str, Any] = {
+        "version": version,
+        "written_at": written_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    if min_rollback_version:
+        entry["min_rollback_version"] = min_rollback_version
+    registry["slots"][slot] = entry
+    _write_slot_versions(registry)
+
+
+def set_rolled_back(version: str) -> None:
+    """Record the version the operator fled to (M8 P6, D30).
+
+    Offers at or below it are suppressed (check, panel) until a strictly
+    newer release is published; an explicit ``apply --force`` overrides.
+    """
+    registry = _read_slot_versions()
+    registry["rolled_back_version"] = version
+    _write_slot_versions(registry)
+
+
+def clear_rolled_back() -> None:
+    """A successful apply supersedes any rollback: the operator made a choice."""
+    registry = _read_slot_versions()
+    if registry.get("rolled_back_version"):
+        registry["rolled_back_version"] = None
+        _write_slot_versions(registry)
 
 
 def running_version() -> str:
@@ -447,11 +627,16 @@ def cmd_check(url: str | None, channel: str | None, *, record: bool) -> int:
             latest = str(manifest.get("version") or "unknown")
     running = running_version()
     # Same rule as the panel: a stale record must not offer a downgrade —
-    # which is also the whole channel-switch story (D-C2).
-    available = "true" if (latest != running and latest > running) else "false"
+    # which is also the whole channel-switch story (D-C2). A rollback marker
+    # suppresses offers at or below the version the operator fled to, until a
+    # strictly newer release is published (M8 P6).
+    rolled_back = str(_read_slot_versions().get("rolled_back_version") or "")
+    suppressed = bool(rolled_back) and latest <= rolled_back
+    available = "true" if (latest != running and latest > running and not suppressed) else "false"
     print(f"running={running}")
     print(f"latest={latest}")
     print(f"channel={picked}")
+    print(f"rolled_back={rolled_back}")
     print(f"update_available={available}")
     if record:
         payload = {
@@ -491,6 +676,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("cancel", help="Clear pending boot_once / boot_attempted")
 
+    rollback_p = sub.add_parser(
+        "rollback",
+        help="Boot the previous slot (N-1): flip the default, clear the attempt",
+    )
+    rollback_p.add_argument("--reboot", action="store_true", help="Reboot into the rolled-back slot")
+    rollback_p.add_argument(
+        "--force",
+        action="store_true",
+        help="Override the eligibility checks (dirty state, declared floor)",
+    )
+
     check_p = sub.add_parser("check", help="Report running vs latest available version")
     check_p.add_argument("--url", help="HTTP directory with manifest.json")
     check_p.add_argument(
@@ -509,7 +705,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Bare flags without a subcommand imply "apply".
-    if argv and argv[0] not in ("status", "apply", "cancel", "check", "-h", "--help"):
+    if argv and argv[0] not in ("status", "apply", "cancel", "check", "rollback", "-h", "--help"):
         argv = ["apply", *argv]
 
     parser = build_parser()
@@ -519,6 +715,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_status()
         if args.command == "cancel":
             return cmd_cancel()
+        if args.command == "rollback":
+            return cmd_rollback(reboot=bool(args.reboot), force=bool(args.force))
         if args.command == "check":
             return cmd_check(args.url, getattr(args, "channel", None), record=args.record)
         if args.command == "apply":

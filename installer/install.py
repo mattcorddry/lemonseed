@@ -91,6 +91,23 @@ class InstallError(Exception):
     pass
 
 
+class ReleaseSourceError(InstallError):
+    """The release set could not be acquired, before anything touched the disk.
+
+    ``str()`` is the product sentence the installer UI shows every user; the
+    technical reason (DNS, HTTP status, signature refusal, …) rides in
+    ``detail`` for the UI's debug disclosure and the install log. Retry and
+    reboot are always safe: acquire runs entirely before partitioning.
+    """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(
+            "Unable to find the release files for Lemonseed AI. "
+            "No changes were made to your system."
+        )
+        self.detail = detail
+
+
 def _progress(cb: ProgressFn | None, **kwargs: Any) -> None:
     if cb:
         cb(**kwargs)
@@ -307,6 +324,42 @@ def write_channel_stub(grub_dir: Path, channel: str) -> None:
         stub.unlink()
 
 
+SLOT_VERSIONS_REL = Path("@var/lib/lemonseed/slot-versions.json")
+
+
+def write_slot_registry(disk: str, version: str) -> None:
+    """Seed the slot-version registry on the target's user-data (M8 P6, D30).
+
+    The rollback verb and the boot-menu labels read what each slot holds, so
+    the installed slot is recorded here. Preserved user-data keeps the other
+    slot's record — that root is untouched by the reinstall — while the
+    installed slot's record is replaced and any rollback marker is dropped:
+    the reinstall supersedes it. Best-effort: a fresh install's user-data is
+    provisioned but write failures are logged, and the next update re-records
+    both slots anyway (the updater self-heals the running one).
+    """
+    try:
+        with mount_user_data(disk) as root:
+            target = root / SLOT_VERSIONS_REL
+            try:
+                registry = json.loads(target.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                registry = {}
+            if not isinstance(registry, dict):
+                registry = {}
+            slots = registry.get("slots") if isinstance(registry.get("slots"), dict) else {}
+            slots["a"] = {
+                "version": version,
+                "written_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            registry["slots"] = slots
+            registry["rolled_back_version"] = None
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
+    except (InstallError, OSError) as exc:
+        _log(syslog.LOG_WARNING, f"could not record the slot-version registry on {disk}: {exc}")
+
+
 def apply_channel_file(disk: str, channel: str) -> None:
     """Record the chosen release channel on the target's user-data (M8 P3, D-C4).
 
@@ -474,13 +527,13 @@ def download_file(
 
 def copy_local(src: Path, dest: Path, expected_sha: str | None, label: str) -> None:
     if not src.is_file():
-        raise InstallError(f"Local artifact missing: {src} ({label})")
+        raise ReleaseSourceError(f"Local artifact missing: {src} ({label})")
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dest)
     if expected_sha:
         digest = sha256_file(dest)
         if digest.lower() != expected_sha.lower():
-            raise InstallError(
+            raise ReleaseSourceError(
                 f"Checksum mismatch for {label}: got {digest}, expected {expected_sha}"
             )
 
@@ -507,7 +560,7 @@ def load_local_manifest(directory: Path) -> dict[str, Any]:
         manifest = json.loads(man.read_text(encoding="utf-8"))
         lemonseed_verify.check_signing_metadata(manifest)
     except VerificationError as exc:
-        raise InstallError(str(exc)) from exc
+        raise ReleaseSourceError(str(exc)) from exc
     return manifest
 
 
@@ -519,7 +572,24 @@ def artifact_relpath(manifest: dict[str, Any], key: str) -> tuple[str, str | Non
     return path, sha
 
 
-def acquire_artifacts(progress: ProgressFn | None, channel: str | None = None) -> tuple[dict[str, Path], str]:
+def acquire_artifacts(
+    progress: ProgressFn | None, channel: str | None = None
+) -> tuple[dict[str, Path], str]:
+    """Acquire the release set, strictly before anything touches the disk.
+
+    Every failure here is a *source* failure (network, discovery, signature,
+    checksum): the product sentence goes to the UI, the technical reason in
+    ``detail`` — and retry/reboot are safe because nothing was written.
+    """
+    try:
+        return _acquire_artifacts(progress, channel=channel)
+    except lemonseed_artifacts.ArtifactError as exc:
+        raise ReleaseSourceError(str(exc)) from exc
+
+
+def _acquire_artifacts(
+    progress: ProgressFn | None, channel: str | None = None
+) -> tuple[dict[str, Path], str]:
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     local = artifact_dir()
     if local:
@@ -541,7 +611,7 @@ def acquire_artifacts(progress: ProgressFn | None, channel: str | None = None) -
                     progress=progress,
                 )
             except lemonseed_artifacts.ArtifactError as exc:
-                raise InstallError(str(exc)) from exc
+                raise ReleaseSourceError(str(exc)) from exc
             _progress(
                 progress,
                 phase="download",
@@ -582,8 +652,12 @@ def acquire_artifacts(progress: ProgressFn | None, channel: str | None = None) -
         picked = lemonseed_artifacts.resolve_channel(channel)
         resolved = lemonseed_artifacts.resolve_release_base(picked)
         if resolved is None:
-            raise InstallError(
-                f"No release on channel '{picked}' to install — the channel is up to date"
+            # An unpublished set (e.g. a local test build): the channel is the
+            # only source the USB carries. The user sentence stays generic;
+            # the detail names the channel and the API that answered.
+            raise ReleaseSourceError(
+                f"No releases found on the {picked} channel at "
+                f"{lemonseed_artifacts.releases_api_url()}"
             )
         base, tag = resolved
         _progress(
@@ -605,7 +679,7 @@ def acquire_artifacts(progress: ProgressFn | None, channel: str | None = None) -
                 progress=progress,
             )
         except lemonseed_artifacts.ArtifactError as exc:
-            raise InstallError(str(exc)) from exc
+            raise ReleaseSourceError(str(exc)) from exc
         _progress(
             progress,
             phase="download",
@@ -720,6 +794,7 @@ def seed_esp(
     files: dict[str, Path],
     progress: ProgressFn | None,
     channel: str = "stable",
+    version: str = "unknown",
 ) -> None:
     esp = wait_part(disk, "ESP")
     ESP_MOUNT.mkdir(parents=True, exist_ok=True)
@@ -773,6 +848,17 @@ def seed_esp(
 
         if AB_HELPER.is_file():
             _run(["bash", str(AB_HELPER), "init", "--esp", str(ESP_MOUNT)])
+            # The boot menu names the version on each slot (M8 P6, D2): the
+            # labels are grubenv vars the template expands. Slot b is the
+            # updater's to label.
+            _run(
+                [
+                    "grub-editenv",
+                    str(ESP_MOUNT / "grub" / "grubenv"),
+                    "set",
+                    f"slot_a_version={version}",
+                ]
+            )
 
         write_channel_stub(grub_dir, channel)
 
@@ -890,7 +976,11 @@ def run_install(
     _progress(progress, phase="write", message="Writing system image to root-a", progress=58)
     write_raw(files["root.squashfs"], root_a, progress, 58, 84)
     _progress(progress, phase="write", message="System image written", progress=85)
-    seed_esp(disk_path, files, progress, channel=channel)
+    seed_esp(disk_path, files, progress, channel=channel, version=version)
+    # The slot-version registry seeds the rollback verb and the boot-menu
+    # labels (M8 P6, D30): slot a is the release just installed. Best-effort —
+    # a failed write is logged, and the first update re-records both slots.
+    write_slot_registry(disk_path, version)
     # Flush target disk before inviting media removal — the live installer
     # root is still on that CD/USB and will vanish when it is ejected.
     _progress(

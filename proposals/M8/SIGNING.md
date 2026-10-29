@@ -44,8 +44,12 @@ signing hardware; only the public half is committed
 that builds releases. Losing all copies of the private key means key rotation:
 generate a fresh key, publish its public half in the trust set, re-sign. Local
 test keys (`make keys`, now `keys/test`) keep milestone iteration independent
-of the production key; appliances refuse test-key signatures because the baked
-trust set carries only the production key.
+of the production key: **`test.pub` is a listed member of the baked trust set**
+(set version 3), so a test build signed with `SIGN_MODE=file` — the default —
+verifies on any appliance without a ceremony run. The private half stays
+gitignored and local to the development machine; retiring the test key later
+is the ordinary rotation: drop it from `release-keys.json` and ship one
+production-signed release.
 
 **Signer backends (`SIGN_MODE`, unchanged interface).**
 
