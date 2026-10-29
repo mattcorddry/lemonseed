@@ -1,6 +1,6 @@
 # Public HTTP gateway: nginx :80 → Lemonseed shell + Open WebUI + CP APIs.
 
-{ pkgs, ... }:
+{ pkgs, lib, config, ... }:
 
 let
   brandAssets = ../../control-plane/static/brand;
@@ -82,6 +82,94 @@ let
     ];
     text = ''
       exec python3 ${../../scripts/lemonseed-avahi-alias.py}
+    '';
+  };
+
+  # avahi 0.8 matches allow-interfaces/deny-interfaces with exact strcasecmp —
+  # no prefixes or wildcards — so a static denyInterfaces cannot exclude
+  # docker0/br-*/veth* (Docker churn then renames the appliance's mDNS name).
+  # The daemon therefore runs against a runtime-patchable copy of its config:
+  # this is the module's avahi-daemon.conf template, rebuilt from the live
+  # services.avahi options (upstream keeps the same text module-internally,
+  # where it cannot be referenced); if the NixOS module's template changes,
+  # this must follow. The generator appends an allow-list of the interfaces
+  # that exist at daemon start: an allow-list fails closed, so any interface
+  # created later (a fresh veth pair, a new bridge) is ignored by avahi
+  # without reconfiguration.
+  avahiConfBase = pkgs.writeText "lemonseed-avahi-daemon.conf" (
+    with config.services.avahi;
+      ''
+        [server]
+        ${
+          lib.optionalString (hostName != "") "host-name=${hostName}"
+        }
+        browse-domains=${lib.concatStringsSep ", " browseDomains}
+        use-ipv4=${lib.boolToYesNo ipv4}
+        use-ipv6=${lib.boolToYesNo ipv6}
+        ${lib.optionalString (allowInterfaces != null) "allow-interfaces=${lib.concatStringsSep "," allowInterfaces}"}
+        ${lib.optionalString (denyInterfaces != null) "deny-interfaces=${lib.concatStringsSep "," denyInterfaces}"}
+        ${lib.optionalString (domainName != null) "domain-name=${domainName}"}
+        allow-point-to-point=${lib.boolToYesNo allowPointToPoint}
+        ${lib.optionalString (cacheEntriesMax != null) "cache-entries-max=${toString cacheEntriesMax}"}
+
+        [wide-area]
+        enable-wide-area=${lib.boolToYesNo wideArea}
+
+        [publish]
+        disable-publishing=${lib.boolToYesNo (!publish.enable)}
+        disable-user-service-publishing=${lib.boolToYesNo (!publish.userServices)}
+        publish-addresses=${lib.boolToYesNo (publish.userServices || publish.addresses)}
+        publish-hinfo=${lib.boolToYesNo publish.hinfo}
+        publish-workstation=${lib.boolToYesNo publish.workstation}
+        publish-domain=${lib.boolToYesNo publish.domain}
+
+        [reflector]
+        enable-reflector=${lib.boolToYesNo reflector}
+        ${extraConfig}
+      '');
+
+  avahiConf = pkgs.writeShellApplication {
+    name = "lemonseed-avahi-conf";
+    runtimeInputs = with pkgs; [ coreutils ];
+    text = ''
+      set -euo pipefail
+      shopt -s nullglob
+
+      src="${avahiConfBase}"
+      dst=/run/lemonseed/avahi-daemon.conf
+      mkdir -p /run/lemonseed
+
+      allow=""
+      for dev in /sys/class/net/*; do
+        name="$(basename "$dev")"
+        case "$name" in
+          lo|docker*|br-*|veth*|virbr*|vrf*|tun*|tap*|wg*|dummy*|netns*|cni*|zt*) continue ;;
+        esac
+        allow="''${allow:+$allow,}$name"
+      done
+
+      {
+        cat "$src"
+        if [[ -n "$allow" ]]; then
+          # The base conf ends inside [reflector]; re-open [server] so the key
+          # lands in the right group (avahi applies repeated groups in order,
+          # and scalar keys use replace semantics).
+          printf '\n[server]\nallow-interfaces=%s\n' "$allow"
+        fi
+      } > "$dst.tmp"
+      chmod 0644 "$dst.tmp"
+      mv -f "$dst.tmp" "$dst"
+      echo "lemonseed-avahi-conf: allow-interfaces=''${allow:-<none>}"
+    '';
+  };
+
+  avahiWatch = pkgs.writeShellApplication {
+    name = "lemonseed-avahi-watch";
+    runtimeInputs = [
+      (pkgs.python3.withPackages (ps: [ ps.dbus-python ]))
+    ];
+    text = ''
+      exec python3 ${../../scripts/lemonseed_avahi_watch.py}
     '';
   };
 
@@ -256,9 +344,10 @@ in
   services.avahi = {
     enable = true;
     nssmdns4 = true;
-    # mDNS only on physical LAN links — not loopback, Docker bridges, or
-    # veth pairs (the appliance runs containers with host networking).
-    denyInterfaces = [ "lo" "docker" "br-" "veth" ];
+    # Loopback only: avahi 0.8 matches deny-interfaces exactly (no wildcards),
+    # so docker/br-/veth cannot be excluded this way — the daemon's
+    # allow-interfaces list is generated at start instead (see avahiConf).
+    denyInterfaces = [ "lo" ];
     openFirewall = true;
     publish = {
       enable = true;
@@ -317,6 +406,34 @@ in
       RestartSec = "3s";
       StandardOutput = "journal+console";
       StandardError = "journal+console";
+    };
+  };
+
+  systemd.services.lemonseed-avahi-watch = {
+    description = "Reclaim the Lemonseed mDNS hostname after spurious avahi renames";
+    wantedBy = [ "multi-user.target" ];
+    after = [
+      "avahi-daemon.service"
+      "lemonseed-identity.service"
+    ];
+    serviceConfig = {
+      Type = "simple";
+      ExecStart = "${avahiWatch}/bin/lemonseed-avahi-watch";
+      Restart = "on-failure";
+      RestartSec = "10s";
+      StandardOutput = "journal+console";
+      StandardError = "journal+console";
+    };
+  };
+
+  systemd.services.avahi-daemon = {
+    after = [ "network-online.target" ];
+    wants = [ "network-online.target" ];
+    serviceConfig = {
+      ExecStartPre = [ "${avahiConf}/bin/lemonseed-avahi-conf" ];
+      ExecStart = lib.mkForce [
+        "${config.services.avahi.package}/sbin/avahi-daemon --syslog -f /run/lemonseed/avahi-daemon.conf"
+      ];
     };
   };
 
@@ -851,11 +968,6 @@ in
 
   # No on-disk nginx access/error logs — nothing for logrotate to manage.
   services.logrotate.settings.nginx.enable = false;
-
-  systemd.services.avahi-daemon = {
-    after = [ "network-online.target" ];
-    wants = [ "network-online.target" ];
-  };
 
   systemd.tmpfiles.rules = [
     "d /run/lemonseed 0755 root root -"
