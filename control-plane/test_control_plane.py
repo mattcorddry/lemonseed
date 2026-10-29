@@ -2762,6 +2762,29 @@ class SessionGateHttpTests(unittest.TestCase):
         self.assertNotIn("password:", html)  # ...but never serialised
         self.assertNotIn("FormData", html)
 
+    def test_profile_panels_share_one_scroll_wrapper(self) -> None:
+        """The profile and password panels must stack, not overlap.
+
+        Both sections used to carry the absolute-positioned ``.profile-panel``
+        class, so they rendered into the same box on top of each other and the
+        page was unusable. They now flow inside a single scrolling wrapper.
+        """
+        html = stub.page_profile(_SNAP).decode()
+        self.assertEqual(html.count('class="profile-scroll"'), 1)
+        self.assertNotIn('class="panel profile-panel"', html)  # the overlapping class is gone
+        self.assertIn('id="profile-panel"', html)
+        self.assertIn('id="profile-password-panel"', html)
+        # Both panels render inside the wrapper, in document order.
+        self.assertLess(
+            html.index('<div class="profile-scroll">'), html.index('id="profile-panel"')
+        )
+        self.assertLess(
+            html.index('id="profile-panel"'), html.index('id="profile-password-panel"')
+        )
+        # And the stylesheet styles the wrapper, not the panels.
+        self.assertIn(".profile-scroll .panel", THEME_CSS)
+        self.assertNotIn(".profile-panel", THEME_CSS)
+
     def test_logout_succeeds_even_when_the_store_is_unreachable(self) -> None:
         """A broken data plane must not trap someone in a signed-in shell."""
         with mock.patch.object(sessions, "drop_quietly", return_value=False):

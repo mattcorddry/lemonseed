@@ -2980,7 +2980,8 @@ def page_profile(snap: dict[str, Any]) -> bytes:
 <main class="app-shell">
 {app_bar(name, metrics=False)}
 <div class="frame-wrap">
-<section class="panel profile-panel" id="profile-panel">
+<div class="profile-scroll">
+<section class="panel" id="profile-panel">
 <h2>My profile</h2>
 <p class="owui-status" id="profile-note" hidden></p>
 <form id="profile-form">
@@ -2990,7 +2991,7 @@ def page_profile(snap: dict[str, Any]) -> bytes:
 <button type="submit" class="btn primary">Save</button>
 </form>
 </section>
-<section class="panel profile-panel" id="profile-password-panel">
+<section class="panel" id="profile-password-panel">
 <h2>Change password</h2>
 <p class="lede">Lemonseed never sends your password over the network; passwords are converted to
 single-use passcodes before transmission to the Lemonseed appliance.</p>
@@ -3005,6 +3006,7 @@ single-use passcodes before transmission to the Lemonseed appliance.</p>
 <div class="row"><span class="name">Last sign-in</span><span class="state" id="profile-last">…</span></div>
 <div class="row"><span class="name">Chat model</span><span class="state {model_state}" id="profile-model">{model_label}</span></div>
 </section>
+</div>
 </div>
 </main>
 <script>{PORTAL_FETCH_JS}</script>

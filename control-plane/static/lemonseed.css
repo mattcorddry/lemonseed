@@ -347,14 +347,18 @@ input, select {
 .rotate-fields { margin-top: 14px; }
 
 /* M7 P3: My Profile and the account popover.
-   The profile panel is a section inside .frame-wrap, which is sized for
+   The profile page renders inside .frame-wrap, which is sized for
    absolutely-positioned iframes; it needs to scroll on its own or a short
-   window clips the change-password form off the bottom. */
-.profile-panel {
-  position: absolute; inset: 0; overflow-y: auto;
-  max-width: 620px; margin: 0 auto; box-sizing: border-box;
+   window clips the change-password form off the bottom. The two panels
+   share one absolute scrolling wrapper: making each panel absolute put
+   both in the same box, stacked on top of each other (bare-metal review). */
+.profile-scroll {
+  position: absolute; inset: 0; overflow-y: auto; box-sizing: border-box;
 }
-@media (min-width: 700px) { .profile-panel { inset: 12px 0 0; } }
+.profile-scroll .panel {
+  max-width: 620px; margin-left: auto; margin-right: auto;
+}
+@media (min-width: 700px) { .profile-scroll { inset: 12px 0 0; } }
 
 .pop-wrap { position: relative; display: inline-flex; }
 .app-bar .gear svg { display: block; }
