@@ -32,12 +32,26 @@ The Lemonseed installer is approximately 1.2GB in size; you will need a USB stic
 
 ### Recommended hardware
 
-Lemonseed runs on ordinary x86-64 PC hardware with a capable GPU:
+Lemonseed runs on an ordinary Intel or AMD PC with a capable GPU. Lemonseed does not run on ARM-based PCs or Macintosh computers. The installer will check your hardware (disk, memory and GPU) and tell you if it does not meet Lemonseed’s requirements.
 
-* **NVIDIA** discrete GPUs.
-* **AMD** Ryzen AI Max+ 395 (“Strix Halo”) APUs, whose shared memory serves as GPU memory.
+| Component | Minimum | Recommended | Status |
+| --------- | ------- | ----------- | ------ |
+| Processor | Intel 4+ core | Intel Core i3-10xxx or newer | Supported |
+|           | AMD 4+ core | AMD Ryzen 5000 or newer | Supported |
+|           | AMD Ryzen AI 385 APU | AMD Ryzen AI 395+ APU 64-128GB | Supported |
+|           | ARM |       | Unsupported |
+|           | Apple |     | Unsupported |
+| Memory | 8GB | 16GB DDR4+ | Supported |
+| Storage | 128GB SSD | 256GB+ NVMe SSD | Supported |
+| GPU | NVIDIA GTX1660 6GB | NVIDIA RTX3080+ 16GB | Supported |
+|     | AMD Radeon RX 6000 8GB | AMD Radeon RX 7000+ 16-32GB | Untested |
+|     | Intel Iris Xe | Intel B60+ | Unsupported |
+|     | ARM Neon      |            | Unsupported |
 
-Support for AMD discrete graphics cards is implemented but not yet validated on real hardware. Lemonseed does not run on ARM-based PCs or Macintosh computers. The installer will check your hardware (disk, memory and GPU) and tell you if it does not meet Lemonseed’s requirements.
+Other hardware requirements:
+ * TPM v2 hardware key store is required for disk encryption (all recent PCs have this)
+ * EFI boot (all recent PCs have this, but some may need it to be enabled in BIOS setup)
+ * Ethernet network interface connected to your home network (WiFi is not yet supported)
 
 ## Using Lemonseed
 
