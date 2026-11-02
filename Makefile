@@ -24,7 +24,7 @@ ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 SIGN ?= 0
 DISK ?=
 
-.PHONY: help build-production build-qemu build-installer release run-qemu qemu-clean clean keys \
+.PHONY: help build-production build-qemu build-installer release release-github-beta release-github-stable run-qemu qemu-clean clean keys \
 	repart-generate disk-repart grub-cfg repart-test update-test test test-qemu \
 	test-update-unit check-untracked nix-gc lint refresh-image-pins check-image-pins \
 	release-verify \
@@ -60,7 +60,9 @@ help:
 	@echo "  make nix-gc            Soft Nix GC (drop stale build roots; no -d)"
 	@echo "  make clean             Remove out/"
 	@echo "  make keys              Generate local EC test keys under keys/"
-	@echo "  make release           Build + pack + sign + stage a release (out/release-<version>/)"
+	@echo "  make release              Build + pack + sign + stage a release → out/release-<version>/"
+	@echo "  make release-github-beta  Publish the staged/built release to GitHub as a beta (prerelease)"
+	@echo "  make release-github-stable Publish the staged/built release to GitHub as stable"
 	@echo "  make release-verify    Re-verify a staged release set (out/release-<version>/)"
 	@echo "  make dev-httpd-start   Serve ./out over HTTP (Docker busybox, primary-IF only)"
 	@echo "  make dev-httpd-stop    Stop the dev-httpd container"
@@ -91,6 +93,12 @@ build-installer:
 
 release:
 	"$(ROOT)/scripts/release.sh"
+
+release-github-beta:
+	"$(ROOT)/scripts/release-github.sh" beta
+
+release-github-stable:
+	"$(ROOT)/scripts/release-github.sh" stable
 
 release-verify:
 	"$(ROOT)/scripts/release.sh" verify

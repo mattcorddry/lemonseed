@@ -255,16 +255,27 @@ and a box on the stable channel tests the promoted release and keeps it.
 2. **Publish as a beta (prerelease).**
 
    ```bash
-   gh release create "v<version>" out/release-<version>/* \
-     --title "<version>" --notes "<release notes>" --prerelease
+   make release-github-beta
    ```
+
+   The wrapper publishes the staged set (running `make release` first when
+   `VERSION` is unset or the matching `out/release-<version>/` is missing),
+   verifies fail-closed, refuses an already-published version, and generates
+   the notes — a one-sentence summary plus a CHANGELOG-style list built from
+   the commits since the previous release. Pass `RELEASE_NOTES_FILE=<path>` to
+   publish hand-written notes instead, and `RELEASE_NOTES_EXTRA=<text>` to
+   prepend a paragraph to the generated notes.
 
    - The **notes are the changelog** — the control plane surfaces them
      verbatim as "release notes" in the update flow, so write them for the
-     household, not for developers.
+     household, not for developers. Review the generated
+     `out/release-<version>.notes.md` before publishing; edit it and re-run
+     with `RELEASE_NOTES_FILE` if the generated text needs a pass.
    - Asset uploads are resumable-by-retry; a mid-upload `502` leaves an empty
      starter asset that is safe to delete and re-upload. Re-uploading an
      existing filename is a `422` — delete the old asset first.
+   - A **version's bytes are immutable**: if the wrapper refuses because the
+     release already exists, pick a new version rather than re-publishing.
 
 3. **Verify the whole published release.** Download everything published —
    the manifest, its signature, every payload part, and the installer ISO —
