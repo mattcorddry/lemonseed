@@ -33,6 +33,7 @@ import catalog
 import chat_ready
 import data_services
 import hardware
+import hardware_password
 import journal
 import modules
 import owui_policy
@@ -3898,6 +3899,116 @@ UPDATE_JS = r"""
 })();
 """
 
+# The SYSTEM panel's Advanced section (M8 P7): the Hardware password row.
+# Presence is polled; the value crosses the wire only on the audited reveal,
+# shown through the one-dialog component with a selectable field and a Copy
+# button whose execCommand fallback is the working path on plain HTTP (D-45).
+HWPW_JS = r"""
+(function () {
+  'use strict';
+
+  const state = document.getElementById('hwpw-state');
+  const note = document.getElementById('hwpw-note');
+  const revealButton = document.getElementById('hwpw-reveal');
+  const infoButton = document.getElementById('hwpw-info');
+  if (!state || !revealButton || !infoButton) return;
+
+  portalFetch('/_lemonseed/api/hardware-password').then(async (res) => {
+    if (!res.ok) return;
+    const body = await res.json();
+    if (body.stored) {
+      state.textContent = 'stored';
+      revealButton.disabled = false;
+    } else {
+      // D-E6: the plaintext is provisional; when it is absent the row says
+      // so instead of offering a reveal that cannot work.
+      state.textContent = 'not stored';
+      if (note) note.hidden = false;
+      revealButton.disabled = true;
+    }
+  }).catch(() => {});
+
+  infoButton.addEventListener('click', () => {
+    dialogMessage(
+      'Hardware password',
+      'The Hardware password is the appliance machine secret. It opens the '
+      + 'encrypted data storage drive if the trusted platform module is '
+      + 'replaced or erased, and it is the password for the GRUB boot menu and '
+      + 'the appliance console. It is not your login password; regular '
+      + 'accounts sign in through the web portal only.'
+    );
+  });
+
+  function copyText(text) {
+    // navigator.clipboard exists only in a secure context; the portal is
+    // plain HTTP on *.local, so the fallback is the working path (D-45).
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).catch(() => copyFallback(text));
+      return;
+    }
+    copyFallback(text);
+  }
+
+  function copyFallback(text) {
+    const scratch = document.createElement('textarea');
+    scratch.value = text;
+    scratch.setAttribute('readonly', '');
+    scratch.style.position = 'fixed';
+    scratch.style.opacity = '0';
+    document.body.appendChild(scratch);
+    scratch.select();
+    try {
+      document.execCommand('copy');
+    } catch (err) { /* nothing more this browser can do */ }
+    document.body.removeChild(scratch);
+  }
+
+  revealButton.addEventListener('click', async () => {
+    const res = await portalFetch('/_lemonseed/api/hardware-password/reveal',
+      {method: 'POST'});
+    if (!res.ok) return;
+    const body = await res.json();
+    if (!body.stored) {
+      state.textContent = 'not stored';
+      if (note) note.hidden = false;
+      return;
+    }
+    const field = document.createElement('input');
+    field.type = 'text';
+    field.readOnly = true;
+    field.value = body.value;
+    field.autocomplete = 'off';
+    field.style.userSelect = 'all';
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'btn';
+    copy.textContent = 'Copy to clipboard';
+    copy.addEventListener('click', () => {
+      field.focus();
+      field.select();
+      copyText(body.value);
+      copy.textContent = 'Copied';
+    });
+    const row = document.createElement('div');
+    row.className = 'owui-actions';
+    row.appendChild(copy);
+    dialog({
+      title: 'Hardware password',
+      copy: 'Keep this password somewhere safe, away from this computer. It may '
+        + 'be required if the trusted platform module (part of the motherboard) '
+        + 'is replaced or erased; if decryption fails, a reinstall reloads the '
+        + 'password into the TPM.',
+      dismiss: null,
+      actions: [{label: 'Close', kind: 'primary', value: null, primary: true}],
+      build: (api) => {
+        api.body.appendChild(field);
+        api.body.appendChild(row);
+      },
+    });
+  });
+})();
+"""
+
 
 def page_settings_content(snap: dict[str, Any]) -> bytes:
     setup = load_setup()
@@ -4032,6 +4143,15 @@ lights and no network, until someone presses the power button on the box.</p>
 </div>
 <p class="owui-status" id="update-note" hidden></p>
 </section>
+<section class="panel" id="advanced">
+<h2>Advanced</h2>
+<div class="row"><span class="name">Hardware password</span><span class="state" id="hwpw-state">…</span></div>
+<p class="owui-status" id="hwpw-note" hidden>The Hardware password is not stored on the appliance; it was only shown at install time. Keep the copy you wrote down safe.</p>
+<div class="owui-actions">
+<button type="button" id="hwpw-reveal" disabled>Reveal</button>
+<button type="button" id="hwpw-info">What is this?</button>
+</div>
+</section>
 <section class="panel">
 <h2>API</h2>
 <details>
@@ -4116,6 +4236,7 @@ first of them; the others appear here as they become installable.</p>
 <script>{DIALOG_JS}</script>
 <script>{PORTAL_FETCH_JS}</script>
 <script>{UPDATE_JS}</script>
+<script>{HWPW_JS}</script>
 <script>{SETTINGS_JS}</script>
 <script>
 async function refreshChat() {{
@@ -5148,6 +5269,28 @@ class Handler(BaseHTTPRequestHandler):
         audit.record(self._actor() or audit.ACTOR_CP, "appliance", action)
         self._json(202, {"state": "running", "kind": "install"})
 
+    def _handle_hw_password_reveal_post(self) -> None:
+        """POST /_lemonseed/api/hardware-password/reveal — Settings → Advanced.
+
+        The Hardware password is machine-secret (the machine generated it), so
+        the reveal is an admin-gated, audited action like every other secret
+        reveal; the value is masked in logs and audit detail per D-37. A box
+        that never adopted — pre-P7 preserve, or a plaintext dropped under
+        D-E6's revisit — answers ``stored:false`` and the panel degrades to a
+        "not stored" note instead of an error.
+        """
+        value = hardware_password.reveal()
+        if value is None:
+            self._json(200, {"stored": False})
+            return
+        audit.record(
+            self._actor() or audit.ACTOR_CP,
+            "root",
+            "hardware_password.revealed",
+            {"surface": "settings.advanced"},
+        )
+        self._json(200, {"stored": True, "value": value})
+
     def _handle_update_rollback_post(self) -> None:
         """POST /_lemonseed/api/update/rollback — boot the prior slot (M8 P6).
 
@@ -5398,6 +5541,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._handle_update_get()
             return
+        if path == "/_lemonseed/api/hardware-password":
+            # M8 P7: presence only. The value itself crosses the wire only on
+            # the audited POST reveal below — a poll must not leak it.
+            if not self._require_admin():
+                return
+            self._json(200, {"stored": hardware_password.stored_plaintext() is not None})
+            return
         if path == "/_lemonseed/api/profile":
             self._handle_profile_get()
             return
@@ -5647,6 +5797,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._handle_update_post(raw)
             return
+        if path == "/_lemonseed/api/hardware-password/reveal":
+            # M8 P7: the audited admin reveal (Settings → Advanced). The value
+            # crosses the wire only here, never on the presence poll.
+            if not self._require_admin():
+                return
+            self._handle_hw_password_reveal_post()
+            return
         if path == "/_lemonseed/api/update/rollback":
             if not self._require_admin():
                 return
@@ -5775,6 +5932,9 @@ def main() -> None:
     data_services.ensure_provision_worker()
     modules.ensure_module_worker()
     auth.ensure_auth_gate_worker()
+    # M8 P7: adopt the installer's Hardware-password bootstrap (retries until
+    # Postgres is up; a pre-P7 box is an unperturbed no-op).
+    hardware_password.ensure_adopted()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"appliance-control-plane listening on http://{HOST}:{PORT}", flush=True)
     server.serve_forever()

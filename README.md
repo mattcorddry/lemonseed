@@ -85,6 +85,13 @@ The gear icon in the upper right corner opens the Settings panel for your Lemons
 
 Your user profile on Lemonseed can be updated by clicking on the User icon in the upper right corner. Clicking this icon enables you to log out, or to edit your profile. Currently the profile includes your name and password; more settings will be added as the Lemonseed project evolves.
 
+## Security
+
+What Lemonseed does to keep your data safe — signed updates, encrypted data at
+rest, a login method that never sends your password — along with the risks
+that remain and how to mitigate them (for example, setting a BIOS password so
+the PC cannot be booted from other media): see [Security](./documentation/Security.md).
+
 ## Contributing
 
 We welcome contributions to this project! Please review [the documentation](./documentation/README.md) to learn more about how Lemonseed is built, and [our backlog](./documentation/roadmap/BACKLOG.md) for the work ahead of us.

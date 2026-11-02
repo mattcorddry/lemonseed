@@ -8,8 +8,7 @@ We expect to start with 2-3 declared module types, but we reserve the right to a
 | Type | Description |
 | ---- | ----------- |
 | Application | A web based application that is built on top of the core AI foundation. Users would typically interact directly with this application via the Lemonseed web interface; the application would be placed behind our NGINX proxy. |
-| Plugin | These provide a backend capability that can be used by Open-WebUI or other applications. The most common form of plugin would be an MCP endpoint, but we could also build dataset managers (e.g. Wikipedia) or other elements.
-| Connection | Extend the network connectivity of the Lemonseed appliance; the most common example would be a VPN technology such as Tailscale / Headscale or CloudflareD. This is where our future "Cloud" product could plug in. Network egress would also be supported, in case users wanted to enable an outbound PROXY server or public VPN for traffic anonymization. |
+| Plugin | These provide a backend capability that can be used by Open-WebUI or other applications. The most common form of plugin would be an MCP endpoint, but we could also build dataset managers (e.g. Wikipedia) or other elements. |
 
 *Open question: should additional LLMs outside of the Lemonseed base catalog be offered as Modules? Or should we build a separate system for our expanded "LLM Catalog"?*
 
@@ -24,8 +23,8 @@ This is an (incomplete) list of requirements for the module specification and im
 1. Modules must declare a module type (see above)
 1. Modules may declare a lemonseed CP control panel element to enable users to configure parameters for the module; any settings exposed will be passed into the module via environment variables.
 1. Modules must declare a spec version; we will start with v1 as a published spec schema. If we need to make breaking changes, we will introduce v2 while maintaining backward compatibility with v1 based modules.
-1. Modules must be revision controlled in the Lemonseed github; we will not support external module catalogs (at least for now).
-1. Modules must be sandboxed on the Lemonseed appliance, typically via Docker containers, but for the `Connection` type we may introduce other ways to sandbox a module (or allow containers with expanded capabilities).
+1. Module definitions must be revision controlled in the Lemonseed github; we will not support external module catalogs (at least for now). Module contents should be hosted externally. We should define one file per module, which can be built into a single catalog using a simple script to merge all modules (plus integrity checks, etc).
+1. Modules must be sandboxed on the Lemonseed appliance via Docker containers. Modules may request elevated capabilities but may *not* access the `docker.sock` endpoint.
 1. Modules may declare dependencies on core system offerings (e.g. a given module needs Valkey) or other modules (e.g. a given Application module needs an MCP module to be installed). Models may also declare dependencies on specific AI capabilities (e.g. Stable Diffusion) or LLM model families (e.g. Gemma).
 1. Modules may include scripts with execution hooks to enable specific actions to take place on the base Lemonseed (scripts do not run inside the Docker container). Initial script hooks should include:
    * Module install
@@ -35,7 +34,7 @@ This is an (incomplete) list of requirements for the module specification and im
    * User CRUD event
 1. If modules depend on the system Postgres or Valkey, they must provide schema and other parameters to define the database that will be created for them. Lemonseed will then provide the URI and credentials to the database as environment variables to the module docker comtainer.
 1. Modules may require 2+ Docker containers by specifying a `docker-compose.yml` service fragment, which Lemonseed will integrate and manage **(this can be backlogged until we need it)**
-1. Modules must declare any outbound connections or external "cloud" dependencies they have; for example a GMail module would declare a cloud dependency on Google Mail.
+1. Modules must declare any outbound connections or external "cloud" dependencies they have; for example a GMail module would declare a cloud dependency on Google Mail. *Should we require outbound ACLs to be declared for all modules?*
 1. Modules must provide a basic test harness that does not have external dependencies to enable Lemonseed to test all modules against new Lemonseed releases.
 
 ## Module Catalog &amp; Management

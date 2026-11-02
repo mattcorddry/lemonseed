@@ -695,6 +695,16 @@ in
         proxyPass = "http://127.0.0.1:8080";
         extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
+      # Hardware password (M8 P7, D25/D-E6): presence and the audited reveal.
+      # Admin-only at the edge and in the CP, like every other secret surface.
+      locations."= /_lemonseed/api/hardware-password" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
+      locations."= /_lemonseed/api/hardware-password/reveal" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
       # Internal auth_request target (never LAN-facing). The CP verifies the
       # signed session cookie and returns 200 + X-Forwarded-* headers (read via
       # auth_request_set in the gate snippet) or 401.

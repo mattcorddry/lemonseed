@@ -10,9 +10,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import syslog
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -26,7 +28,13 @@ from typing import Any
 # installer and the in-place updater never carry two verifiers (SIGNING.md §5).
 import lemonseed_artifacts
 import lemonseed_verify
-from disks import list_candidate_disks
+from disks import (
+    is_luks,
+    list_candidate_disks,
+    luks_password_unlock,
+    luks_preserved_identity,
+    luks_token_unlock,
+)
 from lemonseed_verify import VerificationError
 from preflight import require_host_ready
 
@@ -79,7 +87,27 @@ ADMIN_ROSTER_REL = Path("@var/lib/lemonseed/admins.json")
 # Same volume, same rule (M8 P3): the updater wrapper and the settings
 # materialization read /var/lib/lemonseed/channel.
 CHANNEL_FILE_REL = Path("@var/lib/lemonseed/channel")
+# --- Encryption (M8 P7, ENCRYPTED-USER-DATA.md §4) ---------------------------
+# The contract mapper (§3.4) is a fixed name because the provisioner's unlock
+# step short-circuits when /dev/mapper/user-data-luks already exists — which is
+# exactly the state the installer hands it in §4.2. LUKS_MAPPER is the
+# cryptsetup name; the node is LUKS_MAPPER_PATH.
+LUKS_MAPPER = "user-data-luks"
+LUKS_MAPPER_PATH = "/dev/mapper/user-data-luks"
+# The CP's bootstrap copy of the Hardware password (§5.1, mode 0600) and the
+# preserved GRUB PBKDF2 the installer re-seats on the ESP (§4.4).
+HARDWARE_PASSWORD_REL = Path("@var/lib/lemonseed/hardware-password")
+GRUB_HARDWARE_PBKDF2_REL = Path("@var/lib/lemonseed/grub-hardware.pbkdf2")
+# GRUB's PBKDF2 is self-describing; 10000 rounds is what grub-mkpasswd-pbkdf2
+# emits. Generated in Python because grub-mkpasswd-pbkdf2 needs a tty.
+HARDWARE_PBKDF2_ITERATIONS = 10000
+# The Hardware password is the non-admin password-reset scheme: four
+# sign-in-code words joined with dashes, drawn from the same curated
+# vocabulary the control plane serves (readable aloud, writable by hand).
+HARDWARE_PASSWORD_WORDS = 4
+WORDLIST_FILE = Path(__file__).resolve().with_name("words-en_US.txt")
 LEMONSEED_ROOT = Path(os.environ.get("LEMONSEED_ROOT", "/etc/lemonseed"))
+PROVISION_SCRIPT = LEMONSEED_ROOT / "appliance-storage-provision.sh"
 REPART_SCRIPT = LEMONSEED_ROOT / "disk-repart.sh"
 RELEASE_SCRIPT = LEMONSEED_ROOT / "disk-release.sh"
 GRUB_CFG = LEMONSEED_ROOT / "grub.cfg"
@@ -119,17 +147,27 @@ def _run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
     Subprocess output (repart, grub-install, amdgpu-kernel-params, …) is
     what we need to diagnose install failures; without this it was only
     visible in the web progress message (last line) or lost entirely.
+    Failures log the command and its output at error level — a failure that
+    only surfaced as a product sentence left nothing to debug.
     """
-    result = subprocess.run(
-        cmd,
-        check=True,
-        text=True,
-        stdout=kwargs.pop("stdout", subprocess.PIPE),
-        stderr=kwargs.pop("stderr", subprocess.STDOUT),
-        **kwargs,
-    )
+    command = " ".join(cmd)
+    _log(syslog.LOG_INFO, f"$ {command}")
+    try:
+        result = subprocess.run(
+            cmd,
+            check=True,
+            text=True,
+            stdout=kwargs.pop("stdout", subprocess.PIPE),
+            stderr=kwargs.pop("stderr", subprocess.STDOUT),
+            **kwargs,
+        )
+    except subprocess.CalledProcessError as exc:
+        for line in (exc.output or "").splitlines():
+            _log(syslog.LOG_ERR, f"$ {command}: {line}")
+        _log(syslog.LOG_ERR, f"$ {command}: failed with exit {exc.returncode}")
+        raise
     for line in (result.stdout or "").splitlines():
-        _log(syslog.LOG_INFO, f"$ {' '.join(cmd)}: {line}")
+        _log(syslog.LOG_INFO, f"$ {command}: {line}")
     return result
 
 
@@ -152,8 +190,17 @@ def artifact_dir() -> Path | None:
     return p if p.is_dir() else None
 
 
-def image_base_url() -> str | None:
-    raw = _cmdline_val("lemonseed.image") or os.environ.get("LEMONSEED_IMAGE_BASE_URL")
+def image_base_url(override: str | None = None) -> str | None:
+    """A --url-style source override, or None (the caller discovers).
+
+    Precedence: the caller's value (the Development channel's typed URL) >
+    lemonseed.image= on the kernel command line > LEMONSEED_IMAGE_BASE_URL.
+    """
+    raw = (
+        (override or "").strip()
+        or _cmdline_val("lemonseed.image")
+        or os.environ.get("LEMONSEED_IMAGE_BASE_URL")
+    )
     return raw.rstrip("/") + "/" if raw else None
 
 
@@ -228,6 +275,69 @@ def user_data_device(disk: str) -> str | None:
         if Path(lv).exists():
             return lv
     return part
+
+
+def _user_data_part(disk: str) -> str | None:
+    """The user-data partition node on ``disk`` (either partlabel spelling)."""
+    parts = parts_on_disk(disk)
+    for label in USER_DATA_PARTLABELS:
+        if parts.get(label):
+            return parts[label]
+    return None
+
+
+def user_data_is_luks(disk: str) -> bool:
+    """True when ``disk``'s user-data partition is a LUKS2 container (P7)."""
+    part = _user_data_part(disk)
+    return bool(part) and is_luks(part or "")
+
+
+def preserved_luks_state(disk: str) -> dict[str, bool]:
+    """Options-page probe: is the target LUKS2, and does its TPM token open it?
+
+    The trial unlock runs here, as soon as preserve mode is confirmed (§4.3):
+    a working token means nothing is asked; a failed one sends the page after
+    the Hardware password (validated by /api/luks-verify) before any install.
+    """
+    part = _user_data_part(disk)
+    if not part or not is_luks(part):
+        return {"luks": False, "unlocked": False}
+    return {"luks": True, "unlocked": luks_token_unlock(part)}
+
+
+def preserved_luks_verify(disk: str, password: str) -> dict[str, Any]:
+    """Validate a candidate Hardware password by trial unlock (§4.3).
+
+    The volume is never left open by this probe; a wrong password is refused
+    with a legible error instead of being discovered mid-install.
+    """
+    part = _user_data_part(disk)
+    if not part or not is_luks(part):
+        return {"ok": True, "luks": False, "error": None}
+    if not luks_password_unlock(part, password):
+        return {
+            "ok": False,
+            "luks": True,
+            "error": (
+                "That Hardware password did not unlock the existing encrypted data "
+                "storage drive. Check the password and try again; nothing on the "
+                "disk was changed."
+            ),
+        }
+    # The password opened the volume — now verify it actually holds a Lemonseed
+    # installation (review: an empty LUKS2 container from a failed install must
+    # not be preserved; the identity write is part of provisioning).
+    if luks_preserved_identity(part, password) is None:
+        return {
+            "ok": False,
+            "luks": True,
+            "error": (
+                "The Hardware password opened the volume, but it does not contain "
+                "a Lemonseed installation. Choose Erase and format instead; "
+                "nothing on the disk was changed."
+            ),
+        }
+    return {"ok": True, "luks": True, "error": None}
 
 
 @contextmanager
@@ -447,12 +557,14 @@ def _urlopen(url: str, timeout: int = 60):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-def fetch_manifest(base: str) -> tuple[dict[str, Any], str]:
+def fetch_manifest(base: str, verify: bool = True) -> tuple[dict[str, Any], str]:
     """Return (manifest, directory URL that contains the artifacts).
 
     The detached signature is verified against the baked trust set before the
     manifest is parsed, so its SHA-256 values are only ever trusted after the
     root of trust holds (M8 P1). Fail-closed: no signature, no manifest.
+    verify=False is the Development channel's explicit contract: the parts
+    are still hash-checked against this manifest, but nothing signs it.
     """
     candidates = [
         base + "manifest.json",
@@ -463,11 +575,14 @@ def fetch_manifest(base: str) -> tuple[dict[str, Any], str]:
         try:
             with _urlopen(url) as resp:
                 manifest_bytes = resp.read()
-            with _urlopen(url + ".sig") as resp:
-                sig_bytes = resp.read()
-            lemonseed_verify.verify_manifest(manifest_bytes, sig_bytes)
-            manifest = json.loads(manifest_bytes.decode("utf-8"))
-            lemonseed_verify.check_signing_metadata(manifest)
+            if verify:
+                with _urlopen(url + ".sig") as resp:
+                    sig_bytes = resp.read()
+                lemonseed_verify.verify_manifest(manifest_bytes, sig_bytes)
+                manifest = json.loads(manifest_bytes.decode("utf-8"))
+                lemonseed_verify.check_signing_metadata(manifest)
+            else:
+                manifest = json.loads(manifest_bytes.decode("utf-8"))
             dir_url = url.rsplit("/", 1)[0] + "/"
             return manifest, dir_url
         except VerificationError as exc:
@@ -573,7 +688,9 @@ def artifact_relpath(manifest: dict[str, Any], key: str) -> tuple[str, str | Non
 
 
 def acquire_artifacts(
-    progress: ProgressFn | None, channel: str | None = None
+    progress: ProgressFn | None,
+    channel: str | None = None,
+    url: str | None = None,
 ) -> tuple[dict[str, Path], str]:
     """Acquire the release set, strictly before anything touches the disk.
 
@@ -582,17 +699,20 @@ def acquire_artifacts(
     ``detail`` — and retry/reboot are safe because nothing was written.
     """
     try:
-        return _acquire_artifacts(progress, channel=channel)
+        return _acquire_artifacts(progress, channel=channel, url=url)
     except lemonseed_artifacts.ArtifactError as exc:
         raise ReleaseSourceError(str(exc)) from exc
 
 
 def _acquire_artifacts(
-    progress: ProgressFn | None, channel: str | None = None
+    progress: ProgressFn | None,
+    channel: str | None = None,
+    url: str | None = None,
 ) -> tuple[dict[str, Path], str]:
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     local = artifact_dir()
     if local:
+        _log(syslog.LOG_INFO, f"download source: local artifacts in {local}")
         _progress(
             progress,
             phase="download",
@@ -635,11 +755,12 @@ def _acquire_artifacts(
         )
         return files, str(manifest.get("version") or "local")
 
-    override = image_base_url()
+    override = image_base_url(url)
     if override:
-        # A lemonseed.image= / LEMONSEED_IMAGE_BASE_URL source override:
-        # production-strict, unchanged (D8).
+        # A Development-channel URL or a lemonseed.image= / env override:
+        # the source is user-supplied, so it must be legible in the journal.
         base = override
+        _log(syslog.LOG_INFO, f"download source: {base}")
         _progress(
             progress,
             phase="download",
@@ -660,14 +781,19 @@ def _acquire_artifacts(
                 f"{lemonseed_artifacts.releases_api_url()}"
             )
         base, tag = resolved
+        _log(syslog.LOG_INFO, f"download source: channel {picked}, release {tag} at {base}")
         _progress(
             progress,
             phase="download",
             message=f"Channel {picked}: release {tag}",
             progress=4,
         )
-    manifest, dir_url = fetch_manifest(base)
+    manifest, dir_url = fetch_manifest(base, verify=channel != "dev")
     version = manifest.get("version", "unknown")
+    _log(
+        syslog.LOG_INFO,
+        f"download: manifest verified for release {version} from {dir_url}",
+    )
     if manifest.get("payload"):
         # Sharded release set over HTTP (or file://) — the P3 channel shape.
         try:
@@ -789,12 +915,297 @@ def partition_disk(
     _progress(progress, phase="partition", message="Partitions ready", progress=55)
 
 
+# --- Encryption (M8 P7, ENCRYPTED-USER-DATA.md §4) --------------------------
+
+
+def _passphrase_stdin(password: str) -> str:
+    """`--key-file=-` uses stdin bytes as the volume key verbatim — no
+    trailing newline is stripped. The key must therefore be exactly the
+    Hardware password, so the keyboard fallback at boot (where the TTY does
+    strip the Enter) and every keyfile agree byte for byte (round-3 bare
+    metal: a mismatch surfaced as cryptenroll EPERM)."""
+    return password
+
+
+@contextmanager
+def _hardware_keyfile(password: str) -> Iterator[str]:
+    """systemd-cryptenroll wants --unlock-key-file=PATH: a 0600 temp file for
+    the enrollment call only, gone as soon as it returns."""
+    fd, name = tempfile.mkstemp(prefix="lemonseed-hw-", suffix=".key")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as keyfile:
+            keyfile.write(password)
+        yield name
+    finally:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+
+
+def _wordlist() -> list[str]:
+    path = WORDLIST_FILE
+    if not path.is_file():
+        # Repo runs (the installer image vendors its copy next to this file):
+        # the vocabulary's canonical home.
+        path = Path(__file__).resolve().parents[1] / "control-plane" / "words-en_US.txt"
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+
+
+def generate_hardware_password() -> str:
+    """Four words from the sign-in-code vocabulary, joined with dashes — the
+    non-admin password-reset scheme (the control plane's OTP), so the password
+    is readable aloud and writable by hand."""
+    words = _wordlist()
+    if len(words) < 2**9:  # the vocabulary floor the control plane enforces
+        raise InstallError("The Hardware password word list is missing or too small")
+    return "-".join(secrets.choice(words) for _ in range(HARDWARE_PASSWORD_WORDS))
+
+
+def make_hardware_pbkdf2(password: str, salt: bytes | None = None) -> str:
+    """GRUB's PBKDF2 for the Hardware password, in the self-describing format
+    grub-mkpasswd-pbkdf2 emits: grub.pbkdf2.sha512.<iters>.<salt>.<digest>.
+    Generated in Python because grub-mkpasswd-pbkdf2 needs a tty."""
+    salt = salt if salt is not None else os.urandom(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha512", password.encode("utf-8"), salt, HARDWARE_PBKDF2_ITERATIONS
+    )
+    return (
+        f"grub.pbkdf2.sha512.{HARDWARE_PBKDF2_ITERATIONS}."
+        f"{salt.hex()}.{digest.hex()}"
+    )
+
+
+def write_hardware_params(grub_dir: Path, pbkdf2: str) -> Path:
+    """The ESP file grub.cfg conditionally sources (§4.4): the superusers/
+    password_pbkdf2 pair guarding GRUB editing and the GRUB console. Written
+    at every install; the ESP survives A/B updates, so the file does too."""
+    params = grub_dir / "hardware-params"
+    params.write_text(
+        f'set superusers="grub"\npassword_pbkdf2 grub {pbkdf2}\n', encoding="utf-8"
+    )
+    return params
+
+
+def read_preserved_pbkdf2(disk: str) -> str:
+    """The preserved volume's GRUB PBKDF2, or '' when absent (a pre-P7 box).
+
+    The reinstall must not invent a password the household does not know
+    (§5.2): on preserve the ESP file is re-seated from the copy the control
+    plane keeps in @var, so it stays in step with the preserved database.
+    """
+    try:
+        with mount_user_data(disk, read_only=True) as root:
+            raw = (root / GRUB_HARDWARE_PBKDF2_REL).read_text(encoding="utf-8").strip()
+    except Exception as exc:  # noqa: BLE001 — affordance read: unreadable means absent
+        _log(syslog.LOG_INFO, f"no preserved GRUB hardware-params on {disk}: {exc}")
+        return ""
+    return raw
+
+
+def seed_hardware_password(disk: str, password: str) -> None:
+    """Seed the CP's bootstrap copy into the encrypted volume's @var (§5.1).
+
+    Deliberately not best-effort: a write that quietly failed would leave the
+    control plane unable to adopt the Hardware password at first boot.
+    """
+    try:
+        with mount_user_data(disk) as root:
+            target = root / HARDWARE_PASSWORD_REL
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(password + "\n", encoding="utf-8")
+            os.chmod(target, 0o600)
+    except (InstallError, OSError) as exc:
+        raise InstallError(
+            "Lemonseed was installed, but the Hardware password was not recorded "
+            f"for the control plane: {exc}"
+        ) from exc
+    _log(syslog.LOG_INFO, f"Hardware password seeded to {target}")
+
+
+def _close_mapper(name: str) -> None:
+    subprocess.run(["cryptsetup", "close", name], capture_output=True, check=False)
+
+
+def _enroll_tpm(part: str, password: str) -> None:
+    """Enroll (or re-enroll) the TPM2 token on the volume. A reinstall reloads
+    the password into the TPM (§4.3); the enrollment authorizes with the
+    Hardware password, since a token that just failed cannot enroll itself."""
+    with _hardware_keyfile(password) as keyfile:
+        _run(
+            [
+                "systemd-cryptenroll",
+                "--tpm2-device=auto",
+                f"--unlock-key-file={keyfile}",
+                part,
+            ]
+        )
+
+
+def prepare_encrypted_user_data(
+    disk_path: str, password: str, progress: ProgressFn | None
+) -> None:
+    """The P7 format step (§4.2), between partition_disk and write_raw.
+
+    Order matters: luksFormat (keyslot 0) → open → enroll the TPM token →
+    PROVE THE SEAL (close, re-open token-only) → run the idempotent provisioner
+    against the open mapper → seed the bootstrap Hardware password into @var →
+    close. A seal that cannot be re-unsealed fails the install here, not at
+    first boot.
+    """
+    part = wait_part(disk_path, "lemonseed-user-data")
+    _progress(
+        progress,
+        phase="encrypt",
+        message="Encrypting the data storage drive",
+        progress=56,
+    )
+    try:
+        _run(
+            [
+                "cryptsetup",
+                "luksFormat",
+                "--type",
+                "luks2",
+                "--key-slot",
+                "0",
+                "--batch-mode",
+                # Positively identifies the volume as Lemonseed's without a
+                # key, so a locked volume can still offer preserve (disks.py).
+                "--label",
+                "lemonseed-user-data",
+                "--key-file=-",
+                part,
+            ],
+            input=_passphrase_stdin(password),
+        )
+        _run(
+            ["cryptsetup", "open", "--key-file=-", part, LUKS_MAPPER],
+            input=_passphrase_stdin(password),
+        )
+    except subprocess.CalledProcessError as exc:
+        raise InstallError(
+            f"Could not encrypt the data storage drive: {_first_line(exc.stdout, str(exc))}"
+        ) from exc
+    try:
+        _enroll_tpm(part, password)
+        # Prove the seal: the token alone must re-open the volume.
+        _run(["cryptsetup", "close", LUKS_MAPPER])
+        _run(["cryptsetup", "open", "--token-only", part, LUKS_MAPPER])
+    except subprocess.CalledProcessError as exc:
+        _close_mapper(LUKS_MAPPER)
+        raise InstallError(
+            "The trusted platform module (TPM) could not be set up to unlock the "
+            "data storage drive automatically, so the appliance would not boot "
+            "unattended. The install cannot continue: "
+            f"{_first_line(exc.stdout, str(exc))}"
+        ) from exc
+    try:
+        if not PROVISION_SCRIPT.is_file():
+            raise InstallError(f"Missing {PROVISION_SCRIPT}")
+        # The provisioner's unlock step short-circuits on the already-open
+        # contract mapper (§3.4) and provisions VG appliance / LV user-data /
+        # btrfs @etc @var while the volume is open.
+        _run(["bash", str(PROVISION_SCRIPT)])
+        seed_hardware_password(disk_path, password)
+    except (InstallError, OSError, subprocess.CalledProcessError) as exc:
+        raise InstallError(
+            "Could not prepare the encrypted data storage drive: "
+            f"{_first_line(getattr(exc, 'stdout', ''), str(exc))}"
+        ) from exc
+    finally:
+        _close_mapper(LUKS_MAPPER)
+    _progress(
+        progress,
+        phase="encrypt",
+        message="Data storage drive encrypted",
+        progress=57,
+    )
+
+
+def _validate_preserved_luks(disk_path: str, hardware_password: str) -> str:
+    """Trial-unlock a preserved LUKS2 volume before the install starts (§4.3).
+
+    Returns "token" or "password" — how the volume will be opened for the
+    reinstall — or "" for a pre-P7 plain volume, which skips everything. A
+    wrong password is refused here, before the disk is touched.
+    """
+    part = _user_data_part(disk_path)
+    if not part or not is_luks(part):
+        return ""
+    if luks_token_unlock(part):
+        return "token"
+    if hardware_password and luks_password_unlock(part, hardware_password):
+        return "password"
+    if hardware_password:
+        raise InstallError(
+            "That Hardware password did not unlock the existing encrypted data "
+            "storage drive. Check the password and try again; the existing user "
+            "data was not touched."
+        )
+    raise InstallError(
+        "This disk's data storage drive is encrypted, and it could not be "
+        "unlocked automatically. Enter the Hardware password to preserve the "
+        "existing user data."
+    )
+
+
+def reopen_preserved_luks(
+    disk_path: str, mode: str, hardware_password: str, progress: ProgressFn | None
+) -> str:
+    """Open the preserved volume for the user-data writes and re-enroll the TPM
+    (§4.3). Returns the preserved GRUB PBKDF2 for seed_esp ('' when absent).
+
+    The volume stays open: the reset-marker and channel writes that follow
+    activate the VG through it, and an open contract mapper is exactly what the
+    appliance's first-boot provisioner expects (§3.4 short-circuit).
+    """
+    part = wait_part(disk_path, "lemonseed-user-data")
+    _progress(
+        progress,
+        phase="partition",
+        message="Unlocking preserved user data",
+        progress=56,
+    )
+    try:
+        if mode == "token":
+            _run(["cryptsetup", "open", "--token-only", part, LUKS_MAPPER])
+        else:
+            _run(
+                ["cryptsetup", "open", "--key-file=-", part, LUKS_MAPPER],
+                input=_passphrase_stdin(hardware_password),
+            )
+    except subprocess.CalledProcessError as exc:
+        raise InstallError(
+            f"Could not unlock the preserved data storage drive: {_first_line(exc.stdout, str(exc))}"
+        ) from exc
+    if hardware_password:
+        try:
+            _enroll_tpm(part, hardware_password)
+            _log(syslog.LOG_INFO, "TPM token re-enrolled on the preserved volume")
+        except (subprocess.CalledProcessError, OSError) as exc:
+            # The volume is open either way; a failed re-enrollment would leave
+            # only the console passphrase for recovery, so say so and stop
+            # rather than shipping a box that cannot reboot unattended (§3.5).
+            raise InstallError(
+                "Could not re-enroll the trusted platform module (TPM) on the "
+                "preserved volume: "
+                f"{_first_line(getattr(exc, 'stdout', ''), str(exc))}"
+            ) from exc
+    return read_preserved_pbkdf2(disk_path)
+
+
 def seed_esp(
     disk: str,
     files: dict[str, Path],
     progress: ProgressFn | None,
     channel: str = "stable",
     version: str = "unknown",
+    hardware_pbkdf2: str = "",
 ) -> None:
     esp = wait_part(disk, "ESP")
     ESP_MOUNT.mkdir(parents=True, exist_ok=True)
@@ -861,6 +1272,11 @@ def seed_esp(
             )
 
         write_channel_stub(grub_dir, channel)
+        if hardware_pbkdf2:
+            # Console lockdown rides the ESP at every install (§4.4): grub.cfg
+            # sources this file, so the updater never needs the plaintext and
+            # the file survives A/B updates untouched.
+            write_hardware_params(grub_dir, hardware_pbkdf2)
 
         # APU iGPU shared memory: write the ttm GRUB stub to the target
         # ESP so the first appliance boot already has the correct GPU/CPU
@@ -922,6 +1338,12 @@ def seed_esp(
                     "Lemonseed",
                 ]
             )
+            # Pin the new entry to the front of BootOrder (D-E3): --create
+            # registers it but says nothing about where it lands, which is
+            # firmware-dependent. The machine's existing entries follow.
+            order = rewrite_boot_order(subprocess.check_output(["efibootmgr"], text=True))
+            if order:
+                _run(["efibootmgr", "-o", order])
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
             # Removable EFI path (BOOTX64.EFI) is already in place.
             _progress(
@@ -942,12 +1364,50 @@ def seed_esp(
             subprocess.run(["umount", str(ESP_MOUNT)], check=False)
 
 
+def rewrite_boot_order(listing: str) -> str | None:
+    """BootOrder with the Lemonseed entry first (D-E3), or None when absent.
+
+    efibootmgr lists entries as 'Boot0003* Lemonseed'; the boot number is the
+    same 4:8 slice the stale-entry cleanup above uses.
+    """
+    order: list[str] = []
+    lemonseed: str | None = None
+    for line in listing.splitlines():
+        if line.startswith("BootOrder:"):
+            order = [n.strip() for n in line.split(":", 1)[1].split(",") if n.strip()]
+        elif line.startswith("Boot") and "Lemonseed" in line:
+            lemonseed = line[4:8]
+    if not lemonseed or not order:
+        return None
+    return ",".join([lemonseed] + [n for n in order if n != lemonseed])
+
+
+# Tools the install pipeline itself needs, checked before anything touches
+# the disk: a missing binary mid-erase is what left a half-installed box
+# behind (M8 P7 bare-metal review). systemd-cryptenroll ships inside systemd,
+# but the PATH check is what proves it is reachable.
+INSTALL_TOOLS = ("cryptsetup", "systemd-cryptenroll", "efibootmgr")
+
+
+def require_install_tools() -> None:
+    missing = [tool for tool in INSTALL_TOOLS if shutil.which(tool) is None]
+    if missing:
+        raise InstallError(
+            "This installer image is incomplete and cannot install Lemonseed "
+            f"(missing: {', '.join(missing)}). Download a fresh installer "
+            "image and try again; nothing has been written to the disk."
+        )
+
+
 def run_install(
     disk_path: str,
     progress: ProgressFn | None = None,
     preserve_user_data: bool = False,
     reset_admin_credentials: bool = False,
     channel: str = "stable",
+    encrypt_user_data: bool = False,
+    hardware_password: str = "",
+    source_url: str | None = None,
 ) -> None:
     _progress(
         progress,
@@ -958,6 +1418,7 @@ def run_install(
         can_reboot=False,
     )
     require_host_ready()
+    require_install_tools()
     disk = _eligible(disk_path)
     _progress(
         progress,
@@ -968,15 +1429,48 @@ def run_install(
         error=None,
         can_reboot=False,
     )
-    files, version = acquire_artifacts(progress, channel=channel)
+    files, version = acquire_artifacts(progress, channel=channel, url=source_url)
     if preserve_user_data and not disk.get("preservable_user_data"):
         raise InstallError("Preserve user data was requested for an unverified disk")
+    # P7 §4.3: validate the preserved LUKS2 volume by trial unlock BEFORE the
+    # install starts — token first, then the Hardware password the options
+    # page collected; a wrong one is refused before the disk is touched.
+    luks_mode = ""
+    if preserve_user_data:
+        luks_mode = _validate_preserved_luks(disk_path, hardware_password)
     partition_disk(disk_path, progress, preserve_user_data=preserve_user_data)
+    hardware_pbkdf2 = ""
+    if preserve_user_data and luks_mode:
+        hardware_pbkdf2 = reopen_preserved_luks(
+            disk_path, luks_mode, hardware_password, progress
+        )
+    elif preserve_user_data:
+        # Pre-P7 plain volume: nothing to unlock (§4.3); re-seat the preserved
+        # GRUB PBKDF2 when @var carries one, and let the grub.cfg guard keep an
+        # absent file bootable (§4.4).
+        hardware_pbkdf2 = read_preserved_pbkdf2(disk_path)
+    else:
+        # Fresh install, encrypted or not (§5): the Hardware password was
+        # generated and presented on the options page; here the choice is
+        # committed. An absent one (API misuse) is still generated, so the
+        # console lockdown is uniform — but nobody will have written it down.
+        password = hardware_password or generate_hardware_password()
+        hardware_pbkdf2 = make_hardware_pbkdf2(password)
+        if encrypt_user_data:
+            prepare_encrypted_user_data(disk_path, password, progress)
     root_a = wait_part(disk_path, "root-a")
     _progress(progress, phase="write", message="Writing system image to root-a", progress=58)
     write_raw(files["root.squashfs"], root_a, progress, 58, 84)
     _progress(progress, phase="write", message="System image written", progress=85)
-    seed_esp(disk_path, files, progress, channel=channel, version=version)
+    persist_channel = channel if channel in ("stable", "beta") else "stable"
+    seed_esp(
+        disk_path,
+        files,
+        progress,
+        channel=persist_channel,
+        version=version,
+        hardware_pbkdf2=hardware_pbkdf2,
+    )
     # The slot-version registry seeds the rollback verb and the boot-menu
     # labels (M8 P6, D30): slot a is the release just installed. Best-effort —
     # a failed write is logged, and the first update re-records both slots.
@@ -1034,8 +1528,8 @@ def run_install(
         # does not exist until the first-boot provisioner runs. A failed write
         # fails the install: a silently flipped channel contradicts an
         # explicit choice, the same standard the reset marker is held to.
-        if channel != "stable":
-            apply_channel_file(disk_path, channel)
+        if persist_channel != "stable":
+            apply_channel_file(disk_path, persist_channel)
     _progress(
         progress,
         phase="await_usb",

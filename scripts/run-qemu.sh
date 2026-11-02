@@ -72,8 +72,36 @@ fi
 MEM="${QEMU_MEM:-2048}"
 SMP="${QEMU_SMP:-2}"
 
+# M8 P7: swtpm so the appliance's TPM token path is exercisable in QEMU.
+# State persists under out/qemu-tpm/ until make clean (which removes all of
+# out/); the broken-seal test paths delete just this directory. Swtpm is
+# optional — absent, the VM boots with the plain (no-TPM) storage path.
+TPM_ARGS=""
+TPM_DIR="${QEMU_TPM_DIR:-${ROOT}/out/qemu-tpm}"
+if command -v swtpm >/dev/null 2>&1; then
+  mkdir -p "${TPM_DIR}"
+  swtpm socket \
+    --dir "${TPM_DIR}" \
+    --tpm2 \
+    --daemon \
+    --pidfile "${TPM_DIR}/swtpm.pid" \
+    --server type=unixio,path="${TPM_DIR}/swtpm.sock" \
+    --ctrl type=unixio,path="${TPM_DIR}/swtpm-ctrl.sock" \
+    --logfile "${TPM_DIR}/swtpm.log" \
+    >/dev/null 2>&1
+  if [[ ! -S "${TPM_DIR}/swtpm.sock" ]]; then
+    echo "==> warning: swtpm did not start; continuing without TPM" >&2
+  else
+    echo "==> TPM: swtpm state in ${TPM_DIR} (persisted until make clean)"
+    TPM_ARGS='-chardev socket,id=tpm-sock,path='"${TPM_DIR}"'/swtpm.sock'
+    TPM_ARGS="${TPM_ARGS} -tpmdev emulator,id=tpm0,chardev=tpm-sock"
+    TPM_ARGS="${TPM_ARGS} -device tpm-crb,tpmdev=tpm0"
+  fi
+fi
+
 echo "==> Booting ${ARTIFACT_DIR} (serial console, Ctrl-A X to exit)"
 echo "==> User-data disk: ${USERDATA_IMG}"
+# shellcheck disable=SC2086
 exec "${QEMU_BIN}" \
   -machine q35 \
   -m "${MEM}" \
@@ -82,6 +110,7 @@ exec "${QEMU_BIN}" \
   -no-reboot \
   -netdev user,id=net0 \
   -device virtio-net-pci,netdev=net0 \
+  ${TPM_ARGS} \
   -kernel "${VMLINUZ}" \
   -initrd "${INITRD}" \
   -drive "file=${SQUASHFS},format=raw,if=virtio,readonly=on" \

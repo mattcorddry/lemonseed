@@ -33,6 +33,13 @@
   # Keep a meaningful closure name now that networking.hostName is empty.
   system.name = "lemonseed";
 
+  # No oomd: NixOS enables it by default, but the appliance runs a fixed
+  # workload whose LLM inference legitimately drives high memory and some
+  # pressure — oomd's pressure-based kills would take down lemond/OWUI
+  # mid-generation (observed on other boxes). Under real exhaustion the
+  # kernel OOM killer plus the CP's supervisor is the recovery path.
+  systemd.oomd.enable = false;
+
   # Keep the base image small and read-only oriented.
   # Console module enables empty-password root on tty2 for bring-up/debug.
   users.mutableUsers = false;

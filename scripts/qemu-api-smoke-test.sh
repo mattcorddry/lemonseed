@@ -708,7 +708,22 @@ print("OK: one account exists (%s, admin); first_admin agrees" % sys.argv[3])
 ' "${M7_USER}" "${M7_ADMIN2}" "${ADMIN_USERNAME}"
 
 echo "==> Checking /api/boot"
-boot_json="$(poll_http "/api/boot" 30)"
+# The handler probes systemctl/docker, which queue behind PID1 while the
+# smoke profile loads the Open WebUI image (minutes under TCG) — so a single
+# 30 s attempt can time out for load reasons alone. Poll within the budget
+# like /api/data below.
+boot_json=""
+boot_deadline=$(( SECONDS + 240 ))
+while (( SECONDS < boot_deadline )); do
+  if candidate="$(poll_http "/api/boot" 30 2>/dev/null)"; then
+    boot_json="${candidate}"
+    break
+  fi
+  sleep 2
+done
+if [[ -z "${boot_json}" ]]; then
+  boot_json="$(poll_http "/api/boot" 30)"  # surface the real curl error
+fi
 echo "${boot_json}" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
@@ -919,7 +934,7 @@ if [[ -z "${svc_id}" || "${owui_user_id}" == "${svc_id}" ]]; then
 fi
 echo "OK: portal admin signed into OWUI as its own user (id=${owui_user_id}, service account id=${svc_id})"
 
-owui_export="$(curl -fsS --max-time 20 -b "${COOKIE_JAR}" \
+owui_export="$(curl -fsS --max-time 60 -b "${COOKIE_JAR}" \
   --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
   -H "Authorization: Bearer ${owui_token}" \
   "http://${AUTH_HOST}:${HOST_PORT}/api/v1/configs/export")"
@@ -947,12 +962,12 @@ elif [[ "${export_rc}" -eq 3 ]]; then
   # First run after the flip: plant the marker through the API so the next
   # run (new VM boot, recreated container) can prove DB persistence.
   echo "==> Marker absent: planting ${marker_key} via configs/import (first post-flip run)"
-  curl -fsS --max-time 20 -b "${COOKIE_JAR}" \
+  curl -fsS --max-time 60 -b "${COOKIE_JAR}" \
     --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
     -H "Authorization: Bearer ${owui_token}" -H 'Content-Type: application/json' \
     -X POST "http://${AUTH_HOST}:${HOST_PORT}/api/v1/configs/import" \
     -d "{\"config\":{\"${marker_key}\":\"${marker_value}\"}}" >/dev/null
-  owui_export="$(curl -fsS --max-time 20 -b "${COOKIE_JAR}" \
+  owui_export="$(curl -fsS --max-time 60 -b "${COOKIE_JAR}" \
     --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
     -H "Authorization: Bearer ${owui_token}" \
     "http://${AUTH_HOST}:${HOST_PORT}/api/v1/configs/export")"
@@ -1016,7 +1031,7 @@ cat /tmp/qemu-owui-policy.err >&2 || true
 echo "OK: owui_policy gate ok (manifest v1 reconciled; key minted; LKG written)"
 
 echo "==> OWUI policy drift: export must show web.search.enable=False (this boot's at_boot reconcile)"
-printf '%s' "$(curl -fsS --max-time 20 -b "${COOKIE_JAR}" \
+printf '%s' "$(curl -fsS --max-time 60 -b "${COOKIE_JAR}" \
   --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
   -H "Authorization: Bearer ${owui_token}" \
   "http://${AUTH_HOST}:${HOST_PORT}/api/v1/configs/export")" | python3 -c '
@@ -1388,7 +1403,7 @@ assert body.get("ok") is True, body
   echo "" >&2
   exit 1
 fi
-curl -fsS --max-time 20 -b "${COOKIE_JAR}" \
+curl -fsS --max-time 60 -b "${COOKIE_JAR}" \
   --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
   -H "Authorization: Bearer ${owui_token}" \
   "http://${AUTH_HOST}:${HOST_PORT}/api/v1/configs/export" | python3 -c '
@@ -1403,12 +1418,12 @@ print("OK: UI refused on direct/ollama/openai, CP re-applied all three a moment 
 '
 
 echo "==> OWUI policy drift: flipping web.search.enable=true out-of-band (admin API)"
-curl -fsS --max-time 20 -b "${COOKIE_JAR}" \
+curl -fsS --max-time 60 -b "${COOKIE_JAR}" \
   --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
   -H "Authorization: Bearer ${owui_token}" -H 'Content-Type: application/json' \
   -X POST "http://${AUTH_HOST}:${HOST_PORT}/api/v1/configs/import" \
   -d '{"config":{"web.search.enable":true}}' >/dev/null
-curl -fsS --max-time 20 -b "${COOKIE_JAR}" \
+curl -fsS --max-time 60 -b "${COOKIE_JAR}" \
   --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
   -H "Authorization: Bearer ${owui_token}" \
   "http://${AUTH_HOST}:${HOST_PORT}/api/v1/configs/export" | python3 -c '
@@ -1476,7 +1491,7 @@ sys.exit(1)
     # A write reconcile (boot/CP restart/slot change) legitimately reverted
     # the flip and re-armed the audit timer; re-assert the out-of-band value.
     echo "  (write reconcile reverted the flip; re-flipping)" >&2
-    curl -fsS --max-time 20 -b "${COOKIE_JAR}" \
+    curl -fsS --max-time 60 -b "${COOKIE_JAR}" \
       --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
       -H "Authorization: Bearer ${owui_token}" -H 'Content-Type: application/json' \
       -X POST "http://${AUTH_HOST}:${HOST_PORT}/api/v1/configs/import" \
@@ -1605,7 +1620,7 @@ print(token)
 # Cross-phase check: the truncate must have removed the Phase-2 marker (proof it
 # hit the right table), then re-planting it must work (proof the rebuilt config
 # is writable), so the next run's persistence assertion still means something.
-curl -fsS --max-time 20 -b "${COOKIE_JAR}" \
+curl -fsS --max-time 60 -b "${COOKIE_JAR}" \
   --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
   -H "Authorization: Bearer ${owui_token}" \
   "http://${AUTH_HOST}:${HOST_PORT}/api/v1/configs/export" | python3 -c '
@@ -1628,12 +1643,12 @@ assert isinstance(urls, list) and len(urls) == 1, \
 }
 echo "OK: reset cleared the table and the manifest re-applied every managed key"
 
-curl -fsS --max-time 20 -b "${COOKIE_JAR}" \
+curl -fsS --max-time 60 -b "${COOKIE_JAR}" \
   --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
   -H "Authorization: Bearer ${owui_token}" -H 'Content-Type: application/json' \
   -X POST "http://${AUTH_HOST}:${HOST_PORT}/api/v1/configs/import" \
   -d "{\"config\":{\"${marker_key}\":\"${marker_value}\"}}" >/dev/null
-curl -fsS --max-time 20 -b "${COOKIE_JAR}" \
+curl -fsS --max-time 60 -b "${COOKIE_JAR}" \
   --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
   -H "Authorization: Bearer ${owui_token}" \
   "http://${AUTH_HOST}:${HOST_PORT}/api/v1/configs/export" | python3 -c '

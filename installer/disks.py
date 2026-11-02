@@ -25,6 +25,171 @@ VG_NAME = "appliance"
 LV_NAME = "user-data"
 STORAGE_IDENTITY = ".lemonseed-storage.json"
 
+# --- Encryption preflight (M8 P7, ENCRYPTED-USER-DATA.md §4.1) --------------
+# TPM is required for encryption, not for the install: a usable TPM 2.0 means
+# the checkbox is offered ticked by default, and its absence just degrades the
+# offer. A trial seal is proven by opening the kernel's TPM resource manager —
+# the cheapest probe that proves /dev/tpmrm0 actually works, not just exists.
+TPM_SYSFS = Path("/sys/class/tpm/tpm0")
+TPM_RM = Path("/dev/tpmrm0")
+ENCRYPT_WARNING = (
+    "This PC has no trusted platform module (TPM), so Lemonseed cannot encrypt "
+    "the data storage drive. You can still install in unencrypted mode."
+)
+# Throwaway mapper for trial unlocks: never the contract name, so a probe can
+# never collide with (or be mistaken for) the install's own volume.
+LUKS_LABEL = "lemonseed-user-data"
+TRIAL_MAPPER = "lemonseed-trial"
+
+
+def tpm2_available() -> bool:
+    """True when a TPM 2.0 is present AND /dev/tpmrm0 can actually be opened.
+
+    ``/sys/class/tpm/tpm0`` alone is not enough: the resource-manager device is
+    what cryptsetup/systemd-cryptenroll talk to, and a BIOS-disabled TPM still
+    shows the sysfs node on some firmware. Opening it is the trial seal.
+    """
+    if not TPM_SYSFS.is_dir() or not TPM_RM.exists():
+        return False
+    try:
+        fd = os.open(TPM_RM, os.O_RDWR | os.O_CLOEXEC)
+    except OSError:
+        return False
+    os.close(fd)
+    return True
+
+
+def encryption_offer(tpm: bool) -> dict[str, Any]:
+    """The options-page checkbox state that follows from TPM usability.
+
+    Tickable by default when a usable TPM is present (the user may still untick
+    it — a VM whose host volume is already encrypted, for instance) and greyed
+    out with the exact warning copy otherwise.
+    """
+    return {
+        "available": bool(tpm),
+        "enabled": bool(tpm),
+        "checked": bool(tpm),
+        "warning": "" if tpm else ENCRYPT_WARNING,
+    }
+
+
+def is_luks(part: str) -> bool:
+    """True when ``part`` carries a LUKS header (the P7 user-data shape)."""
+    try:
+        proc = subprocess.run(
+            ["cryptsetup", "isLuks", part], capture_output=True, check=False
+        )
+    except OSError:
+        return False
+    return proc.returncode == 0
+
+
+def _close_mapper(name: str) -> None:
+    subprocess.run(["cryptsetup", "close", name], capture_output=True, check=False)
+
+
+def luks_label(part: str) -> str:
+    """The LUKS2 header label, readable without any key (luksDump). Empty when
+    absent or unreadable — the installer stamps it at format time so a locked
+    volume can be positively identified as Lemonseed's."""
+    out = _run_text(["cryptsetup", "luksDump", part])
+    for line in out.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("label:"):
+            return stripped.split(":", 1)[1].strip().lower()
+    return ""
+
+
+def luks_token_unlock(part: str) -> bool:
+    """Trial-unlock ``part`` by its TPM token against a throwaway mapper.
+
+    Always closes again: this answers "does the seal work?", it does not hold
+    the volume. A failed trial (TPM absent, replaced, erased, PCR drift) is
+    what sends the options page after the Hardware password (§4.3).
+    """
+    # --token-only, not --tpm2-device: the latter is a systemd-cryptsetup
+    # option and plain cryptsetup refuses it (round-4 bare-metal finding).
+    try:
+        proc = subprocess.run(
+            ["cryptsetup", "open", "--token-only", part, TRIAL_MAPPER],
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    if proc.returncode != 0:
+        _close_mapper(TRIAL_MAPPER)
+        return False
+    _close_mapper(TRIAL_MAPPER)
+    return True
+
+
+def luks_password_unlock(part: str, password: str) -> bool:
+    """Trial-unlock ``part`` with a candidate Hardware password; always closes."""
+    try:
+        proc = subprocess.run(
+            ["cryptsetup", "open", "--key-file=-", part, TRIAL_MAPPER],
+            input=password,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    if proc.returncode != 0:
+        _close_mapper(TRIAL_MAPPER)
+        return False
+    return True
+
+
+def luks_preserved_identity(part: str, password: str) -> dict[str, Any] | None:
+    """Trial-unlock ``part`` with the Hardware password and read the storage
+    identity off its btrfs LV (§4.3). The content check behind the preserve
+    offer: an empty LUKS2 container — say, from a failed previous install —
+    opens with a perfectly good password yet preserves nothing. Always closes
+    everything again; None means "cannot preserve", for any reason."""
+    try:
+        proc = subprocess.run(
+            ["cryptsetup", "open", "--key-file=-", part, TRIAL_MAPPER],
+            input=password,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        _close_mapper(TRIAL_MAPPER)
+        return None
+    try:
+        subprocess.run(["vgchange", "-ay", VG_NAME], check=False, capture_output=True)
+        lv_path = _run_text(["lvs", "--noheadings", "-o", "lv_path", f"{VG_NAME}/{LV_NAME}"])
+        if not lv_path:
+            return None
+        with tempfile.TemporaryDirectory(prefix="lemonseed-inspect-") as mountpoint:
+            mounted = subprocess.run(
+                ["mount", "-t", "btrfs", "-o", "ro,subvolid=5", lv_path, mountpoint],
+                check=False,
+                capture_output=True,
+            ).returncode == 0
+            if not mounted:
+                return None
+            try:
+                identity = json.loads(
+                    (Path(mountpoint) / STORAGE_IDENTITY).read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                return None
+            finally:
+                subprocess.run(["umount", mountpoint], check=False, capture_output=True)
+        if identity.get("format") == "lemonseed-storage-v1" and identity.get("vg") == VG_NAME:
+            return identity
+        return None
+    finally:
+        subprocess.run(["vgchange", "-an", VG_NAME], check=False, capture_output=True)
+        _close_mapper(TRIAL_MAPPER)
+
 
 def _read(path: Path) -> str:
     try:
@@ -191,14 +356,37 @@ def _preservable_user_data(node: dict[str, Any]) -> dict[str, Any] | None:
         ):
             continue
 
-        pv = _run_text(
-            ["pvs", "--noheadings", "--separator=|", "-o", "pv_name,vg_name,vg_tags", part_path]
-        )
-        fields = [field.strip() for field in pv.split("|")]
-        if len(fields) != 3 or Path(fields[0]).resolve() != Path(part_path).resolve():
-            continue
-        if fields[1] != VG_NAME or STORAGE_TAG not in fields[2].split(","):
-            continue
+        size = int(part.get("size") or 0)
+        # P7: the PV may now live inside a LUKS2 container (§4.3). Preserve
+        # stays possible when the TPM token unlocks it; when it does not, the
+        # summary still offers preserve — the options page collects the
+        # Hardware password and the install validates it before touching the
+        # disk — but the identity below could not be re-verified unlocked.
+        # A locked volume is only positively identified as Lemonseed's by the
+        # LUKS2 label the installer stamps at format time; anything else (an
+        # empty container from a failed install, a foreign volume) leaves
+        # preserve greyed out — we could not examine the contents to know a
+        # Lemonseed install is even there.
+        luks = is_luks(part_path)
+        if luks:
+            if not luks_token_unlock(part_path):
+                if luks_label(part_path) != LUKS_LABEL:
+                    return None
+                return {
+                    "storage_uuid": None,
+                    "size_bytes": size,
+                    "luks": True,
+                    "locked": True,
+                }
+        else:
+            pv = _run_text(
+                ["pvs", "--noheadings", "--separator=|", "-o", "pv_name,vg_name,vg_tags", part_path]
+            )
+            fields = [field.strip() for field in pv.split("|")]
+            if len(fields) != 3 or Path(fields[0]).resolve() != Path(part_path).resolve():
+                continue
+            if fields[1] != VG_NAME or STORAGE_TAG not in fields[2].split(","):
+                continue
 
         # Activating the verified target briefly lets us validate the LV,
         # filesystem and top-level btrfs identity. Always deactivate again.
@@ -237,10 +425,14 @@ def _preservable_user_data(node: dict[str, Any]) -> dict[str, Any] | None:
             ):
                 return {
                     "storage_uuid": identity.get("storage_uuid"),
-                    "size_bytes": int(part.get("size") or 0),
+                    "size_bytes": size,
+                    "luks": luks,
+                    "locked": False,
                 }
         finally:
             subprocess.run(["vgchange", "-an", VG_NAME], check=False, capture_output=True)
+            if luks:
+                _close_mapper(TRIAL_MAPPER)
     return None
 
 

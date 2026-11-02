@@ -18,12 +18,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from disks import list_candidate_disks, pick_default
+from disks import encryption_offer, list_candidate_disks, pick_default, tpm2_available
 from install import (
     InstallError,
     ReleaseSourceError,
     attach_admin_rosters,
+    generate_hardware_password,
     image_base_url,
+    preserved_luks_state,
+    preserved_luks_verify,
     run_install,
 )
 from preflight import MIN_DISK_BYTES, evaluate_host
@@ -60,7 +63,13 @@ def get_state() -> dict[str, Any]:
 
 
 def install_worker(
-    disk_path: str, preserve_user_data: bool, reset_admin_credentials: bool, channel: str
+    disk_path: str,
+    preserve_user_data: bool,
+    reset_admin_credentials: bool,
+    channel: str,
+    encrypt_user_data: bool = False,
+    hardware_password: str = "",
+    source_url: str | None = None,
 ) -> None:
     def progress(**kwargs: Any) -> None:
         _set(**kwargs)
@@ -72,6 +81,9 @@ def install_worker(
             preserve_user_data=preserve_user_data,
             reset_admin_credentials=reset_admin_credentials,
             channel=channel,
+            encrypt_user_data=encrypt_user_data,
+            hardware_password=hardware_password,
+            source_url=source_url,
         )
     except InstallError as exc:
         # ReleaseSourceError means nothing touched the disk: the product
@@ -102,10 +114,16 @@ def start_install(
     preserve_user_data: bool,
     reset_admin_credentials: bool = False,
     channel: str = "stable",
+    encrypt_user_data: bool = False,
+    hardware_password: str = "",
+    source_url: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     # Only meaningful with preserve (fresh installs create the first admin at
     # /setup anyway; a marker on a fresh box would be noise).
     reset_admin_credentials = reset_admin_credentials and preserve_user_data
+    # Encryption is a fresh-install choice: a preserve keeps whatever volume
+    # the box already has (§4.3), and only a usable TPM may turn the offer on.
+    encrypt_user_data = encrypt_user_data and not preserve_user_data and tpm2_available()
     with _lock:
         if _state["phase"] not in ("idle", "error", "await_usb"):
             return 409, {"error": "install already in progress", "state": dict(_state)}
@@ -119,13 +137,22 @@ def start_install(
                 "disk": {"path": disk_path},
                 "preserve_user_data": preserve_user_data,
                 "reset_admin_credentials": reset_admin_credentials,
+                "encrypt_user_data": encrypt_user_data,
                 "can_reboot": False,
                 "version": None,
             }
         )
     threading.Thread(
         target=install_worker,
-        args=(disk_path, preserve_user_data, reset_admin_credentials, channel),
+        args=(
+            disk_path,
+            preserve_user_data,
+            reset_admin_credentials,
+            channel,
+            encrypt_user_data,
+            hardware_password,
+            source_url,
+        ),
         daemon=True,
     ).start()
     return 202, {"ok": True, "state": get_state()}
@@ -211,30 +238,33 @@ INDEX_HTML = """<!DOCTYPE html>
     <section id="disk-panel" class="panel">
       <h2>Target disk</h2>
       <div id="disks" class="disks"></div>
-      <div id="channel-row">
-        <span>
-          <strong>Release channel</strong>
-          <small>Beta gets new builds first, including support for brand-new hardware. You can change it later in Settings.</small>
-        </span>
-        <label class="channel-option">
-          <input type="radio" name="channel" value="stable" checked />
-          <span>Stable — the default for most homes</span>
-        </label>
-        <label class="channel-option">
-          <input type="radio" name="channel" value="beta" />
-          <span>Beta — newer, less tested</span>
-        </label>
+      <div id="channel-row" class="settings-rows">
+        <div class="row"><span class="name">Release channel</span><span class="state"><select id="install-channel"><option value="stable">Stable</option><option value="beta">Beta</option><option value="dev">Development</option></select></span></div>
       </div>
-      <label id="preserve-row" class="preserve hidden">
-        <input id="preserve-user-data" type="checkbox" checked />
+      <label id="preserve-row" class="preserve">
+        <input id="preserve-radio" type="radio" name="install-mode" value="preserve" checked />
         <span>
           <strong>Preserve existing user information on this appliance</strong>
           <small>Keep chats, settings, workers, and downloaded models. Lemonseed system software will be replaced.</small>
-          <span id="reset-admin-row" class="preserve nested hidden">
+          <span id="reset-admin-row" class="preserve nested">
             <input id="reset-admin" type="checkbox" />
             <span>
               <strong>Reset admin credentials</strong>
               <small id="reset-admin-copy">Ask for a new admin account after reinstall. Other users and their data are kept.</small>
+            </span>
+          </span>
+        </span>
+      </label>
+      <label id="erase-row" class="preserve">
+        <input id="erase-radio" type="radio" name="install-mode" value="erase" />
+        <span>
+          <strong>Erase and format this drive for Lemonseed</strong>
+          <small>Everything on this disk will be erased, including any operating system and files that are not part of Lemonseed.</small>
+          <span id="encrypt-row" class="preserve nested">
+            <input id="encrypt-user-data" type="checkbox" checked />
+            <span>
+              <strong>Enable encryption</strong>
+              <small id="encrypt-warning" class="hidden"></small>
             </span>
           </span>
         </span>
@@ -264,6 +294,50 @@ INDEX_HTML = """<!DOCTYPE html>
         <button id="err-reboot" class="cta">Reboot</button>
       </div>
     </section>
+
+    <div id="dev-dialog" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="dev-title">
+      <div class="modal-card">
+        <h2 id="dev-title">Development channel</h2>
+        <p class="hw-copy">
+          Development channel: Enter the URL to a development build of
+          Lemonseed. This will not validate release signatures and should only
+          be used by developers.
+        </p>
+        <input id="dev-url" class="hw-input" type="url"
+               placeholder="http://host:port/release-YYYYMMDD.NN/"
+               autocomplete="off" autocapitalize="off" spellcheck="false" />
+        <p id="dev-error" class="err hidden"></p>
+        <div class="modal-actions">
+          <button id="dev-cancel" type="button">Cancel</button>
+          <button id="dev-ok" type="button" class="cta">Use this URL</button>
+        </div>
+      </div>
+    </div>
+    <div id="hw-dialog" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="hw-title">
+      <div class="modal-card">
+        <h2 id="hw-title">Hardware password</h2>
+        <p id="hw-value" class="hw-secret"></p>
+        <input id="hw-input" class="hw-input hidden" type="text"
+               autocomplete="off" autocapitalize="off" spellcheck="false" />
+        <p id="hw-explainer" class="hw-copy">
+          The hardware password is used to protect the Lemonseed from unwanted
+          physical access. When the drive is encrypted, the hardware password is
+          the key. The hardware password can also be used for local diagnostic
+          access to the appliance.
+        </p>
+        <p id="hw-explainer-2" class="hw-copy">
+          Save this password to your password manager of choice, or write it
+          down and keep it somewhere hidden. You may need it if the Lemonseed
+          loses the drive encryption key (such as a motherboard replacement).
+        </p>
+        <p id="hw-error" class="err hidden"></p>
+        <div class="modal-actions">
+          <button id="hw-copy" type="button">Copy</button>
+          <button id="hw-regen" type="button">Generate again</button>
+          <button id="hw-continue" type="button" class="cta">Continue</button>
+        </div>
+      </div>
+    </div>
   </main>
   <script src="/static/app.js"></script>
 </body>
@@ -314,6 +388,9 @@ class Handler(BaseHTTPRequestHandler):
                     "image_base": IMAGE_BASE,
                     "preflight": host,
                     "min_disk_bytes": MIN_DISK_BYTES,
+                    # The D-E1 offer: ticked when a usable TPM is present,
+                    # greyed out with the exact warning copy otherwise.
+                    "encryption": encryption_offer(tpm2_available()),
                 },
             )
             return
@@ -359,6 +436,27 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self._json(400, {"error": "invalid json"})
             return
+        if path == "/api/password":
+            # A fresh draw for the reveal dialog; the choice only becomes
+            # real when the install POST carries it back (no rotation exists
+            # post-install, D27, so regenerating is only free before that).
+            self._json(200, {"hardware_password": generate_hardware_password()})
+            return
+        if path == "/api/luks":
+            disk = body.get("disk") or ""
+            if not disk:
+                self._json(400, {"error": "disk required"})
+                return
+            self._json(200, preserved_luks_state(disk))
+            return
+        if path == "/api/luks-verify":
+            disk = body.get("disk") or ""
+            password = str(body.get("password") or "")
+            if not disk or not password:
+                self._json(400, {"error": "disk and password required"})
+                return
+            self._json(200, preserved_luks_verify(disk, password))
+            return
         if path == "/api/install":
             disk = body.get("disk") or ""
             if not disk:
@@ -367,11 +465,30 @@ class Handler(BaseHTTPRequestHandler):
             preserve_user_data = bool(body.get("preserve_user_data"))
             reset_admin_credentials = bool(body.get("reset_admin_credentials"))
             channel = body.get("channel") or "stable"
-            if channel not in ("stable", "beta"):
-                self._json(400, {"error": "channel must be stable or beta"})
+            if channel not in ("stable", "beta", "dev"):
+                self._json(400, {"error": "channel must be stable, beta or dev"})
                 return
+            # Development installs fetch from a URL the user types (a LAN dev
+            # server, a file server, a staging bucket): an explicit, opt-in
+            # override so no private host name is ever baked into a published
+            # ISO — the default discovery path knows only GitHub.
+            source_url = str(body.get("source_url") or "").strip()
+            if channel == "dev" and not source_url:
+                self._json(400, {"error": "source_url is required for the development channel"})
+                return
+            if channel != "dev" and source_url:
+                self._json(400, {"error": "source_url only applies to the development channel"})
+                return
+            encrypt_user_data = bool(body.get("encrypt_user_data"))
+            hardware_password = str(body.get("hardware_password") or "")
             code, payload = start_install(
-                disk, preserve_user_data, reset_admin_credentials, channel=channel
+                disk,
+                preserve_user_data,
+                reset_admin_credentials,
+                channel=channel,
+                source_url=source_url or None,
+                encrypt_user_data=encrypt_user_data,
+                hardware_password=hardware_password,
             )
             self._json(code, payload)
             return

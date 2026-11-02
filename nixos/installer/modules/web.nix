@@ -32,6 +32,7 @@ let
       bash
       grub2_efi
       efibootmgr
+      cryptsetup # luksFormat/open + TPM2 token unlock (M8 P7)
       cacert
     ];
     text = ''
@@ -82,6 +83,7 @@ in
       efibootmgr
       gnused
       gawk
+      cryptsetup # luksFormat/open + TPM2 token unlock (M8 P7)
     ];
     serviceConfig = {
       Type = "simple";
@@ -96,6 +98,9 @@ in
         "LEMONSEED_REPART_DIR=/var/lib/lemonseed/repart.d"
         "LEMONSEED_RELEASE_KEYS_DIR=${releaseKeys}"
         "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+        # cryptsetup dlopens the systemd TPM2 token plugin to prove the seal
+        # (M8 P7); the plugin ships beside systemd, off cryptsetup's search path.
+        "LD_LIBRARY_PATH=${pkgs.systemd}/lib/cryptsetup"
       ];
     };
   };

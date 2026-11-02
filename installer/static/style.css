@@ -127,6 +127,132 @@ html, body {
   border-radius: 0;
 }
 .preserve.nested.off { opacity: 0.45; pointer-events: none; }
+/* The encryption offer follows the same nested-option grammar: greyed out
+   unless erase-and-format is the selected mode — a preserve keeps the volume
+   the box already has. */
+#encrypt-row.off { opacity: 0.45; pointer-events: none; }
+#encrypt-warning { color: var(--warn-ink); }
+
+/* Version rows + channel select: the settings page's row grammar, so the
+   installer reads like the portal's General panel. */
+.settings-rows {
+  margin-top: 1rem;
+  display: grid;
+  gap: 0.1rem;
+}
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.35rem 0.2rem;
+}
+.row .name { color: var(--muted); }
+.row .state {
+  font-weight: 600;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+.row select,
+.row input[type="url"] {
+  padding: 0.3rem 0.5rem;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: rgba(15, 28, 24, 0.55);
+  color: var(--ink);
+  font: inherit;
+  max-width: 14rem;
+}
+.row input[type="url"] {
+  width: 13rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.85rem;
+}
+
+/* Hardware password dialog (D27 presentation). The value renders in a
+   user-select: all field, so a tap selects the whole password for the
+   selection-based copy path. */
+.modal {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(15, 28, 24, 0.75);
+  z-index: 10;
+}
+.modal-card {
+  width: min(30rem, calc(100vw - 2rem));
+  padding: 1.25rem 1.25rem 1.4rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg1);
+}
+.modal-card h2 {
+  margin: 0 0 0.75rem;
+  font-size: 0.95rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+}
+.hw-secret {
+  margin: 0 0 0.9rem;
+  padding: 0.85rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(15, 28, 24, 0.55);
+  font-family: ui-monospace, monospace;
+  font-size: 1.15rem;
+  letter-spacing: 0.04em;
+  user-select: all;
+  word-break: break-word;
+}
+.hw-input {
+  width: 100%;
+  margin: 0 0 0.9rem;
+  padding: 0.85rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(15, 28, 24, 0.55);
+  color: var(--ink);
+  font-family: ui-monospace, monospace;
+  font-size: 1.05rem;
+}
+.hw-copy {
+  margin: 0 0 0.4rem;
+  color: var(--muted);
+  line-height: 1.45;
+  font-size: 0.9rem;
+}
+.hw-copy strong { color: var(--ink); }
+.modal-actions {
+  display: flex;
+  gap: 0.6rem;
+  margin-top: 1rem;
+}
+.modal-actions button {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 0.9rem 0.6rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink);
+  font-size: 1rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+.modal-actions .cta {
+  /* The base .cta is a full-width standalone button; inside the action row
+     every button must share one geometry (equal flex cells, no margin). */
+  width: auto;
+  margin-top: 0;
+  background: var(--accent);
+  color: var(--accent-ink);
+  border: 0;
+}
+.modal-actions button[disabled] { opacity: 0.4; cursor: not-allowed; }
 
 .cta {
   margin-top: 1rem;

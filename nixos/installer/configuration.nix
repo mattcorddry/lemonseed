@@ -67,7 +67,8 @@
     lvm2
     efibootmgr
     grub2_efi
-    systemd # systemd-repart
+    systemd # systemd-repart, systemd-cryptenroll
+    cryptsetup # luksFormat/open + TPM2 token unlock (M8 P7)
     avahi
     pciutils
     usbutils
@@ -89,11 +90,16 @@
   environment.etc."lemonseed/grub.cfg".source = ../../boot/grub.cfg;
   environment.etc."lemonseed/lemonseed-ab.sh".source = ../../scripts/lemonseed-ab.sh;
   environment.etc."lemonseed/amdgpu-kernel-params.sh".source = ../../scripts/amdgpu-kernel-params.sh;
+  # The installer runs the (idempotent) provisioner against the open LUKS
+  # mapper during the encrypted-install flow (M8 P7).
+  environment.etc."lemonseed/appliance-storage-provision.sh".source =
+    ../../scripts/appliance-storage-provision.sh;
 
   # Keep the live image lean: no docker / appliance stack.
   nix.enable = false;
   documentation.enable = false;
   documentation.nixos.enable = false;
+
 
   system.stateVersion = "26.05";
 }

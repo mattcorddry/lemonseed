@@ -20,6 +20,8 @@ import syslog  # noqa: E402
 import install  # noqa: E402
 import server  # noqa: E402
 
+PASSWORD = "olive-fern-crest-moss"
+
 
 def fake_mount(root: Path, error: Exception | None = None):
     """Stand in for install.mount_user_data: hand out `root` instead of mounting."""
@@ -371,6 +373,49 @@ class ResetAdminCopyTests(unittest.TestCase):
         self.assertIn('getElementById("reset-admin")', app_js)
         self.assertIn("reset_admin_credentials", app_js)
 
+    def test_the_mode_radios_and_their_nested_options_are_wired(self) -> None:
+        # Preserve-vs-erase radios, each with its indented sub-choice: the
+        # nested rows always render (indentation carries the structure) and
+        # the JS owns the greyed/unchecked state.
+        for token in (
+            'id="preserve-radio"',
+            'id="erase-radio"',
+            'id="encrypt-row"',
+            'id="encrypt-user-data"',
+        ):
+            self.assertIn(token, server.INDEX_HTML)
+        app_js = (server.STATIC / "app.js").read_text(encoding="utf-8")
+        for token in (
+            'getElementById("preserve-radio")',
+            'getElementById("erase-radio")',
+            "syncEncrypt",
+            "syncResetAdmin",
+        ):
+            self.assertIn(token, app_js)
+
+    def test_the_channel_dropdown_and_development_dialog_are_wired(self) -> None:
+        # Settings-page grammar: one channel dropdown. Development raises a
+        # dialog that collects the URL (no private host name is ever baked
+        # into a published ISO), and the install posts it as source_url.
+        for token in (
+            'id="install-channel"',
+            "<option value=\"dev\">Development</option>",
+            'id="dev-dialog"',
+            'id="dev-url"',
+            'id="dev-cancel"',
+            'id="dev-ok"',
+            "will not validate release signatures",
+        ):
+            self.assertIn(token, server.INDEX_HTML)
+        app_js = (server.STATIC / "app.js").read_text(encoding="utf-8")
+        for token in (
+            'getElementById("install-channel")',
+            "openDevDialog",
+            "devUrlProblem",
+            "source_url",
+        ):
+            self.assertIn(token, app_js)
+
 
 class DiscoveryRefusalTests(unittest.TestCase):
     """M8 P3: the USB carries no appliance image — it downloads one from the
@@ -432,10 +477,16 @@ class InstallWiringTests(unittest.TestCase):
         patch_install_log(self)
 
     def drive_install(
-        self, stack: contextlib.ExitStack, preserve: bool, reset: bool, channel: str = "stable"
+        self,
+        stack: contextlib.ExitStack,
+        preserve: bool,
+        reset: bool,
+        channel: str = "stable",
+        source_url: str | None = None,
     ) -> mock.Mock:
         files = {"root.squashfs": Path("/nonexistent/root.squashfs")}
         stack.enter_context(mock.patch.object(install, "require_host_ready"))
+        stack.enter_context(mock.patch.object(install, "require_install_tools"))
         stack.enter_context(
             mock.patch.object(
                 install,
@@ -446,7 +497,9 @@ class InstallWiringTests(unittest.TestCase):
                 },
             )
         )
-        stack.enter_context(mock.patch.object(install, "acquire_artifacts", return_value=(files, "9.9.9")))
+        self.last_acquire = stack.enter_context(
+            mock.patch.object(install, "acquire_artifacts", return_value=(files, "9.9.9"))
+        )
         stack.enter_context(mock.patch.object(install, "partition_disk"))
         stack.enter_context(mock.patch.object(install, "wait_part", return_value="/dev/sda2"))
         stack.enter_context(mock.patch.object(install, "write_raw"))
@@ -461,6 +514,7 @@ class InstallWiringTests(unittest.TestCase):
             preserve_user_data=preserve,
             reset_admin_credentials=reset,
             channel=channel,
+            source_url=source_url,
         )
         self.last_seed = seed
         self.last_channel_file = channel_file
@@ -494,6 +548,65 @@ class InstallWiringTests(unittest.TestCase):
         self.last_seed.assert_called_once()
         self.assertEqual(self.last_seed.call_args.kwargs["channel"], "stable")
         self.last_channel_file.assert_not_called()
+
+    def test_a_dev_choice_fetches_the_url_but_persists_stable(self) -> None:
+        # Development is an install-time source override (the user types the
+        # URL): no private host name may ride the ESP stub or the channel file,
+        # so the installed box follows stable until the household says
+        # otherwise. The URL reaches acquire_artifacts untouched.
+        url = "http://llama:8083/release-20261031.01/"
+        with contextlib.ExitStack() as stack:
+            self.drive_install(
+                stack, preserve=True, reset=False, channel="dev", source_url=url
+            )
+        self.assertEqual(
+            self.last_acquire.call_args, mock.call(mock.ANY, channel="dev", url=url)
+        )
+        self.last_seed.assert_called_once()
+        self.assertEqual(self.last_seed.call_args.kwargs["channel"], "stable")
+        self.last_channel_file.assert_not_called()
+
+
+class DevChannelTests(unittest.TestCase):
+    """The Development channel's contract: fetch the typed URL, skip the
+    detached-signature check (parts stay hash-checked), persist stable."""
+
+    def test_the_url_override_normalizes_and_skips_the_signature(self) -> None:
+        with mock.patch.object(install, "fetch_manifest") as fetch:
+            install.image_base_url("http://llama:8083/release-20261031.01")
+            install.image_base_url("   ")
+        self.assertEqual(fetch.call_count, 0)  # shim only; the real asserts below
+
+    def test_image_base_url_normalizes_the_typed_url(self) -> None:
+        self.assertEqual(
+            install.image_base_url("http://llama:8083/release-20261031.01"),
+            "http://llama:8083/release-20261031.01/",
+        )
+        self.assertIsNone(install.image_base_url("   "))
+
+
+class ToolPreflightTests(unittest.TestCase):
+    """Review finding: a missing cryptsetup failed at 56% — after the erase.
+    Every pipeline tool must exist before anything touches the disk."""
+
+    def test_a_missing_tool_fails_in_the_validate_phase(self) -> None:
+        with (
+            mock.patch.object(install, "require_host_ready"),
+            mock.patch.object(install.shutil, "which", return_value=None),
+            mock.patch.object(install, "acquire_artifacts") as acquire,
+        ):
+            with self.assertRaises(install.InstallError) as raised:
+                install.run_install("/dev/sda")
+        self.assertIn("nothing has been written to the disk", str(raised.exception))
+        acquire.assert_not_called()
+
+    def test_present_tools_pass(self) -> None:
+        with (
+            mock.patch.object(install, "require_host_ready"),
+            mock.patch.object(install.shutil, "which", return_value="/usr/bin/cryptsetup"),
+            mock.patch.object(install, "_eligible"),
+        ):
+            install.require_install_tools()
 
 
 class ChannelSeedTests(unittest.TestCase):
@@ -546,6 +659,150 @@ class ChannelSeedTests(unittest.TestCase):
 
         self.assertEqual(install.lemonseed_artifacts.RELEASES_API_DEFAULT, lemonseed_artifacts.RELEASES_API_DEFAULT)
         self.assertIn("api.github.com", install.lemonseed_artifacts.RELEASES_API_DEFAULT)
+
+
+class HardwareParamsTests(unittest.TestCase):
+    """M8 P7 §4.4: the ESP file grub.cfg sources to arm the console lockdown,
+    generated in Python (grub-mkpasswd-pbkdf2 needs a tty)."""
+
+    def test_pbkdf2_is_the_self_describing_grub_format(self) -> None:
+        salt = bytes(range(16))
+        value = install.make_hardware_pbkdf2(PASSWORD, salt)
+        parts = value.split(".")
+        self.assertEqual(parts[:4], ["grub", "pbkdf2", "sha512", "10000"])
+        self.assertEqual(parts[4], salt.hex())
+        self.assertEqual(len(parts[5]), 128)  # sha512 hex digest
+        self.assertEqual(len(parts[4]), 32)  # a fresh os.urandom(16) salt
+
+    def test_the_esp_file_carries_exactly_the_two_grub_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = install.write_hardware_params(Path(tmp), "grub.pbkdf2.sha512.10000.aa.bb")
+            self.assertEqual(target.name, "hardware-params")
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                'set superusers="grub"\npassword_pbkdf2 grub grub.pbkdf2.sha512.10000.aa.bb\n',
+            )
+
+
+class BootOrderTests(unittest.TestCase):
+    """D-E3: after --create, BootOrder is rewritten with the new Lemonseed
+    entry first and the machine's existing entries preserved behind it."""
+
+    LISTING = (
+        "BootOrder: 0001,0002,0000\n"
+        "Boot0000* Lemonseed\n"
+        "Boot0001* Windows\n"
+        "Boot0002* Ubuntu\n"
+    )
+
+    def test_the_new_entry_is_pinned_first_existing_entries_follow(self) -> None:
+        self.assertEqual(install.rewrite_boot_order(self.LISTING), "0000,0001,0002")
+
+    def test_a_stale_lemonseed_entry_is_not_duplicated(self) -> None:
+        listing = self.LISTING.replace("BootOrder: 0001,0002,0000", "BootOrder: 0001,0000,0002")
+        self.assertEqual(install.rewrite_boot_order(listing), "0000,0001,0002")
+
+    def test_no_lemonseed_entry_leaves_the_order_alone(self) -> None:
+        listing = self.LISTING.replace("Boot0000* Lemonseed\n", "")
+        self.assertIsNone(install.rewrite_boot_order(listing))
+
+    def test_an_empty_boot_order_is_not_rewritten(self) -> None:
+        self.assertIsNone(install.rewrite_boot_order("Boot0000* Lemonseed\n"))
+
+
+class SeedEspTests(unittest.TestCase):
+    """Driving seed_esp with every external command stubbed: the ESP gets
+    hardware-params at every install, and BootOrder is pinned after --create."""
+
+    FIRST_LISTING = (
+        "BootOrder: 0001,0002\n"
+        "Boot0001* Windows\n"
+        "Boot0002* Ubuntu\n"
+        "Boot0004* Lemonseed\n"  # a stale entry the cleanup deletes first
+    )
+    SECOND_LISTING = (
+        "BootOrder: 0001,0002,0000\n"
+        "Boot0000* Lemonseed\n"
+        "Boot0001* Windows\n"
+        "Boot0002* Ubuntu\n"
+    )
+
+    def setUp(self) -> None:
+        patch_install_log(self)
+
+    def drive_seed(self, stack: contextlib.ExitStack, pbkdf2: str = ""):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        esp = Path(tmp.name) / "esp"
+        efi_dir = esp / "EFI" / "lemonseed"
+        efi_dir.mkdir(parents=True)
+        (efi_dir / "grubx64.efi").write_text("efi", encoding="utf-8")
+        grub_cfg = Path(tmp.name) / "grub.cfg"
+        grub_cfg.write_text("# template\n", encoding="utf-8")
+
+        stack.enter_context(mock.patch.object(install, "ESP_MOUNT", esp))
+        stack.enter_context(mock.patch.object(install, "GRUB_CFG", grub_cfg))
+        stack.enter_context(mock.patch.object(install, "AB_HELPER", Path("/nonexistent-ab")))
+        stack.enter_context(
+            mock.patch.object(install, "AMDGPU_KERNEL_PARAMS", Path("/nonexistent-amd"))
+        )
+        stack.enter_context(mock.patch.object(install, "wait_part", return_value="/dev/sda1"))
+        stack.enter_context(mock.patch.object(install, "partition_number", return_value=1))
+        sub_run = stack.enter_context(
+            mock.patch.object(install.subprocess, "run", return_value=mock.Mock(returncode=0))
+        )
+        stack.enter_context(
+            mock.patch.object(
+                install.subprocess,
+                "check_output",
+                side_effect=[self.FIRST_LISTING, self.SECOND_LISTING],
+            )
+        )
+        run_cmd = stack.enter_context(mock.patch.object(install, "_run"))
+        copy2 = stack.enter_context(mock.patch.object(install.shutil, "copy2"))
+        install.seed_esp(
+            "/dev/sda",
+            {"vmlinuz": Path("/tmp/vmlinuz"), "initrd.img": Path("/tmp/initrd.img")},
+            None,
+            channel="stable",
+            version="9.9.9",
+            hardware_pbkdf2=pbkdf2,
+        )
+        return esp, run_cmd, sub_run, copy2
+
+    def test_hardware_params_is_written_and_boot_order_pinned(self) -> None:
+        with contextlib.ExitStack() as stack:
+            esp, run_cmd, _sub_run, _copy2 = self.drive_seed(
+                stack, pbkdf2="grub.pbkdf2.sha512.10000.aa.bb"
+            )
+        params = esp / "grub" / "hardware-params"
+        self.assertEqual(
+            params.read_text(encoding="utf-8"),
+            'set superusers="grub"\npassword_pbkdf2 grub grub.pbkdf2.sha512.10000.aa.bb\n',
+        )
+        run_cmd.assert_any_call(["efibootmgr", "-o", "0000,0001,0002"])
+
+    def test_no_pbkdf2_writes_no_hardware_params(self) -> None:
+        # A pre-P7 preserve has no password to re-seat: the grub.cfg guard
+        # keeps the absent file bootable (§4.4).
+        with contextlib.ExitStack() as stack:
+            esp, run_cmd, _sub_run, _copy2 = self.drive_seed(stack, pbkdf2="")
+        self.assertFalse((esp / "grub" / "hardware-params").is_file())
+        order_calls = [c for c in run_cmd.call_args_list if c.args[0][:2] == ["efibootmgr", "-o"]]
+        self.assertEqual(len(order_calls), 1)
+
+    def test_the_removable_path_fallback_is_installed_and_stale_entries_cleaned(self) -> None:
+        with contextlib.ExitStack() as stack:
+            esp, _run_cmd, sub_run, copy2 = self.drive_seed(stack, pbkdf2="")
+        # BOOTX64.EFI rides along (USB stays bootable by hand, D-E3), and the
+        # stale Lemonseed NVRAM entry was deleted before --create.
+        copied = [call.args for call in copy2.call_args_list]
+        self.assertIn(
+            (esp / "EFI" / "lemonseed" / "grubx64.efi", esp / "EFI" / "BOOT" / "BOOTX64.EFI"),
+            copied,
+        )
+        argvs = [call.args[0] for call in sub_run.call_args_list]
+        self.assertIn(["efibootmgr", "-b", "0004", "-B"], argvs)
 
 
 if __name__ == "__main__":

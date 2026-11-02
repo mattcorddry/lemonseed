@@ -464,11 +464,13 @@ boot menu or the web UI.
 
 ### Proposal
 
-- **LUKS on the user-data volume, TPM-sealed, TPM required (D24 — decided).** The
-  installer requires a TPM 2.0 and fails with a legible preflight when one is absent
-  or the seal cannot be established. The alternatives — (b) a web-based boot passphrase
-  workflow and (c) a hardware-attribute-derived key — are backlogged as
-  *Alternatives to TPM* until needed.
+- **LUKS on the user-data volume, TPM-sealed, encryption optional (D24 as amended
+  by D-E1).** The installer's options page gains an **"Encrypt user data
+  (recommended)"** checkbox — checked by default when a TPM 2.0 trial seal works,
+  greyed with a warning when absent (TPM is required *for encryption*, not for
+  install). The alternatives — (b) a web-based boot passphrase workflow and (c) a
+  hardware-attribute-derived key — are backlogged as *Alternatives to TPM* until
+  needed.
 - **Migration:** existing machines migrate by USB reinstall with data loss — both test
   boxes are rebuildable (D9); there is no in-place encryption path. The installer gains
   the partitioning/format step.
@@ -505,7 +507,38 @@ boot menu or the web UI.
   viewable, so encryption protects the disk against theft — not against someone holding
   admin credentials on the LAN. Passwords are never logged and are masked in audit
   detail (D-37). This does not protect a running, unlocked box, and it does not bring
-  TLS back.
+  TLS back. The plaintext in the DB is **provisional** (D-E6): the design works from
+  hashes alone; only the Settings reveal reads it.
+- **Unlock-failure boot UX (D-E2).** A failed unlock shows the legible copy for
+  30 s, reboots, retries; after 3 failures (ESP counter, cleared on first success)
+  the box halts on the message. No HTTP/mDNS stack in the initrd. The console
+  contract is legible without the portal: `/etc/issue` explains root = Hardware
+  password and that regular accounts live in the web portal (D-E4); serial gettys
+  on physical ports; no autologin anywhere. The installer pins the NVRAM boot order
+  (D-E3) and keeps installer-image root unlocked for debugging.
+
+**As built (review):** shipped as designed, with the following notes — the
+  Hardware-password hash derivation is pure-Python `sha512_crypt` in the CP
+  (`hardware_password.py`; the appliance has no `openssl` dependency for it) and
+  the CP adopts the bootstrap copy at first start, writes the GRUB PBKDF2 and
+  the root shadow hash, then deletes the plaintext (D-E6: the plaintext lives
+  only between first boot and adoption, so removing it later cannot break
+  anything). The provisioner's unlock step is unit-tested via stubbed tooling
+  (`scripts/test_appliance_storage_provision.py`), including the bounded retry
+  off-by-one it exposed. QEMU smoke needed one hardening: the `/api/boot`
+  probe in `qemu-api-smoke-test.sh` now polls within the budget like
+  `/api/data`, because the handler's systemctl/docker probes queue behind
+  PID1 while the smoke profile loads the Open WebUI image under TCG.
+  Bare-metal rounds 3–5 surfaced further findings (canonical bare-password
+  volume key, initrd cipher-module set for kernel 6.18, LUKS2 label for
+  locked-volume identification, the TPM2 token-plugin library path, and the
+  every-boot prompt caused by cryptsetup refusing the systemd-cryptsetup-only
+  `--tpm2-device` option — the token attempt must be `--token-only`), plus two
+  ride-along fixes: the serial-getty guards became `ExecCondition` tests of
+  `/proc/tty/driver/serial` (a `console=ttyS0`-created node with no UART behind
+  it is not a tty), and `systemd.oomd` is disabled on the appliance (NixOS
+  enables it by default; pressure-based kills would take down lemond/OWUI
+  mid-generation). All recorded as built in `ENCRYPTED-USER-DATA.md` §11.
 
 **Design-gate deliverable:** `ENCRYPTED-USER-DATA.md` — the migration
 plan, the installer UX (Hardware password prompt and copy), the recovery story under
@@ -516,16 +549,25 @@ what the installer changes.
 
 - QEMU: installer provisions an encrypted user-data volume; first boot unseals via TPM;
   `@etc`/`@var`, Postgres, Valkey come up; the appliance is whole.
+- Unencrypted install (D-E1): the checkbox greyed/unticked path installs plain and the
+  update flow works end to end.
 - Update flow on an encrypted box: the unattended reboot must not hang on a passphrase —
   TPM sealing is what makes M7 P5's self-rebooting update compatible; assert it.
 - Preserve-reinstall with the reset marker under encryption; and when the TPM has been
   replaced or erased, the installer **prompts for the Hardware password** before
-touching the preserved volume, and refuses a wrong one.
-- TPM-absent install fails with a legible preflight (option (a), decided).
+  touching the preserved volume, and refuses a wrong one.
+- Corrupted LUKS metadata: the boot fails legibly and never silently reformats. TPM
+  present but no key enrolled / wrong key: both fail the token path onto the D-E2
+  retry, distinguishable in the journal. Bounded retry: counter increments, clears on
+  success, third failure halts.
+- TPM-absent install shows the greyed checkbox with the warning copy and installs
+  unencrypted (D-E1).
 - Console: no root autologin; **boot-target selection needs no password** while
-  editing/console does; the tty root password is the stored one, not empty.
-- Hardware password: retrievable by an admin from Settings → Advanced, with the info
-  explainer; masked in logs and audit.
+  editing/console does; the tty root password is the stored one, not empty; `/etc/issue`
+  renders on console and serial gettys.
+- Hardware password: retrievable by an admin from Settings → Advanced via the reveal
+  dialog with working Copy (execCommand fallback), with the info explainer; masked in
+  logs and audit.
 
 ### Gate
 
@@ -589,6 +631,7 @@ mid-build:
 | **D28** | **Release-channel decisions (M8 P3):** the channel is *only* the GitHub prerelease flag — the signed manifest describes the payload, never the audience, so a beta → stable flip is a metadata edit and the re-sign/rebuild machinery originally proposed was dropped as too heavyweight for the narrow concern (residual risk accepted: repo write access can re-badge, but it could publish anything anyway). Switching channels **never downgrades**; the version comparison is the only update decision. The setting lives in the CP settings table (`cp_meta`) behind a minimal `get_setting`/`set_setting` wrapper, materialized to `/var/lib/lemonseed/channel` for the DB-free root jobs; the installer seeds the file (preserve) or the ESP command line (fresh), and the CP adopts the seed. Stable with only prereleases published is *up to date*, not an error. |
 | **D29** | **Signing cutover (M8, post-P4 review):** the signature scheme is **ECDSA NIST P-256, SHA-256 over the exact manifest bytes, DER-encoded** — recorded as `detached-ecdsa-p256` and enforced by the verifier; the `detached-ed25519` generation was fully superseded in one cut (no install base, single trust-set generation — set `version` 2, key file `lemonseed-release.pub` with its public fingerprint in the JSON). Production signing is **hardware-backed via `SIGN_MODE=pkcs11`**: the key never exists as a file, and every signature requires the token's own authorization (PIN and/or physical presence — not bypassable). Where the signing environment is a separate host from the build machine, **`SIGN_MODE=offline`** finalizes the signing block without a signature; the detached signature is produced out of band and the completed set must pass `make release-verify` before publishing. `SIGN_MODE=file` with `keys/test` (via `make keys`) keeps milestone iteration independent of the production key; the verifier notes randomized ECDSA (no deterministic-nonce assumption, no `s` normalization). Key custody and the signing environment remain private; only the scheme and the generic openssl primitives are public. |
 | **D30** | **Rollback floor (M8 P6, review):** the 30-day horizon became **`MIN_ROLLBACK_VERSION`** declared by the *release itself* (`rollback.min_rollback_version` in the signed manifest — written by `release_payload.py pack` and `package.sh`; a one-way-door release pins it via `MIN_ROLLBACK_VERSION=<v>` through `release.sh`). Default at pack time: the release's date minus the horizon; legacy manifests fall back to the same computed floor at rollback time. The refusal is hard; `--force` is the CLI override. This also amends **D2**: the safety checks (registry-gated eligibility) and the **web rollback UI** shipped in P6 rather than being deferred — the schema-boundary guard alone stays backlogged (D21). |
+| **D31** | **P7 review amendments (recorded as D-E1–D-E6 in [`ENCRYPTED-USER-DATA.md`](./M8/ENCRYPTED-USER-DATA.md)):** encryption is an install-time checkbox (amends D24 — TPM required *for encryption*, not for install); unlock-failure boot UX is a bounded 30 s × 3-attempt retry with an ESP counter, then halt; the installer pins NVRAM boot order; `/etc/issue` + serial gettys + no autologin anywhere; the Hardware password and console lockdown are uniform across encrypted and unencrypted installs; the CP-DB plaintext is provisional (backlog: *Revisit whether we want to store the clear text hardware password on Lemonseed*) and the installer image's root stays unlocked for debugging. |
 
 ## Open questions
 

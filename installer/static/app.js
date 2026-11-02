@@ -4,10 +4,28 @@
   const startBtn = document.getElementById("start");
   const diskPanel = document.getElementById("disk-panel");
   const preserveRow = document.getElementById("preserve-row");
-  const preserveCheck = document.getElementById("preserve-user-data");
+  const preserveRadio = document.getElementById("preserve-radio");
+  const eraseRow = document.getElementById("erase-row");
+  const eraseRadio = document.getElementById("erase-radio");
   const resetAdminRow = document.getElementById("reset-admin-row");
   const resetAdminCheck = document.getElementById("reset-admin");
   const resetAdminCopy = document.getElementById("reset-admin-copy");
+  const encryptRow = document.getElementById("encrypt-row");
+  const encryptCheck = document.getElementById("encrypt-user-data");
+  const encryptWarning = document.getElementById("encrypt-warning");
+  const channelSelect = document.getElementById("install-channel");
+  const devDialog = document.getElementById("dev-dialog");
+  const devUrlInput = document.getElementById("dev-url");
+  const devError = document.getElementById("dev-error");
+  const devCancelBtn = document.getElementById("dev-cancel");
+  const devOkBtn = document.getElementById("dev-ok");
+  const hwDialog = document.getElementById("hw-dialog");
+  const hwValue = document.getElementById("hw-value");
+  const hwInput = document.getElementById("hw-input");
+  const hwCopyBtn = document.getElementById("hw-copy");
+  const hwRegenBtn = document.getElementById("hw-regen");
+  const hwContinueBtn = document.getElementById("hw-continue");
+  const hwError = document.getElementById("hw-error");
   // The sentence as it is printed in the HTML. Kept as the fallback so a disk
   // with no roster to read shows real copy instead of an empty line.
   const resetAdminDefault = resetAdminCopy ? resetAdminCopy.textContent : "";
@@ -32,10 +50,33 @@
   let hostPreflight = { ok: true, reasons: [] };
   let pollTimer = null;
   let waitTimer = null;
+  let encryptionAvailable = false;
+  let hwPassword = "";
+  let hwMode = null; // "generate" | "unlock", while the dialog is open
+  let devUrl = ""; // the Development channel's source, once confirmed
+  let channelBeforeDev = "stable";
 
   function fmtSize(bytes) {
     const g = bytes / (1024 ** 3);
     return g >= 10 ? `${g.toFixed(0)} GB` : `${g.toFixed(1)} GB`;
+  }
+
+  // The D-E1 offer rides /api/disks: ticked when a usable TPM is present
+  // (the user may still untick it), greyed out with the server's exact
+  // warning copy otherwise. The server owns the copy because only it has
+  // run the TPM trial.
+  function applyEncryption(payload) {
+    const enc = payload.encryption || {};
+    encryptionAvailable = Boolean(enc.available);
+    encryptCheck.disabled = !encryptionAvailable;
+    encryptCheck.checked = Boolean(enc.checked);
+    if (!encryptionAvailable && enc.warning) {
+      encryptWarning.textContent = enc.warning;
+      encryptWarning.classList.remove("hidden");
+    } else {
+      encryptWarning.classList.add("hidden");
+      encryptWarning.textContent = "";
+    }
   }
 
   function showHostPreflightWarn() {
@@ -82,6 +123,7 @@
   function renderDisks(payload) {
     disksEl.innerHTML = "";
     renderPreflight(payload);
+    applyEncryption(payload);
     const hostOk = hostPreflight.ok !== false;
     const eligible = (payload.disks || []).filter((d) => d.eligible);
     const blocked = (payload.disks || []).filter((d) => !d.eligible);
@@ -130,31 +172,220 @@
     startBtn.disabled = !selected || !hostOk;
   }
 
+  // The first choice is preserve-vs-erase, so the radio availability rides
+  // the selected disk: preserve is the default when the disk allows it and
+  // greyed out otherwise (erase is then the only path).
   function updatePreserve(disk) {
     const available = Boolean(disk && disk.preservable_user_data);
-    preserveRow.classList.toggle("hidden", !available);
-    preserveCheck.checked = available;
-    // Reset-admin only makes sense alongside preserve (a fresh install
-    // creates the first admin at /setup regardless). It is nested under
-    // preserve and greyed out until preserve is checked.
-    resetAdminRow.classList.toggle("hidden", !available);
+    preserveRadio.disabled = !available;
+    // Default preserve only when the volume was verified (unlocked, identity
+    // read). A locked volume cannot be examined without the Hardware password,
+    // so erase is the default and preserve remains an opt-in that the
+    // unlock dialog validates before anything is written.
+    const verified = available && !disk.preservable_user_data.locked;
+    preserveRadio.checked = verified;
+    eraseRadio.checked = !verified;
     // Name the accounts a reset would remove admin access from (D-28). The
-    // server computed the sentence because only it can read the roster; this is
-    // per-disk, so switching the selected disk has to re-paint it.
+    // server computed the sentence because only it can read the roster; this
+    // is per-disk, so switching the selected disk has to re-paint it.
     if (resetAdminCopy) {
       resetAdminCopy.textContent =
         (disk && disk.reset_admin_copy) || resetAdminDefault;
     }
     syncResetAdmin();
+    syncEncrypt();
   }
 
   function syncResetAdmin() {
-    const enabled = preserveCheck.checked;
+    const enabled = preserveRadio.checked;
     resetAdminRow.classList.toggle("off", !enabled);
     if (!enabled) resetAdminCheck.checked = false;
   }
 
-  preserveCheck.addEventListener("change", syncResetAdmin);
+  preserveRadio.addEventListener("change", syncResetAdmin);
+  eraseRadio.addEventListener("change", () => {
+    syncResetAdmin();
+    syncEncrypt();
+  });
+
+  // Encryption is a sub-choice of erase-and-format only: a preserve keeps
+  // whatever volume the box already has (encrypted stays encrypted, plain
+  // stays plain — there is no in-place conversion). Greyed when erase is not
+  // the selected mode; greyed AND unchecked when no usable TPM was found.
+  function syncEncrypt() {
+    const enabled = eraseRadio.checked && encryptionAvailable;
+    encryptRow.classList.toggle("off", !enabled);
+    if (!encryptionAvailable) encryptCheck.checked = false;
+  }
+  eraseRadio.addEventListener("change", syncEncrypt);
+
+  // ---- Release channel (settings-page grammar) --------------------------
+  // The default source is GitHub discovery per channel. Development is an
+  // explicit, opt-in URL — the popup fires the moment the channel is chosen,
+  // so no private host name ever rides a published ISO by accident.
+  function devUrlProblem(value) {
+    try {
+      const parsed = new URL(value);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        return "Use an http:// or https:// URL.";
+      }
+      if (!parsed.hostname) {
+        return "That URL has no host name. Example: http://host:port/release-20261031.01/";
+      }
+      return "";
+    } catch (_) {
+      return "That does not look like a URL. Example: http://host:port/release-20261031.01/";
+    }
+  }
+
+  function openDevDialog() {
+    devUrlInput.value = devUrl;
+    devError.classList.add("hidden");
+    devDialog.classList.remove("hidden");
+    devUrlInput.focus();
+  }
+
+  function closeDevDialog() {
+    devDialog.classList.add("hidden");
+  }
+
+  channelSelect.addEventListener("change", () => {
+    if (channelSelect.value === "dev") {
+      openDevDialog();
+    } else {
+      channelBeforeDev = channelSelect.value;
+    }
+  });
+
+  devCancelBtn.addEventListener("click", () => {
+    channelSelect.value = channelBeforeDev;
+    closeDevDialog();
+  });
+
+  devOkBtn.addEventListener("click", () => {
+    const problem = devUrlProblem(devUrlInput.value.trim());
+    if (problem) {
+      devError.textContent = problem;
+      devError.classList.remove("hidden");
+      return;
+    }
+    devUrl = devUrlInput.value.trim();
+    channelBeforeDev = "dev";
+    closeDevDialog();
+  });
+
+  // ---- Hardware password dialog (D27 presentation, §4.2) ----------------
+  // Plain HTTP means navigator.clipboard does not exist here: select-and-
+  // execCommand is the working path, not the edge case.
+  async function copySecret(value) {
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(value);
+        return true;
+      } catch (_) {
+        /* fall through to the selection copy */
+      }
+    }
+    const field = hwMode === "generate" ? hwValue : hwInput;
+    field.focus();
+    const range = document.createRange();
+    range.selectNodeContents(field);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    return document.execCommand("copy");
+  }
+
+  async function drawPassword() {
+    hwValue.textContent = "…";
+    try {
+      const res = await fetch("/api/password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      hwPassword = (await res.json()).hardware_password || "";
+    } catch (_) {
+      hwPassword = "";
+    }
+    hwValue.textContent = hwPassword || "Could not generate a password. Try again.";
+  }
+
+  function openGenerateDialog() {
+    hwMode = "generate";
+    hwValue.classList.remove("hidden");
+    hwInput.classList.add("hidden");
+    hwCopyBtn.classList.remove("hidden");
+    hwRegenBtn.classList.remove("hidden");
+    hwError.classList.add("hidden");
+    hwDialog.classList.remove("hidden");
+    drawPassword();
+  }
+
+  function openUnlockDialog() {
+    hwMode = "unlock";
+    hwValue.classList.add("hidden");
+    hwInput.classList.remove("hidden");
+    hwInput.value = "";
+    hwCopyBtn.classList.add("hidden");
+    hwRegenBtn.classList.add("hidden");
+    hwError.classList.add("hidden");
+    hwDialog.classList.remove("hidden");
+    hwInput.focus();
+  }
+
+  function closeDialog() {
+    hwMode = null;
+    hwDialog.classList.add("hidden");
+  }
+
+  hwCopyBtn.addEventListener("click", async () => {
+    const value = hwMode === "generate" ? hwPassword : hwInput.value;
+    await copySecret(value);
+    hwCopyBtn.textContent = "Copied";
+    setTimeout(() => {
+      hwCopyBtn.textContent = "Copy";
+    }, 1500);
+  });
+
+  hwRegenBtn.addEventListener("click", drawPassword);
+
+  hwContinueBtn.addEventListener("click", async () => {
+    if (hwMode === "unlock") {
+      const password = hwInput.value;
+      if (!password) return;
+      hwContinueBtn.disabled = true;
+      let ok = false;
+      let message = "";
+      try {
+        const res = await fetch("/api/luks-verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ disk: selected, password }),
+        });
+        const body = await res.json();
+        ok = Boolean(body.ok);
+        message = body.error || res.statusText;
+      } catch (_) {
+        message = "Could not verify the password.";
+      }
+      hwContinueBtn.disabled = false;
+      if (!ok) {
+        hwError.textContent = message;
+        hwError.classList.remove("hidden");
+        return;
+      }
+      closeDialog();
+      beginInstall(password);
+      return;
+    }
+    if (!hwPassword) {
+      await drawPassword();
+      return;
+    }
+    closeDialog();
+    beginInstall(hwPassword);
+  });
 
   function showProgress() {
     diskPanel.classList.add("hidden");
@@ -280,6 +511,37 @@
 
   startBtn.addEventListener("click", async () => {
     if (!selected) return;
+    if (channelSelect.value === "dev" && !devUrl) {
+      openDevDialog();
+      return;
+    }
+    const preserving = Boolean(
+      selectedDisk && selectedDisk.preservable_user_data && preserveRadio.checked
+    );
+    // §4.3: a preserved LUKS2 volume whose TPM token does not unlock asks for
+    // the Hardware password and validates it before the install starts. The
+    // state was decided at discovery time (disks.py ran the token trial).
+    const lockedLuks = Boolean(
+      preserving &&
+        selectedDisk.preservable_user_data.luks &&
+        selectedDisk.preservable_user_data.locked
+    );
+    if (!preserving) {
+      // The Hardware password is always generated and presented (§5): on an
+      // unencrypted install it still guards GRUB editing and the root console.
+      openGenerateDialog();
+    } else if (lockedLuks) {
+      openUnlockDialog();
+    } else {
+      beginInstall("");
+    }
+  });
+
+  async function beginInstall(hardwarePassword) {
+    const preserving = Boolean(
+      selectedDisk && selectedDisk.preservable_user_data && preserveRadio.checked
+    );
+    const channel = channelSelect.value || "stable";
     startBtn.disabled = true;
     showProgress();
     applyStatus({ phase: "starting", progress: 1, message: "Starting…" });
@@ -288,16 +550,17 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         disk: selected,
-        channel: document.querySelector('input[name="channel"]:checked')?.value || "stable",
-        preserve_user_data: Boolean(
-          selectedDisk && selectedDisk.preservable_user_data && preserveCheck.checked
-        ),
+        channel,
+        source_url: channel === "dev" ? devUrl : "",
+        preserve_user_data: preserving,
         reset_admin_credentials: Boolean(
           selectedDisk &&
             selectedDisk.preservable_user_data &&
-            preserveCheck.checked &&
+            preserveRadio.checked &&
             resetAdminCheck.checked
         ),
+        encrypt_user_data: Boolean(eraseRadio.checked && encryptionAvailable && encryptCheck.checked),
+        hardware_password: hardwarePassword,
       }),
     });
     const body = await res.json();
@@ -312,7 +575,7 @@
     }
     pollTimer = setInterval(poll, 500);
     poll();
-  });
+  }
 
   rebootBtn.addEventListener("click", async () => {
     rebootBtn.disabled = true;
@@ -362,4 +625,5 @@
     .catch(() => {
       disksEl.innerHTML = '<p class="err">Could not list disks.</p>';
     });
+  refreshLatest();
 })();

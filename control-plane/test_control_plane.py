@@ -46,6 +46,7 @@ import auth  # noqa: E402
 import catalog  # noqa: E402
 import chat_ready  # noqa: E402
 import hardware  # noqa: E402
+import hardware_password  # noqa: E402
 import journal  # noqa: E402
 import model_store  # noqa: E402
 import modules  # noqa: E402
@@ -3976,6 +3977,125 @@ class SharedThemeTests(unittest.TestCase):
         """A leftover copy in Python is the drift this row set out to remove."""
         for name in ("STYLE", "SETTINGS_MODEL_PICKER_CSS", "OWUI_CONFIG_CSS"):
             self.assertFalse(hasattr(stub, name), f"stub.{name} is a second copy of the theme")
+
+
+class AdvancedPanelTests(unittest.TestCase):
+    """The SYSTEM panel's Advanced section and its reveal flow (M8 P7).
+
+    Text-level on purpose: the dialog component's behavior is covered by the
+    node harness (test_dialog_js.py); what matters here is that the panel
+    ships, degrades when the plaintext is not stored (D-E6), and that the
+    reveal is admin-gated, audited, and the only route that carries the value.
+    """
+
+    def setUp(self) -> None:
+        docker = mock.patch.object(
+            stub.modules, "owui_container_status", return_value=None
+        )
+        docker.start()
+        self.addCleanup(docker.stop)
+        self.html = stub.page_settings_content(dict(_SNAP)).decode()
+
+    def test_advanced_section_ships_with_the_row_and_buttons(self) -> None:
+        self.assertIn('<section class="panel" id="advanced">', self.html)
+        self.assertIn("Hardware password</span>", self.html)
+        self.assertIn('id="hwpw-reveal"', self.html)
+        self.assertIn('id="hwpw-info"', self.html)
+        self.assertIn('id="hwpw-note" hidden', self.html)
+
+    def test_reveal_script_ships_after_the_dialog_component(self) -> None:
+        """dialog*() calls need the definitions earlier in the document."""
+        self.assertIn("hwpw-reveal", stub.HWPW_JS)
+        dialog_at = self.html.index("function dialog(")
+        hwpw_at = self.html.index("Copy to clipboard")
+        self.assertLess(dialog_at, hwpw_at)
+
+    def test_the_reveal_field_is_selectable_and_copy_has_a_fallback(self) -> None:
+        # Plain HTTP on *.local: navigator.clipboard is absent, so the
+        # execCommand fallback is the working path, not the edge case (D-45).
+        self.assertIn("userSelect = 'all'", stub.HWPW_JS)
+        self.assertIn("execCommand('copy')", stub.HWPW_JS)
+
+
+class HardwarePasswordRouteTests(unittest.TestCase):
+    """Presence and the audited reveal, at the CP's own HTTP boundary."""
+
+    def setUp(self) -> None:
+        self.handler = stub.Handler.__new__(stub.Handler)
+        self.handler.headers = {"X-Forwarded-User": "matt"}
+        self.sent: list[tuple[int, dict]] = []
+        json_mock = mock.patch.object(
+            stub.Handler,
+            "_json",
+            side_effect=lambda code, body: self.sent.append((code, body)),
+        )
+        admin_mock = mock.patch.object(stub.Handler, "_require_admin", return_value=True)
+        actor_mock = mock.patch.object(stub.Handler, "_actor", return_value="matt")
+        audit_mock = mock.patch.object(stub.audit, "record")
+        for patch in (json_mock, admin_mock, actor_mock):
+            patch.start()
+            self.addCleanup(patch.stop)
+        audit_started = audit_mock.start()
+        self.addCleanup(audit_mock.stop)
+        self.audit_mock = audit_mock
+        self.audit_started = audit_started
+        # The module-level reveal/presence are patched at the boundary so the
+        # route tests never touch the real state directory (adoption itself is
+        # covered by test_hardware_password.py).
+        self.stored: dict[str, str] = {}
+        stored = mock.patch.object(
+            hardware_password,
+            "stored_plaintext",
+            side_effect=lambda: self.stored.get("pw"),
+        )
+        stored.start()
+        self.addCleanup(stored.stop)
+        reveal = mock.patch.object(
+            hardware_password,
+            "reveal",
+            side_effect=lambda: self.stored.get("pw"),
+        )
+        reveal.start()
+        self.addCleanup(reveal.stop)
+
+    def test_presence_polls_without_the_value(self) -> None:
+        self.handler.path = "/_lemonseed/api/hardware-password"
+        self.handler.do_GET()
+        self.assertEqual(self.sent, [(200, {"stored": False})])
+
+    def test_reveal_returns_the_value_and_writes_the_audit_entry(self) -> None:
+        self.stored["pw"] = "apple-bacon-chard-date"
+        self.handler.path = "/_lemonseed/api/hardware-password/reveal"
+        self.handler.do_POST()
+        self.assertEqual(self.sent, [(200, {"stored": True, "value": "apple-bacon-chard-date"})])
+        actor, target, action, detail = self.audit_started.call_args.args
+        self.assertEqual((actor, target, action), ("matt", "root", "hardware_password.revealed"))
+        # D-37: names of surfaces, never the secret itself.
+        self.assertNotIn("apple-bacon-chard-date", repr(detail))
+
+    def test_a_box_that_never_stored_degrades_without_an_error(self) -> None:
+        self.handler.path = "/_lemonseed/api/hardware-password/reveal"
+        self.handler.do_POST()
+        self.assertEqual(self.sent, [(200, {"stored": False})])
+        self.assertFalse(self.audit_started.called)
+
+
+class HardwarePasswordGatewayTests(unittest.TestCase):
+    """The gateway mirrors the CP's admin gating at the edge (D25)."""
+
+    def test_both_hardware_password_locations_are_admin_gated(self) -> None:
+        gateway = (Path(__file__).resolve().parent.parent / "nixos" / "modules" / "gateway.nix").read_text(
+            encoding="utf-8"
+        )
+        for location in (
+            '= /_lemonseed/api/hardware-password"',
+            '= /_lemonseed/api/hardware-password/reveal"',
+        ):
+            with self.subTest(location=location):
+                block_start = gateway.index("locations.\"" + location)
+                block = gateway[block_start : gateway.index("};", block_start)]
+                self.assertIn("${authGate}", block)
+                self.assertIn("${adminGate}", block)
 
 
 if __name__ == "__main__":

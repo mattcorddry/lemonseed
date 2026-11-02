@@ -32,8 +32,8 @@ You need [Nix](https://nixos.org/download/) with flakes enabled. See `nix-instal
 ```
 boot/           GRUB config (A/B slot selection)
 control-plane/  Appliance HTTP control plane (setup + status)
-documentation/  DESIGN.md (as-built contract), RELEASE.md, roadmap/ (milestone
-                records + BACKLOG.md)
+documentation/  DESIGN.md (as-built contract), Security.md, RELEASE.md,
+                roadmap/ (milestone records + BACKLOG.md)
 installer/      USB installer pipeline + web UI
 nixos/          NixOS modules (appliance + installer)
   modules/      Storage, A/B root, NVIDIA, lemond, gateway, …
@@ -82,7 +82,9 @@ unattended) and offers the newest release on its **channel** — `stable` for mo
 homes, `beta` for early builds and brand-new hardware. The channel is chosen at
 install time and changeable in Settings; switching channels never downgrades the box.
 Every update is signature-verified against the keys baked into the image before a
-single byte is trusted.
+single byte is trusted. An overview of the whole security stance — what is
+protected, what is not, and what you can do — lives in
+[Security.md](./Security.md).
 
 ## Status
 
