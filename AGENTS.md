@@ -51,7 +51,7 @@ Treat a **work sprint** as: implement → validate → report. Do not return to 
 - Keep changes scoped to the task.
 - Stage new files early enough that flake builds can see them (`make check-untracked` / `make test` will fail until you do).
 - If behavior changes, extend or add unit tests in the same change set.
-- Any temporary files (shell scripts, etc) should be created in /tmp (or a subdirectory created by `mktemp -d`) and should be cleaned up once they are no longer required.
+- Any temporary files (shell scripts, etc) should be created in /tmp, $buildroot/.tmp, or a subdirectory created by `mktemp -d`. Temporary files should be cleaned up after each sprint (note that any `rm` command invocation requires user approval, so don't try to delete files as-you-go).
 
 ### 2. End of sprint — always
 
