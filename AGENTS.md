@@ -55,6 +55,10 @@ Treat a **work sprint** as: implement → validate → report. Do not return to 
 
 ### 2. End of sprint — always
 
+The strategy behind these phases — what each one is for, what it must not try
+to catch, and the reasoning that keeps us from duplicating effort — lives in
+[documentation/TESTING.md](documentation/TESTING.md).
+
 Run from repo root:
 
 ```bash
@@ -118,4 +122,5 @@ When coming back to the user, include briefly:
 | `documentation/DESIGN.md` | Product and architecture decisions **as built**, plus the consolidated backlog |
 | `AGENTS.md` | How agents should work and close sprints |
 | `documentation/RELEASE.md` | The release runbook: build/sign machine setup, per-release workflow, publish + verify, channel flip, BM drill |
+| `documentation/TESTING.md` | The test strategy: the phase matrix, the reasoning per phase, what each phase must not catch, the cadence |
 | `documentation/roadmap/` | Milestone design records (`M*/`) and `BACKLOG.md` — the reasoning and phase plans behind each milestone. Historical: `DESIGN.md` wins on current behavior |

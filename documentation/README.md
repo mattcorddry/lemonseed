@@ -25,6 +25,9 @@ That prints the available targets. Common ones:
 | `sudo make repart-test` | Loopback GPT/repart smoke (requires root) |
 | `make update-test` | Loopback A/B updater smoke (no root) |
 
+The test strategy — the phase matrix, the reasoning per phase, what each phase
+must not try to catch, and the cadence — is [TESTING.md](./TESTING.md).
+
 You need [Nix](https://nixos.org/download/) with flakes enabled. See `nix-install.sh` if you are setting up a build host from scratch.
 
 ## Tree overview
