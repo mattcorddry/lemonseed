@@ -2086,9 +2086,9 @@ class StubHttpTests(unittest.TestCase):
 
 OWUI_EXPORT_FIXTURE = {
     "openai.enable": True,
-    "openai.api_base_urls": ["http://host.docker.internal/_lemonseed/lemond/v1"],
+    "openai.api_base_urls": ["http://lemonseed-litellm:4000/v1"],
     "openai.api_keys": ["sk-PLAINTEXT"],
-    "openai.api_configs": {"http://host.docker.internal/_lemonseed/lemond/v1": {"valves": {}}},
+    "openai.api_configs": {"http://lemonseed-litellm:4000/v1": {"valves": {}}},
     "ollama.enable": False,
     "web.search.enable": True,
     "vector_db.chunks_per_collection": {"docs": 10},

@@ -151,6 +151,10 @@ class ResolverContext:
     api_map: dict[str, str] = field(default_factory=dict)
     secrets: dict[str, str] = field(default_factory=dict)
     lemond_base: str = ""
+    # Empty until the LiteLLM proxy is serving (M9 P1): the connection settings
+    # derived from it then resolve to skip-with-drift, keeping OWUI pointed at
+    # lemond until the cutover target is a verified fact.
+    litellm_base: str = ""
     placeholders: dict[str, str] = field(default_factory=dict)
     # CP identity truth: [{email, name, is_admin, disabled}], built by wiring.
     cp_users: list[dict[str, Any]] = field(default_factory=list)
@@ -650,9 +654,24 @@ def _resolve_lemond_api_configs(ctx: ResolverContext) -> dict[str, Any]:
     return {ctx.lemond_base: {"valves": {}}}
 
 
+def _resolve_litellm_base(ctx: ResolverContext) -> str:
+    if not ctx.litellm_base:
+        raise PolicyError("litellm proxy is not ready yet")
+    return ctx.litellm_base
+
+
+def _resolve_litellm_api_configs(ctx: ResolverContext) -> dict[str, Any]:
+    if not ctx.litellm_base:
+        raise PolicyError("litellm proxy is not ready yet")
+    # v0.11.0 api_configs: url -> {"valves": {...}}; day one has no valves.
+    return {ctx.litellm_base: {"valves": {}}}
+
+
 RESOLVERS: dict[str, Callable[[ResolverContext], Any]] = {
     "lemond_base": _resolve_lemond_base,
     "lemond_api_configs": _resolve_lemond_api_configs,
+    "litellm_base": _resolve_litellm_base,
+    "litellm_api_configs": _resolve_litellm_api_configs,
     "api_paths_allow": lambda ctx: derive_allowed_endpoints(ctx.api_map),
 }
 
@@ -764,9 +783,33 @@ def _has_public_read_grant(grants: Any) -> bool:
 
 
 class ModelsHandler:
-    """OWUI admin models, owned by CP-chosen id (never server UUIDs)."""
+    """OWUI admin models, owned by CP-chosen id (never server UUIDs).
+
+    Since M9 P1 the owned ids ARE the LiteLLM entity names (``Lemonseed AI``,
+    ``Lemonseed AI with Content Filters``), carried as *override-style* rows:
+    ``base_model_id`` is null and the id matches the connection model, so
+    OWUI's backend merges the row into the connection entry in place — one
+    picker entry per entity instead of two look-alikes. The rows are still
+    what makes the entities visible to non-admins, because OWUI's model
+    filtering only shows models backed by a model row to members.
+
+    Observation is the **union of two reads**, because v0.11.0 has no single
+    endpoint that returns every row: ``models/base`` returns the
+    ``base_model_id IS NULL`` rows our override rows live in, while
+    ``models/export`` returns the ``base_model_id != NULL`` rows — which is
+    what keeps the reserved-name sweep and the public-grant pass able to see
+    wrapper-style rows, including the legacy ``lemonseed-ai`` rows the M9 P1
+    migration retires. Both are unpaginated; both require only the admin
+    role the service identity already holds.
+    """
 
     kind = "models"
+
+    # `models/create` requires these fields (v0.11.0 ModelForm), but their
+    # exported values are OWUI-normalized (meta gains its null ModelMeta keys,
+    # params may grow extras), so comparing them drifts forever. Create sends
+    # them empty; reconcile compares only the keys we actually own.
+    _OWUI_NORMALIZED_MODEL_KEYS = frozenset({"meta", "params"})
 
     # OWUI v0.11.0 access model: a resource is public exactly when its grant
     # list carries this wildcard (``user:*`` read). An empty list is
@@ -810,16 +853,27 @@ class ModelsHandler:
     def observe(
         self, client: Any, spec: EntitySpec, ctx: ResolverContext
     ) -> dict[str, dict]:
-        result = client.call("models.export")
-        if not result.get("ok"):
-            raise PolicyError(f"models.export failed: {result.get('error')}")
-        items = _response_items(result.get("data"), "models")
-        if items is None:
-            raise PolicyError("models.export: unexpected response shape")
+        """Ground truth keyed by CP-chosen id, from both row universes.
+
+        No v0.11.0 endpoint returns every model row, so observe reads the two
+        halves and merges. ``models/export`` rows keep the old semantics
+        (wrapper-style rows the service identity can write); ``models/base``
+        rows are the override-style rows our definitions land in. QEMU found
+        this the hard way: observing only the wrapper-filtered endpoints made
+        a freshly created override row invisible on the next reconcile, which
+        read as "missing" and re-created into ``MODEL_ID_TAKEN``.
+        """
         out: dict[str, dict] = {}
-        for item in items:
-            if isinstance(item, dict) and item.get("id"):
-                out[str(item["id"])] = item
+        for api, label in (("models.base", "models/base"), ("models.export", "models/export")):
+            result = client.call(api)
+            if not result.get("ok"):
+                raise PolicyError(f"{label} failed: {result.get('error')}")
+            items = _response_items(result.get("data"), "models")
+            if items is None:
+                raise PolicyError(f"{label}: unexpected response shape")
+            for item in items:
+                if isinstance(item, dict) and item.get("id"):
+                    out[str(item["id"])] = item
         return out
 
     def desired(self, spec: EntitySpec, ctx: ResolverContext) -> dict[str, dict]:
@@ -834,7 +888,7 @@ class ModelsHandler:
     def changes(self, spec: EntitySpec, desired: dict, observed: dict) -> Optional[dict]:
         payload: dict[str, Any] = {}
         for key, want in desired.items():
-            if key in ("id",):
+            if key in {"id", *self._OWUI_NORMALIZED_MODEL_KEYS}:
                 continue
             if observed.get(key) != want:
                 payload[key] = copy.deepcopy(want)

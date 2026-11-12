@@ -65,6 +65,7 @@ DEFAULT_API: dict[str, str] = {
     "config.import": "POST /api/v1/configs/import",
     "config.namespace": "GET /api/v1/configs/namespace/{namespace}",
     "models.export": "GET /api/v1/models/export",
+    "models.base": "GET /api/v1/models/base",
     "models.list": "GET /api/v1/models/list",
     "models.create": "POST /api/v1/models/create",
     "models.update": "POST /api/v1/models/model/update",
@@ -342,7 +343,7 @@ class OwuiClient:
         return self.call("config.namespace", path_params={"namespace": namespace})
 
     def models_admin_list(self) -> dict[str, Any]:
-        """Admin ground truth (``models/list`` is access-filtered — never it)."""
+        """``models/export`` rows (v0.11.0 returns only base_model_id rows)."""
         return self.call("models.export")
 
     def model_create(self, model: dict[str, Any]) -> dict[str, Any]:

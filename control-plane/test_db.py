@@ -709,7 +709,7 @@ class DataSuperviseTests(unittest.TestCase):
     @mock.patch.object(data_services, "pg_isready", return_value=True)
     def test_data_snapshot_shape(self, _ready: mock.Mock, _port: mock.Mock) -> None:
         snap = data_services.data_snapshot()
-        self.assertEqual(set(snap), {"postgres", "valkey", "provisioning"})
+        self.assertEqual(set(snap), {"postgres", "valkey", "litellm", "provisioning"})
         self.assertEqual(snap["postgres"]["state"], "ready")
         self.assertEqual(snap["valkey"]["state"], "ready")
 

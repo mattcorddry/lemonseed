@@ -423,6 +423,11 @@ def supervise_data_once() -> None:
     _supervise_one(
         VALKEY_CONTAINER, VALKEY_IMAGE_KEY, "valkey", 6379, _valkey_run_args
     )
+    # LiteLLM rides the same worker (lazy import: litellm.py imports this
+    # module's docker helpers, so the cycle is cut here, not at module load).
+    from litellm import supervise_litellm_once
+
+    supervise_litellm_once()
     # Audit retention rides here rather than on the module policy tick: that one
     # only runs when Open WebUI is up, and rows have to stop accumulating on a
     # box that never installs a module at all.
@@ -448,9 +453,12 @@ def ensure_data_worker() -> None:
 
 
 def data_snapshot() -> dict[str, Any]:
+    from litellm import litellm_snapshot  # lazy: see supervise_data_once
+
     return {
         "postgres": postgres_snapshot(),
         "valkey": valkey_snapshot(),
+        "litellm": litellm_snapshot(),
         "provisioning": provisioning_snapshot(),
     }
 

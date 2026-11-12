@@ -1,4 +1,9 @@
 {
+  "litellm": {
+    "name": "ghcr.io/berriai/litellm",
+    "tag": "v1.108.3",
+    "digest": "sha256:f14d0a035d84d1a8bc98538faf5999e456641fd4cfa191822fd4be1934c1f4f6"
+  },
   "open_webui": {
     "name": "ghcr.io/open-webui/open-webui",
     "tag": "v0.11.0",

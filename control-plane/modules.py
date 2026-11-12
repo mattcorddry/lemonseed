@@ -587,9 +587,26 @@ def _policy_context() -> owui_policy.ResolverContext:
             "CP_OWUI_ID": _service_account_id,
             "SERVICE_ACCOUNT_ID": _service_account_id,
         }
+    secrets = dict(_module_credentials(MODULE_ID))
+    litellm_base = ""
+    try:
+        from litellm import LITELLM_BASE, master_key
+
+        # The connection is owned unconditionally (like every core service):
+        # the proxy is the one OpenAI-compatible endpoint, and the three
+        # connection settings flip together at the very first reconcile, so a
+        # half-cutover (new key on the old lemond URL) can never exist. If the
+        # litellm module itself is broken, litellm_base stays empty and the
+        # optional manifest entries report unresolved without blocking the
+        # reconcile gate.
+        litellm_base = LITELLM_BASE
+        secrets["LITELLM_MASTER_KEY"] = master_key()
+    except Exception as exc:  # noqa: BLE001 — a litellm problem must not break the lemond path
+        print(f"open-webui policy: litellm context unavailable: {exc}", flush=True)
     return owui_policy.ResolverContext(
-        secrets=_module_credentials(MODULE_ID),
+        secrets=secrets,
         lemond_base=LEMONADE_BASE,
+        litellm_base=litellm_base,
         placeholders=placeholders,
         cp_users=auth.owui_identities(),
     )

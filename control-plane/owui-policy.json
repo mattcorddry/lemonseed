@@ -11,6 +11,12 @@
         "cadence": "at_boot",
         "reason": "No Ollama on the appliance; the egress surface stays closed."
       },
+      "evaluation.arena.enable": {
+        "value": false,
+        "mode": "managed",
+        "cadence": "at_boot",
+        "reason": "The LM Arena evaluation feature is not a Lemonseed capability; left on, its default placeholder model joins every picker."
+      },
       "direct.enable": {
         "value": false,
         "mode": "managed",
@@ -21,25 +27,28 @@
         "value": true,
         "mode": "managed",
         "cadence": "at_boot",
-        "reason": "Lemonade (lemond) is the OpenAI-compatible upstream for chat."
+        "reason": "The LiteLLM proxy is the OpenAI-compatible upstream for chat."
       },
       "openai.api_base_urls": {
-        "value": { "derived": "lemond_base", "wrap": "list" },
+        "value": { "derived": "litellm_base", "wrap": "list" },
         "mode": "managed",
         "cadence": "at_boot",
-        "reason": "Chat traffic goes to Lemonade and nowhere else (whole list is ours)."
+        "optional": true,
+        "reason": "Chat traffic goes to the LiteLLM proxy and nowhere else (whole list is ours). Optional only so a broken gateway module reports unresolved instead of blocking the reconcile gate."
       },
       "openai.api_keys": {
-        "value": { "secret": "OPENAI_API_KEY", "wrap": "list" },
+        "value": { "secret": "LITELLM_MASTER_KEY", "wrap": "list" },
         "mode": "managed",
         "cadence": "at_boot",
-        "reason": "The Lemonade API key for the managed connection (masked in the portal)."
+        "optional": true,
+        "reason": "The CP-generated LiteLLM master key for the managed connection (masked in the portal). The connection set flips as one, so this is optional on the same terms as the base URL."
       },
       "openai.api_configs": {
-        "value": { "derived": "lemond_api_configs" },
+        "value": { "derived": "litellm_api_configs" },
         "mode": "managed",
         "cadence": "at_boot",
-        "reason": "Exactly one model connection: Lemonade, with no per-connection valves."
+        "optional": true,
+        "reason": "Exactly one model connection: the LiteLLM proxy, with no per-connection valves."
       },
       "web.search.enable": {
         "value": false,
@@ -250,11 +259,26 @@
     "models": {
       "mode": "selective_management",
       "own_by": "id",
-      "own_ids": ["lemonseed-ai", "lemonseed-ai-filtered"],
+      "own_ids": ["Lemonseed AI", "Lemonseed AI with Content Filters"],
       "reserved_name_regex": "^Lemonseed.*$",
       "ensure_public": true,
-      "definitions": {},
-      "reason": "Lemonseed owns ids lemonseed-ai* and the Lemonseed name space; other models are never touched except for one thing: every model entry on the box is public (one wildcard read grant), because model choice is a global, admin-managed setting and the OWUI model editor defaults new entries to owner-only access. Definitions arrive with Phase 5 (LiteLLM)."
+      "definitions": {
+        "Lemonseed AI": {
+          "id": "Lemonseed AI",
+          "name": "Lemonseed AI",
+          "base_model_id": null,
+          "meta": {},
+          "params": {}
+        },
+        "Lemonseed AI with Content Filters": {
+          "id": "Lemonseed AI with Content Filters",
+          "name": "Lemonseed AI with Content Filters",
+          "base_model_id": null,
+          "meta": {},
+          "params": {}
+        }
+      },
+      "reason": "Lemonseed owns the two LiteLLM entity names and the Lemonseed name space; other models are never touched except for one thing: every model entry on the box is public (one wildcard read grant), because model choice is a global, admin-managed setting and the OWUI model editor defaults new entries to owner-only access. The two definitions are override-style rows: base_model_id is null and the id IS the LiteLLM entity name, so OWUI's backend merges the row into the connection model in place and the picker carries one entry per entity instead of a duplicate look-alike pair. meta/params are sent empty (models/create requires them) and are deliberately excluded from drift comparison, because their exported shape is OWUI-normalized. Legacy wrapper rows (lemonseed-ai*) leave own_ids and are swept by the reserved-name rule on the first post-upgrade reconcile."
     },
     "users": {
       "mode": "full_management",
@@ -314,7 +338,7 @@
     "config.import": "POST /api/v1/configs/import",
     "config.namespace": "GET /api/v1/configs/namespace/{namespace}",
     "models.export": "GET /api/v1/models/export",
-    "models.list": "GET /api/v1/models/list",
+    "models.base": "GET /api/v1/models/base",
     "models.create": "POST /api/v1/models/create",
     "models.update": "POST /api/v1/models/model/update",
     "models.access_update": "POST /api/v1/models/model/access/update",

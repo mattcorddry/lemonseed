@@ -2,8 +2,16 @@
 # Run all unit tests (no root, no hypervisor, no bare metal).
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.."; pwd)"
 cd "${ROOT}"
+
+# The installer's download dir defaults to /var/lib/lemonseed/download; unit
+# tests run unprivileged, so point it at a scratch dir before anything imports
+# install.py (the constant is read at import time). A fixed path, not mktemp:
+# the runner is invoked many times a day and a fresh temp dir each run would
+# just litter /tmp.
+LEMONSEED_DOWNLOAD_DIR="${TMPDIR:-/tmp}/lemonseed-unit-tests/download"
+export LEMONSEED_DOWNLOAD_DIR
 
 "${ROOT}/scripts/check-untracked.sh"
 

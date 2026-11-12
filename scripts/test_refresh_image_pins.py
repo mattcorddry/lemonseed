@@ -182,6 +182,113 @@ class WriteTests(unittest.TestCase):
                 rip.main(["--set-tag", "postgres", "--pins", str(self.tmp)], resolver=stable)
 
 
+class LatestStableTests(unittest.TestCase):
+    """The LiteLLM tag tracks upstream's newest stable GitHub release; only an
+    explicit --latest-stable may query the network (never --check, never CI)."""
+
+    RELEASE_PAYLOAD = {
+        "tag_name": "v1.108.3",
+        "draft": False,
+        "prerelease": False,
+    }
+
+    def _urlopen(self, payload, status=200):
+        response = mock.Mock()
+        response.__enter__ = mock.Mock(return_value=response)
+        response.__exit__ = mock.Mock(return_value=False)
+        response.read.return_value = json.dumps(payload).encode()
+        response.status = status
+        return mock.Mock(return_value=response)
+
+    def test_reads_the_newest_stable_release(self) -> None:
+        with mock.patch.object(rip.urllib.request, "urlopen", self._urlopen(self.RELEASE_PAYLOAD)):
+            self.assertEqual(rip.latest_stable_tag("BerriAI/litellm"), "v1.108.3")
+
+    def test_fails_closed_on_prerelease_draft_or_missing_tag(self) -> None:
+        for mutate in (
+            {"draft": True},
+            {"prerelease": True},
+            {"tag_name": ""},
+            {"tag_name": None},
+            "not-a-dict",
+        ):
+            payload = dict(self.RELEASE_PAYLOAD, **mutate) if isinstance(mutate, dict) else mutate
+            with mock.patch.object(rip.urllib.request, "urlopen", self._urlopen(payload)):
+                with self.assertRaises(rip.RefreshError):
+                    rip.latest_stable_tag("BerriAI/litellm")
+
+    def test_network_failure_fails_closed(self) -> None:
+        with mock.patch.object(
+            rip.urllib.request, "urlopen", side_effect=OSError("no dns")
+        ):
+            with self.assertRaises(rip.RefreshError):
+                rip.latest_stable_tag("BerriAI/litellm")
+
+    def test_latest_stable_flag_with_unchanged_tag_still_rebases_digest(self) -> None:
+        """Same tag but new digest upstream: --latest-stable must not skip the
+        refresh — the digest is what an appliance actually runs."""
+        tmp = Path(tempfile.mkdtemp()) / "container-images.json"
+        tmp.write_text(
+            json.dumps(
+                {
+                    "litellm": {
+                        "name": "ghcr.io/berriai/litellm",
+                        "tag": "v1.108.3",
+                        "digest": DIGEST_A,
+                    }
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with mock.patch.object(
+            rip, "latest_stable_tag", return_value="v1.108.3"
+        ) as m_latest:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                code = rip.main(
+                    ["--latest-stable", "--pins", str(tmp)],
+                    resolver=lambda _nt: DIGEST_B,
+                )
+        self.assertEqual(code, 0)
+        m_latest.assert_called_once_with("BerriAI/litellm")
+        data = json.loads(tmp.read_text())
+        self.assertEqual(data["litellm"]["tag"], "v1.108.3", "same tag stays")
+        self.assertEqual(data["litellm"]["digest"], DIGEST_B)
+
+    def test_latest_stable_flag_with_new_tag_moves_the_pin(self) -> None:
+        tmp = Path(tempfile.mkdtemp()) / "container-images.json"
+        tmp.write_text(
+            json.dumps(
+                {
+                    "litellm": {
+                        "name": "ghcr.io/berriai/litellm",
+                        "tag": "v1.108.2",
+                        "digest": DIGEST_A,
+                    }
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with mock.patch.object(
+            rip, "latest_stable_tag", return_value="v1.108.3"
+        ) as m_latest:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                code = rip.main(
+                    ["--latest-stable", "--pins", str(tmp)],
+                    resolver=lambda _nt: DIGEST_B,
+                )
+        self.assertEqual(code, 0)
+        m_latest.assert_called_once_with("BerriAI/litellm")
+        data = json.loads(tmp.read_text())
+        self.assertEqual(data["litellm"]["tag"], "v1.108.3")
+        self.assertEqual(data["litellm"]["digest"], DIGEST_B)
+
+
 class InTreePinsTests(unittest.TestCase):
     def test_shipped_pins_file_is_refreshable(self) -> None:
         """Guard the real file against a schema the rebaser cannot read."""

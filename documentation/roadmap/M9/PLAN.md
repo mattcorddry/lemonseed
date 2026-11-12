@@ -1,8 +1,11 @@
 # M9 — Modules framework, LiteLLM, and expanded model offerings
 
-Draft for approval, revised 2026-11-02. `DESIGN.md` is the as-built product contract;
+Draft for approval, revised 2026-11-02. **Revised again 2026-11-12**: P5 is
+redefined as the **Lemonade 2026.46 engine upgrade** with the original
+model-catalog-expansion work absorbed into it (D43), placed ahead of the Hermes
+module work. `DESIGN.md` is the as-built product contract;
 this document is the **sprint pull** from `BACKLOG.md` (items tagged `[M9]`) and from
-M8's close-out. Decisions D32–D42 at the bottom continue the global decision log, so
+M8's close-out. Decisions D32–D44 at the bottom continue the global decision log, so
 nothing gets re-litigated mid-build.
 
 M8 closed with P1–P7 shipped and bare-metal verified: signed GitHub releases with
@@ -24,6 +27,10 @@ tools get one gateway, and other LAN apps get an OpenAI-compatible endpoint.
   module never changes OWUI's configuration.
 - Health is **live**: Postgres, Valkey, lemond, LiteLLM and every module flip the
   status fields when they stop serving.
+- The appliance runs the **Lemonade 2026.46 engine** with the catalog refreshed
+  from the pinned release at build time, and — if the phase budget allows —
+  container backends on supported hardware (D43; the container migration carries
+  its own decision point to push to M10).
 - The AMD dGPU path is validated on bare metal (planner fit arithmetic on VRAM).
 
 ## Scope and boundary
@@ -34,9 +41,19 @@ tools get one gateway, and other LAN apps get an OpenAI-compatible endpoint.
 | P2 | Module catalog spec v1 + CP lifecycle + hooks | **yes — spec schema and dependency model** | no |
 | P3 | First module: MCP gateway (Plugin) | no | (BM-1) |
 | P4 | Live API health | no | no |
-| P5 | Model catalog expansion (build-time catalog refresh, checkpoint check, custom models) | no | no |
-| P6 | Hermes (Application module) | **yes — dedicated design document** | BM-2 |
-| P7 | AMD dGPU bare-metal validation | no | BM-3 |
+| P5 | **Lemonade 2026.46 engine upgrade + model catalog refresh** — P5.1 engine bump + API re-baseline; P5.2 HTTP job surface + build-time catalog refresh and registration; P5.3 container backends + native-pin retirement (D43) | **yes — engine pin, catalog registration, container-engine bring-up** | BM-2 |
+| P6 | Hermes (Application module) | **yes — dedicated design document** | BM-3 |
+| P7 | AMD dGPU bare-metal validation | no | BM-4 |
+
+**Why the upgrade sits here.** The module-framework phases (P2–P4) never touch
+the inference core, so building them first does not create rework; P5 is one
+coherent cut because the build-time catalog refresh is keyed on the pinned
+release (bump the pin → refresh the catalog in the same change), and it keeps
+P6 Hermes — the milestone's largest remaining lift — off the engine churn. If
+nix-amd-ai carries a settled 2026.46 release before P2's build starts, the
+upgrade may jump the queue ahead of P2 instead; both orders keep the same phase
+gate. The detail lives in
+[`LEMONADE-26.md`](../LEMONADE-26.md); P5 follows it.
 
 **Phase gate (M8's, unchanged).** A phase ends when `make test` **and**
 `QEMU_API_TIMEOUT=… make test-qemu` are both green, its new tests exist, and its
@@ -102,6 +119,24 @@ Valkey — not a module:
 
 Config authority settled (this document + `DESIGN.md` §3.4/§3.5 updates), QEMU green,
 BM-1 pass.
+
+> **As built (M9 P1):** design `LITELLM.md` + implementation landed; unit tests
+> green (`control-plane/test_litellm.py`, plus policy/pin/snapshot fixtures
+> updated). Deviations are recorded in `LITELLM.md` §4–§8 as built: the guardrail
+> is `litellm_content_filter` + `harmful_child_safety` (the sketched id does not
+> exist upstream and would brick the proxy), the master key lives under
+> `general_settings.master_key`, the per-model guardrail attach lives inside
+> `litellm_params`, the OWUI MCP config write is **deferred to P3** (mechanics
+> unvalidated in the spike), the cutover is unconditional (§6), and there is
+> deliberately no QEMU image preload — the proxy only starts once a model is
+> chosen, which the QEMU profile never has, so chat-through-LiteLLM and the
+> filtered-entity probe are BM-1 items. BM-1 review fixes, also as built: the
+> OWUI model rows are **override-style** (id = the LiteLLM entity name,
+> `base_model_id: null`, observed via paginated `models/list`) after the first
+> wrapper implementation rendered every entity twice for admins, and
+> `evaluation.arena.enable` is pinned off (its default "Arena Model" placeholder
+> joined every picker). The filtered entity is **shipped**: the BM probe blocked a
+> prompt through it (`harmful_child_safety`, severity high).
 
 ---
 
@@ -219,44 +254,102 @@ fails.
 
 ---
 
-## P5 — Model catalog expansion
+## P5 — Lemonade 2026.46 engine upgrade + model catalog refresh
+
+*(Redefined 2026-11-12 — the original P5, "Model catalog expansion", is absorbed
+into P5.2 below; the upgrade's detail is [`LEMONADE-26.md`](../LEMONADE-26.md),
+which this phase follows.)*
 
 ### Problem
 
-Our model catalog has drifted from the pinned Lemonade release — Lemonade added new
-models (e.g. Qwen3.8) that we never picked up, because the catalog is hand-maintained.
-And nothing verifies that catalog checkpoints exist in the pinned Lemonade release
-before an image ships.
+The appliance runs lemond 11.5.2 (pinned llama.cpp b10273/b10236, July release)
+against an upstream now on the date-versioned `v2026.MM.NN` cadence. 2026.46.2
+brings the container-backend machinery, a server-owned download/job surface, and
+a much richer `/v1/system-info` — the surfaces the catalog work and the planner
+need. Meanwhile our hand-maintained catalog has drifted from the pinned release
+(Lemonade added models, e.g. Qwen3.8, that we never picked up) and nothing
+verifies catalog checkpoints against the pinned release before an image ships.
+The engine bump and the catalog refresh are one cut: the refresh derives from
+the pinned release, so bumping the pin and refreshing the catalog land together.
 
-### Proposal
+### Proposal — three sub-phases
 
-- **Build-time catalog refresh:** the build derives our catalog entries from the
-  pinned Lemonade release's `server_models.json`, so new upstream models are picked
-  up by a rebuild instead of by hand. Our catalog carries only what we add on top
-  (friendly names where they matter, availability, descriptions).
-- **Build-time checkpoint check:** every catalog `checkpoint` must exist in the
-  pinned `server_models.json` (the disk-space guard's directory matching once broke
-  on a case disagreement).
-- **Custom models:** models we offer that Lemonade does not — direct HF checkpoint
-  path + `lemonade load`, plus the llama.cpp arch-support caveat. LiteLLM reduces
-  the display-name pressure here: what OWUI shows comes from LiteLLM's config, not
-  from Lemonade-side naming.
-- **Deferred: the `moe` attribute.** Hand-maintaining a per-model MoE flag will
-  rot; it returns to the backlog unless Lemonade (or the models themselves) expose
-  a queryable attribute we can derive it from.
+- **P5.1 Engine bump + API re-baseline.** Bump the nix-amd-ai flake pin (or
+  vendor the upstream build) to a settled 2026.46 release (46.3 preferred over
+  the two-day-old 46.2 once nix-amd-ai carries it); keep the existing native
+  llama.cpp builds **unchanged** as the legacy test point. The **native-bridge
+  gate**: verify the new lemond still execs our `*_bin` paths verbatim
+  (`prefer_system = false`) and does not demand its own `backend_versions.json`
+  pins — if it refuses, skip the native-bridge work and jump to P5.3's
+  container work instead. Adopt the new `/v1/system-info` in `hardware.py`
+  (read `devices.amd_gpu`, plan on `virtual_mem_gb`, read
+  `recipes.*.backends[].state`, delete the llama-cli/vulkaninfo fallback
+  probes); audit every `/v1/models` consumer for the
+  `image_defaults`/`audio_defaults` → `recipe_options` break; refresh the
+  `lemonade-python-sdk` pin; lemond config review (`LEMONADE_DEFAULTS_PATH`,
+  `LEMONADE_ADMIN_API_KEY`, `no_fetch_executables` semantics, telemetry off,
+  `withWebApp=false` still excludes `/app`).
+- **P5.2 HTTP job surface + build-time catalog refresh.** The CP moves pull/load
+  to `POST /v1/pull` + `GET /v1/downloads` (+ `POST /v1/downloads/control` for
+  cancel — killing a `Popen` dies), the portal's "Getting Ready" interstitial
+  and the power interlock (`in_flight_work()`) read real job progress, and the
+  curated catalog **registers itself** through `POST /v1/models/register` as
+  `user.*` definitions with named checkpoints. The original P5 work rides
+  here: the build derives catalog entries from the pinned release's
+  `server_models.json` (which this release refactored to list every model file
+  — name drift is a live risk that registration removes), every `checkpoint`
+  is verified at build time, custom models keep the direct HF checkpoint path,
+  and the `moe` attribute stays deferred. LiteLLM reduces display-name
+  pressure. `/internal/aliases` is the optional native home for the
+  `Lemonseed AI` naming layer below LiteLLM.
+- **P5.3 Container backends + native-pin retirement.** lemond's container
+  machinery (rootless Podman default, Docker fallback) is the destination for
+  inference: upstream refreshes the engine images, so new Strix Halo engines
+  (nathanw, halobox, rocmfpx, gufo, ds4:rocm, halogen) arrive as *installable
+  backends* instead of a Nix packaging battle. Bring-up: Docker via the
+  existing daemon (docker-group for `lemond` — root-equivalent risk accepted,
+  D43), a hardening carve-out in `lemond.nix` scoped to the socket, a
+  **digest-pin allowlist of our own** (upstream refreshes image digests between
+  releases; track them alongside `container-images.json`), and the
+  no-pull-on-the-boot-path invariant preserved by pre-pulling images at
+  install/update/first-selection. **The CP never enumerates hardware**: the
+  backend offer is whatever `recipes.llamacpp.backends[]` reports as
+  `installed`/`installable`, filtered only by a derived allowlist (backends
+  whose device families lemond reports — never hardcoded to `gfx1151`), a
+  core > guest tier preference, and the container-tool preflight. Native CUDA
+  moves to lemond's own per-arch core binary (installed off the critical path
+  via `POST /v1/install`); the Nix-built CUDA binary becomes the offline
+  fallback/test point. Native Vulkan drops from the production image once
+  Strix Halo is container-served and no AMD dGPU path depends on it; the
+  native CPU build stays for QEMU.
+- **Decision point (P5.3):** if the container migration balloons beyond the
+  milestone's budget, it moves to M10 with the design note landing in
+  `LEMONADE-26.md` — P5.1 and P5.2 do not depend on it, and neither does P6.
 
 ### Tests
 
-Unit: the catalog refresh produces entries for every upstream model (and drops
-vanished ones); the checkpoint check fails the build on a missing checkpoint; our
-additions survive the refresh. The refresh is wired into the catalog build so a
-Lemonade pin bump picks up new models without a manual pass.
+- Unit: system-info parsing (AMD devices + backend states, no double counting
+  with the deleted probes), the `/v1/models` `recipe_options` break, the
+  catalog refresh (entries for every upstream model, vanished ones dropped,
+  our additions survive, the checkpoint check fails the build on a missing
+  checkpoint), registration round-trip (`user.*` ids, named checkpoints),
+  download-job progress/cancel plumbing, and P5.3's allowlist derivation
+  (family-derived, tier-preferred, container-tool preflight).
+- QEMU: the engine bump keeps `make test-qemu` green end to end; a model
+  switch mid-pull cancels cleanly through `downloads/control`; the refreshed
+  catalog loads from registered definitions; P5.3 adds container bring-up on
+  the QEMU CPU profile only if the profile adopts containers (otherwise QEMU
+  stays on the native CPU backend).
+- **BM-2:** the Strix box validated on the new engine — pull → load → verify →
+  `/api/system` healthy, the planner's `virtual_mem_gb` mapping correct, and
+  (P5.3) at least two container engines loaded, one unload leaving no orphan
+  containers.
 
 ### Gate
 
-`make test` green, the build-time refresh + checkpoint check wired into the catalog
-build, and a diff review of the refreshed catalog against the current hand-written
-one.
+`make test` + QEMU green through the new engine; the refreshed catalog diff
+reviewed against the hand-written one; BM-2 pass. P5.3 carries the M10 decision
+point.
 
 ---
 
@@ -292,11 +385,11 @@ landing here — the module framework (P2) does not depend on it.
 
 Unit: policy decisions (launch on sign-in, opt-in gating, teardown on user delete).
 QEMU: two users, isolated panels, teardown.
-BM-2: both users on real hardware, containers bounded.
+BM-3: both users on real hardware, containers bounded.
 
 ### Gate
 
-Design document approved → implementation → QEMU green → BM-2 pass. Or the explicit
+Design document approved → implementation → QEMU green → BM-3 pass. Or the explicit
 push to M10 with the design note landed.
 
 ---
@@ -326,7 +419,8 @@ unless discovery or fit arithmetic surfaces a defect.
 
 ### Gate
 
-Documented BM run; hardware-support matrix updated.
+Documented BM run; hardware-support matrix updated. *(This phase's bare-metal
+checkpoint is BM-4.)*
 
 ---
 
@@ -362,6 +456,8 @@ Documented BM run; hardware-support matrix updated.
 | **D40** | Hermes is an **Application module** with a dedicated design document (user-scoped, multi-instance containers; demand-launch vs opt-in policy; user-CRUD teardown; OWUI "Actions" entry). Implementation in M9 with a decision point to push to M10 if the design balloons. |
 | **D41** | Model catalog maintenance is **build-time**: the catalog is refreshed from the pinned Lemonade release's `server_models.json` (new upstream models are picked up by a rebuild), every `checkpoint` is verified against that file, and custom models use the direct HF checkpoint path. Display-name pressure is reduced by LiteLLM (what OWUI shows comes from LiteLLM's config). The `moe` attribute is **deferred** until it can be derived from a queryable upstream attribute. |
 | **D42** | The AMD dGPU bare-metal validation (RX 7600, tier-D) is an M9 deliverable: planner fit arithmetic on VRAM is a different path from the APU carve-out. |
+| **D43** | **The Lemonade engine is upgraded to 2026.46 within M9 (P5), ahead of the Hermes module work.** Container backends are the destination for inference; the native llama.cpp pin is a legacy test point, not the production path (no re-pin to the upstream build numbers unless containers are blocked). The container engine is **Docker via docker.sock for the `lemond` account** — root-equivalent risk accepted (Docker is already the module platform; rootless Podman is the fallback, with the runc→CPU trap). **The control plane never enumerates hardware**: lemond's `/v1/system-info` decides, and the CP adds only policy on top — an allowlist derived from the device families lemond reports (never hardcoded to one family), a core > guest tier preference, and the container-tool preflight. NVIDIA has no CUDA container upstream (NVIDIA container images are spec'd future work), so the NVIDIA path is lemond's own **native** per-arch CUDA binary (installed off the critical path via `POST /v1/install`); the Nix-built CUDA binary is only an offline fallback/test point. Detail in [`LEMONADE-26.md`](../LEMONADE-26.md). |
+| **D44** | **Model catalog maintenance is build-time *and* registration-based.** The catalog refresh derives entries from the pinned release's `server_models.json` and the CP **registers** them through `POST /v1/models/register` as `user.*` definitions with named checkpoints, so our offering no longer depends on upstream's built-in catalog still carrying our exact names. (Extends D41; D41's checkpoint check verifies the refresh at build time, and custom models keep the direct HF checkpoint path.) |
 
 ## Open questions
 
@@ -377,3 +473,10 @@ Documented BM run; hardware-support matrix updated.
 4. **Hermes launch policy default** — opt-in per user is the working answer;
    settled finally in the P6 design document (alongside the Hermes 0.23 WebApp vs
    OWUI evaluation).
+5. ~~Which 2026.46 release to pin~~ — **answered:** a settled 2026.46.2/46.3
+   once nix-amd-ai carries it; if nix-amd-ai lags, vendor the upstream source
+   build in-tree (the open question in DESIGN §12.8). The upgrade never
+   re-pins the native llama.cpp builds (D43's legacy-test-point stance).
+6. **Does `no_fetch_executables = true` block container image pulls?** Must be
+   tested explicitly in P5.1 — the flag's semantics are load-bearing for the
+   appliance's no-downloads-on-the-boot-path invariant.

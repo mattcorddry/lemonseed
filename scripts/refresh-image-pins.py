@@ -12,6 +12,7 @@ silently by every ``docker pull`` on every deployed box.
     ./scripts/refresh-image-pins.py                # rebase every stale pin
     ./scripts/refresh-image-pins.py postgres       # just one pin
     ./scripts/refresh-image-pins.py --set-tag open_webui=v0.12.0
+    ./scripts/refresh-image-pins.py litellm --latest-stable   # rebase to upstream's newest stable release
 
 Asking the registry (``docker buildx imagetools inspect``) rather than pulling
 means this works for a 1.7 GB image without downloading it. The digest returned
@@ -31,6 +32,7 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
@@ -42,10 +44,19 @@ _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _TOP_DIGEST_RE = re.compile(r"^Digest:\s+(sha256:[0-9a-f]{64})\s*$", re.MULTILINE)
 
 # Where a digest change also needs a fixed-output hash rewritten.
+# LiteLLM is not preloaded into the QEMU profile (it only starts once a model
+# is chosen, which QEMU never has), so it has no fixed-output hash to rebase.
 HASH_FILES = {
     "postgres": "nixos/modules/qemu-docker-cache.nix",
     "valkey": "nixos/modules/qemu-docker-cache.nix",
     "open_webui": "flake.nix",
+}
+
+# Pins whose tag is meant to track upstream's newest stable release. Used only
+# by --latest-stable (an explicit --set-tag always wins): normal refreshes and
+# --check never touch the network.
+RELEASE_TRACKED = {
+    "litellm": "BerriAI/litellm",
 }
 
 Resolver = Callable[[str], str]
@@ -88,6 +99,26 @@ def registry_digest(name_tag: str) -> str:
         detail = (done.stderr or done.stdout or "").strip()
         raise RefreshError(f"registry query failed for {name_tag}: {detail[:300]}")
     return parse_digest(done.stdout)
+
+
+def latest_stable_tag(repo: str) -> str:
+    """The newest non-draft, non-prerelease release tag of a GitHub repo.
+
+    ``releases/latest`` is exactly that set — GitHub's own channel semantics,
+    matching D5's stable channel — so one request decides the tag. Fails closed:
+    a release we could not resolve must not silently rebase a pin.
+    """
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RefreshError(f"GitHub release query failed for {repo}: {exc}") from exc
+    tag = str(payload.get("tag_name") or "") if isinstance(payload, dict) else ""
+    if not tag or payload.get("draft") or payload.get("prerelease"):
+        raise RefreshError(f"GitHub returned no stable release tag for {repo}: {payload!r}"[:300])
+    return tag
 
 
 def plan(
@@ -179,6 +210,12 @@ def main(argv: Optional[List[str]] = None, resolver: Optional[Resolver] = None) 
         help="rebase a pin to a new tag before resolving (repeatable)",
     )
     parser.add_argument("--pins", type=Path, default=PINS_PATH, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--latest-stable",
+        action="store_true",
+        help="rebase release-tracked pins (see RELEASE_TRACKED) to upstream's "
+        "newest stable GitHub release before resolving",
+    )
     args = parser.parse_args(argv)
 
     set_tags: Dict[str, str] = {}
@@ -192,6 +229,13 @@ def main(argv: Optional[List[str]] = None, resolver: Optional[Resolver] = None) 
     try:
         pins = load_pins(args.pins)
         keys = args.keys or sorted(pins)
+        if args.latest_stable:
+            for key in keys:
+                repo = RELEASE_TRACKED.get(key)
+                if repo and key not in set_tags:
+                    tag = latest_stable_tag(repo)
+                    if tag != str(pins[key].get("tag") or ""):
+                        set_tags[key] = tag
         rows = plan(pins, keys, resolve, set_tags)
     except RefreshError as exc:
         print(f"refresh-image-pins: {exc}", file=sys.stderr)

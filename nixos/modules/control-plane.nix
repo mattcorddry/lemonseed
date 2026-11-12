@@ -18,6 +18,7 @@ let
        ${cpSrc}/owui_client.py \
        ${cpSrc}/owui_policy.py ${cpSrc}/owui_portal.py ${cpSrc}/owui-policy.json \
        ${cpSrc}/image_pins.py ${cpSrc}/container-images.json \
+       ${cpSrc}/litellm.py \
        ${cpSrc}/words-en_US.txt "$out/"
     cp ${cpSrc}/catalog/models.json "$out/catalog/"
     cp -r ${cpSrc}/static/brand/. "$out/static/brand/"

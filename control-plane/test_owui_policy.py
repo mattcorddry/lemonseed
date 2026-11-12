@@ -143,11 +143,12 @@ class _FakeClient:
         **kwargs: Any,
     ) -> dict[str, Any]:
         self.calls.append(
-            {"name": name, "path_params": path_params, "json_body": json_body}
+            {"name": name, "path_params": path_params, "json_body": json_body,
+             "kwargs": kwargs}
         )
         reply = self.responses.get(name, {"ok": True, "status": 200, "data": None, "error": None})
         if callable(reply):
-            reply = reply(name, path_params, json_body)
+            reply = reply(name, path_params, json_body, **kwargs)
         return {"ok": True, "status": 200, "data": reply, "error": None}
 
 
@@ -212,8 +213,8 @@ class TestManifest(unittest.TestCase):
         for spec in manifest.guards:
             self.assertTrue(spec.hint, f"{spec.path} has no hint")
             self.assertTrue(owui_policy._GUARD_HINT_RE.match(spec.hint), spec.path)
-        for logical in ("config.export", "config.import", "models.export", "users.all",
-                        "users.create", "users.update", "users.delete",
+        for logical in ("config.export", "config.import", "models.base", "models.export",
+                        "users.all", "users.create", "users.update", "users.delete",
                         "apikey.create", "app.version"):
             self.assertIn(logical, manifest.api)
         # Every api entry widens the CP key's allowed_endpoints, so an unused
@@ -232,10 +233,18 @@ class TestManifest(unittest.TestCase):
         self.assertIs(settings["ollama.enable"].spec.value, False)
         self.assertIs(settings["openai.enable"].spec.value, True)
         self.assertEqual(settings["openai.api_base_urls"].spec.kind, "derived")
-        self.assertEqual(settings["openai.api_base_urls"].spec.name, "lemond_base")
+        self.assertEqual(settings["openai.api_base_urls"].spec.name, "litellm_base")
         self.assertTrue(settings["openai.api_base_urls"].spec.wrap_list)
         self.assertEqual(settings["openai.api_keys"].spec.kind, "secret")
-        self.assertEqual(settings["openai.api_keys"].spec.name, "OPENAI_API_KEY")
+        self.assertEqual(settings["openai.api_keys"].spec.name, "LITELLM_MASTER_KEY")
+        definitions = load_real_manifest().entities["models"].config["definitions"]
+        self.assertEqual(
+            sorted(definitions),
+            ["Lemonseed AI", "Lemonseed AI with Content Filters"],
+        )
+        self.assertTrue(
+            all(d["base_model_id"] is None for d in definitions.values())
+        )
         params = settings["models.default_params"].spec.value
         self.assertEqual(params["function_calling"], "legacy")
         self.assertIn("Lemonseed", params["system"])
@@ -745,6 +754,7 @@ class TestResolvers(unittest.TestCase):
         # OWUI prefix semantics: parameterized routes cut at their first
         # {param} segment; static routes stay exact.
         self.assertIn("/api/v1/users", parts)
+        self.assertIn("/api/v1/models/base", parts)
         self.assertIn("/api/v1/models/export", parts)
         self.assertIn("/api/v1/configs/export", parts)
         self.assertIn("/api/config", parts)
@@ -890,6 +900,34 @@ class TestPlanner(unittest.TestCase):
         result = self._models_plan({}, {"lemonseed-ai": have})
         self.assertEqual(result.actions, [])
         self.assertEqual(result.entries, [])
+
+    def test_models_owui_normalized_fields_never_drift(self) -> None:
+        # QEMU finding: models/create requires meta+params, but their exported
+        # shape is OWUI-normalized (meta grows its null ModelMeta keys) —
+        # comparing them would update the row on every reconcile, forever.
+        want = {
+            "id": "lemonseed-ai",
+            "name": "Lemonseed AI",
+            "base_model_id": "Lemonseed AI",
+            "meta": {},
+            "params": {},
+        }
+        have = {
+            **want,
+            "meta": {
+                "profile_image_url": None,
+                "description": None,
+                "capabilities": None,
+                "knowledge": None,
+            },
+            "params": {"temperature": 0.7},
+        }
+        result = self._models_plan(
+            {"lemonseed-ai": want},
+            {"lemonseed-ai": have},
+            definitions={"lemonseed-ai": want},
+        )
+        self.assertEqual(result.actions, [])
 
     def test_models_foreign_reserved_name_sweeps_case_insensitive(self) -> None:
         have = {"id": "uuid-foreign", "name": "lemonseed ROBOT"}
@@ -1044,12 +1082,22 @@ class TestModelsHandler(unittest.TestCase):
             self.handler.validate("full_ownership", base)
 
     def test_observe_keys_by_cp_id(self) -> None:
-        client = _FakeClient({"models.export": [
-            {"id": "lemonseed-ai", "name": "Lemonseed AI"},
-            {"id": "theirs", "name": "Theirs"},
-        ]})
+        client = _FakeClient({
+            "models.base": [{"id": "Lemonseed AI", "name": "Lemonseed AI"}],
+            "models.export": [{"id": "lemonseed-ai", "name": "Lemonseed AI"}],
+        })
         observed = self.handler.observe(client, models_spec(), owui_policy.ResolverContext())
-        self.assertEqual(set(observed), {"lemonseed-ai", "theirs"})
+        # No v0.11.0 endpoint returns every row; the union is the ground truth.
+        self.assertEqual(set(observed), {"Lemonseed AI", "lemonseed-ai"})
+
+    def test_observe_rejects_unexpected_shape_on_either_read(self) -> None:
+        # A shape regression must surface as a policy error, not as an empty
+        # observation that would read as "every owned row vanished".
+        for bad in ({"models.base": None, "models.export": []},
+                    {"models.base": [], "models.export": {"rows": []}}):
+            client = _FakeClient(bad)
+            with self.assertRaises(owui_policy.PolicyError):
+                self.handler.observe(client, models_spec(), owui_policy.ResolverContext())
 
     def test_observe_failure_raises_policy_error(self) -> None:
         class _Down:
@@ -1397,8 +1445,12 @@ class TestReconcile(unittest.TestCase):
             load_api_key=lambda: fake.stored_key,
             persist_api_key=lambda key: (setattr(fake, "stored_key", key), True)[1],
             refresh_context=lambda: owui_policy.ResolverContext(
-                secrets={"OPENAI_API_KEY": "sk-lemon"},
+                secrets={
+                    "OPENAI_API_KEY": "sk-lemon",
+                    "LITELLM_MASTER_KEY": "sk-litellm",
+                },
                 lemond_base="http://host.docker.internal/_lemonseed/lemond/v1",
+                litellm_base="http://lemonseed-litellm:4000/v1",
                 placeholders={"SERVICE_ACCOUNT_ID": "svc-1", "CP_OWUI_ID": "svc-1"},
                 cp_users=cp_users if cp_users is not None else [
                     {"email": "ana@lemonseed.local", "name": "Ana",
@@ -1429,8 +1481,8 @@ class TestReconcile(unittest.TestCase):
         self.assertIs(fake.config["web.search.enable"], False)
         self.assertIs(fake.config["ollama.enable"], False)
         self.assertEqual(fake.config["openai.api_base_urls"],
-                         ["http://host.docker.internal/_lemonseed/lemond/v1"])
-        self.assertEqual(fake.config["openai.api_keys"], ["sk-lemon"])
+                         ["http://lemonseed-litellm:4000/v1"])
+        self.assertEqual(fake.config["openai.api_keys"], ["sk-litellm"])
         self.assertEqual(fake.config["ui.default_models"], [])
         # Keys for the CP: minted after settings applied, persisted once.
         self.assertTrue(state["key_ready"])
@@ -1443,9 +1495,16 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(by_email["bob@lemonseed.local"]["role"], "user")
         drift_keys = {e["key"] for e in state["drift"]["entries"] if e["state"] == "drift"}
         self.assertNotIn("users:lemonseed-cp@localhost", drift_keys)
-        # Models: foreign reserved-name swept; zero definitions = zero creates.
+        # Models: foreign reserved-name swept; the two owned definitions
+        # created as override rows sharing the LiteLLM entity ids.
         self.assertEqual(fake.model_deletes, ["uuid-k"])
-        self.assertEqual(fake.model_creates, [])
+        self.assertEqual(sorted(fake.model_creates),
+                         ["Lemonseed AI", "Lemonseed AI with Content Filters"])
+        by_model_id = {m["id"]: m for m in fake.models}
+        self.assertIsNone(by_model_id["Lemonseed AI"]["base_model_id"])
+        self.assertIsNone(
+            by_model_id["Lemonseed AI with Content Filters"]["base_model_id"]
+        )
         # LKG written from a fresh export on the ok run; timestamp surfaces.
         self.assertEqual(len(self.lkg_writes), 1)
         written_map, policy_hash, version = self.lkg_writes[0]
@@ -1464,6 +1523,24 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(fake.user_updates, [])
         self.assertEqual(fake.mints, 1)  # persisted key reused; no re-mint
 
+    def test_unresolved_litellm_keeps_the_gate_green(self) -> None:
+        """Degradation contract: if the litellm context is unavailable (broken
+        module, import failure), the connection entries report unresolved but
+        the box must not flip into a permanent policy error."""
+        fake = FakeOwui()
+        deps = self._deps(fake)
+        deps.refresh_context = lambda: owui_policy.ResolverContext(
+            secrets={"OPENAI_API_KEY": "sk-lemon"},
+            lemond_base="http://host.docker.internal/_lemonseed/lemond/v1",
+            placeholders={"SERVICE_ACCOUNT_ID": "svc-1", "CP_OWUI_ID": "svc-1"},
+            cp_users=[],
+        )
+        state = owui_policy.reconcile(18080, self.BOOT, deps)
+        self.assertTrue(state["ok"], state.get("last_error"))
+        entries = {e["key"]: e for e in state["drift"]["entries"]}
+        self.assertEqual(entries["openai.api_base_urls"]["state"], "error")
+        self.assertIn("litellm", entries["openai.api_base_urls"]["note"])
+
     def test_private_model_becomes_public_and_stays_there(self) -> None:
         # Bare-metal review: the OWUI model editor defaults an entry to
         # owner-only access, which hid the chat model from every non-admin.
@@ -1477,13 +1554,18 @@ class TestReconcile(unittest.TestCase):
         entry = next(e for e in state["drift"]["entries"]
                      if e["key"] == "models:access:m-1")
         self.assertEqual(entry["state"], "fixed")
-        # Second run: the wildcard grant is present, so nothing writes.
+        # Second run: m-1's wildcard grant is present, so nothing writes for
+        # it; the two models created in run 1 get their grants here instead.
         fake.model_access_updates.clear()
         state2 = owui_policy.reconcile(18080, self.BOOT, self._deps(fake))
         self.assertTrue(state2["ok"], state2.get("last_error"))
-        self.assertEqual(fake.model_access_updates, [])
-        self.assertFalse(any(e["key"].startswith("models:access:")
-                             for e in state2["drift"]["entries"]))
+        self.assertEqual(
+            sorted(u[0] for u in fake.model_access_updates),
+            ["Lemonseed AI", "Lemonseed AI with Content Filters"],
+        )
+        self.assertFalse(
+            any(e["key"] == "models:access:m-1" for e in state2["drift"]["entries"])
+        )
 
     def test_public_model_and_sweep_target_are_left_alone(self) -> None:
         fake = FakeOwui(models=[
@@ -1776,7 +1858,7 @@ class TestReconcile(unittest.TestCase):
         fake = FakeOwui(config={"openai.api_keys": ["sk-stray-key"]})
         state = owui_policy.reconcile(18080, self.BOOT, self._deps(fake))
         self.assertTrue(state["ok"], state.get("last_error"))
-        self.assertEqual(fake.config["openai.api_keys"], ["sk-lemon"])  # applied for real
+        self.assertEqual(fake.config["openai.api_keys"], ["sk-litellm"])  # applied for real
         entry = next(e for e in state["drift"]["entries"] if e["key"] == "openai.api_keys")
         self.assertEqual(entry["state"], "fixed")
         self.assertEqual(entry["found"], owui_policy.MASK)
@@ -1939,8 +2021,14 @@ class FakeOwui:
 
     def call(self, name, *, path_params=None, json_body=None, **kwargs):
         ok = {"ok": True, "status": 200, "error": None}
+        if name == "models.base":
+            # v0.11.0: base rows are exactly base_model_id IS NULL; export is
+            # its complement. The union is what the reconcile observes.
+            rows = [m for m in copy.deepcopy(self.models) if m.get("base_model_id") is None]
+            return {**ok, "data": rows}
         if name == "models.export":
-            return {**ok, "data": copy.deepcopy(self.models)}
+            rows = [m for m in copy.deepcopy(self.models) if m.get("base_model_id") is not None]
+            return {**ok, "data": rows}
         if name == "users.all":
             # Match v0.11.0 UserInfoListResponse, not the bare-list guess the
             # first fakes baked in.

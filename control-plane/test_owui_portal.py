@@ -35,12 +35,12 @@ REAL_MANIFEST = CP / "owui-policy.json"
 # values, both managed and unmanaged namespaces present.
 EXPORT: dict[str, Any] = {
     "openai.enable": True,
-    "openai.api_base_urls": ["http://host.docker.internal/_lemonseed/lemond/v1"],
+    "openai.api_base_urls": ["http://lemonseed-litellm:4000/v1"],
     "openai.api_keys": ["sk-PLAINTEXT"],
     "openai.api_configs": {
         # v0.11.0 shape: base url -> {"valves": {}}. Credentials live only in
         # openai.api_keys, so this value is expected to be shown unmasked.
-        "http://host.docker.internal/_lemonseed/lemond/v1": {"valves": {}},
+        "http://lemonseed-litellm:4000/v1": {"valves": {}},
     },
     "ollama.enable": False,
     "web.search.enable": True,          # drifted: the manifest wants False
@@ -266,7 +266,7 @@ class MaskingTests(unittest.TestCase):
         # the way.
         row = self.rows["openai.api_configs"]
         self.assertEqual(list(row["found"]),
-                         ["http://host.docker.internal/_lemonseed/lemond/v1"])
+                         ["http://lemonseed-litellm:4000/v1"])
         self.assertFalse(row["masked"])
 
     def test_unmanaged_secret_looking_keys_are_masked_too(self) -> None:
@@ -339,7 +339,8 @@ class DriftOverlayTests(unittest.TestCase):
     def test_entity_card_exposes_ownership_metadata(self) -> None:
         models = entity_named(self.view, "models")
         self.assertEqual(models["mode"], "selective_management")
-        self.assertEqual(models["own_ids"], ["lemonseed-ai", "lemonseed-ai-filtered"])
+        self.assertEqual(models["own_ids"],
+                         ["Lemonseed AI", "Lemonseed AI with Content Filters"])
         self.assertEqual(models["reserved_name_regex"], "^Lemonseed.*$")
         self.assertEqual(entity_named(self.view, "users")["scope"],
                          # D-18: a CP-side rename now converges, so name is a
