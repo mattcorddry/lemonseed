@@ -194,6 +194,13 @@ class SchemaMigrationTests(unittest.TestCase):
                 " KEY, at TIMESTAMPTZ NOT NULL DEFAULT NOW(), actor TEXT NOT"
                 " NULL, target TEXT NOT NULL DEFAULT '', action TEXT NOT NULL,"
                 " detail JSONB )",
+                # M9 P2: the module state machine (§7). run_hash is the run
+                # fingerprint, so a settings change is a supervision tick.
+                "CREATE TABLE IF NOT EXISTS modules ( id TEXT PRIMARY KEY,"
+                " state TEXT NOT NULL, version TEXT NOT NULL DEFAULT '',"
+                " settings JSONB NOT NULL DEFAULT '{}', error TEXT, run_hash"
+                " TEXT NOT NULL DEFAULT '', updated_at TIMESTAMPTZ NOT NULL"
+                " DEFAULT NOW() )",
             ],
         )
 

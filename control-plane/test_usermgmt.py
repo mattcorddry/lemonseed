@@ -23,9 +23,10 @@ sys.path.insert(0, str(CP))
 
 import auth  # noqa: E402
 import db  # noqa: E402
-import modules  # noqa: E402
 import srp  # noqa: E402
 import usermgmt  # noqa: E402
+
+import modules  # noqa: E402
 
 
 def _enrollment(username: str = "alice", password: str = "longenough") -> tuple[str, str]:

@@ -35,7 +35,7 @@ import data_services
 import hardware
 import hardware_password
 import journal
-import modules
+import module_manager
 import owui_policy
 import owui_portal
 import sessions
@@ -43,6 +43,8 @@ import srp
 import updates
 import usermgmt
 from catalog import plan_model
+
+import modules
 
 HOST = os.environ.get("APPLIANCE_CP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("APPLIANCE_CP_PORT", "8080"))
@@ -806,6 +808,335 @@ function dialogTypedConfirm(title, copy, word, options) {
     },
   });
 }
+"""
+
+# --- Modules tab (M9 P2) -----------------------------------------------------
+#
+# The Modules tab is the control plane's own module surface (§8): what is
+# installed, what the catalog offers, the lifecycle buttons, and the settings
+# forms the module spec declares. The chat interface is a module too, but it
+# has its own pane — this one is for everything else.
+#
+# The destructive remove lives here on purpose: the Preserve data checkbox is
+# the *default*, and unchecking it is what summons the typed confirmation, so
+# the safe path is the one that needs no reading and the dangerous one cannot
+# be reached by a stray click.
+MODULES_JS = r"""
+const MODULE_STATE_LABEL = {
+  pending: 'working',
+  waiting: 'waiting',
+  installed: 'stopped',
+  enabled: 'running',
+  broken: 'needs attention',
+};
+
+let modulesTimer = null;
+let modulesOp = null;
+
+function moduleStateLabel(state) {
+  return MODULE_STATE_LABEL[state] || state || '—';
+}
+
+function moduleStatus(text, bad) {
+  const el = document.getElementById('module-status');
+  el.textContent = text || '';
+  el.hidden = !text;
+  el.classList.toggle('bad', !!bad);
+}
+
+function moduleCard(card) {
+  const wrap = document.createElement('article');
+  wrap.className = 'module-card' + (card.state === 'broken' ? ' broken' : '');
+  const head = document.createElement('div');
+  head.className = 'module-card-head';
+  const name = document.createElement('span');
+  name.className = 'module-card-name';
+  name.textContent = card.name + (card.version ? ' ' + card.version : '');
+  head.appendChild(name);
+  const state = document.createElement('span');
+  state.className = 'module-card-state ' + (card.state === 'broken' ? 'bad' : 'wait');
+  state.textContent = card.installed ? moduleStateLabel(card.state) : 'not installed';
+  head.appendChild(state);
+  wrap.appendChild(head);
+  if (card.description) {
+    const desc = document.createElement('p');
+    desc.className = 'module-card-desc';
+    desc.textContent = card.description;
+    wrap.appendChild(desc);
+  }
+  if (card.error) {
+    const err = document.createElement('p');
+    err.className = 'owui-status bad';
+    err.textContent = card.error;
+    wrap.appendChild(err);
+  }
+  if (card.spec_missing) {
+    const note = document.createElement('p');
+    note.className = 'owui-status bad';
+    note.textContent = 'This module no longer has a spec in the appliance image; '
+      + 'remove it, or reinstall it after the next update.';
+    wrap.appendChild(note);
+  }
+  const status = document.createElement('p');
+  status.className = 'module-card-status';
+  status.textContent = card.docker_status ? 'container ' + card.docker_status : '';
+  wrap.appendChild(status);
+
+  if (card.mcp_server) {
+    const mcp = document.createElement('p');
+    mcp.className = 'module-card-status';
+    mcp.textContent = 'Adds an MCP tool server to the chat path while enabled.';
+    wrap.appendChild(mcp);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'module-actions';
+  const busy = !!modulesOp;
+  const add = (label, action, danger) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = danger ? 'btn danger' : 'btn';
+    b.textContent = label;
+    b.disabled = busy;
+    b.addEventListener('click', () => moduleAction(card, action));
+    actions.appendChild(b);
+  };
+  if (card.installed) {
+    if (card.state === 'enabled') add('Disable', 'disable');
+    else if (card.state === 'installed') add('Enable', 'enable');
+    if (card.state !== 'enabled') add('Remove…', 'remove', true);
+  } else {
+    add('Install', 'install');
+  }
+  wrap.appendChild(actions);
+
+  if (card.installed && (card.settings || []).length) {
+    const form = document.createElement('div');
+    form.className = 'module-settings';
+    (card.settings || []).forEach((setting) => {
+      const value = card.values ? card.values[setting.name] : undefined;
+      const label = document.createElement('label');
+      if (setting.type === 'bool') {
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = value === true;
+        cb.dataset.setting = setting.name;
+        label.appendChild(cb);
+        label.appendChild(document.createTextNode(' ' + (setting.label || setting.name)));
+      } else if (setting.type === 'enum') {
+        label.textContent = setting.label || setting.name;
+        const select = document.createElement('select');
+        (setting.choices || []).forEach((choice) => {
+          const opt = document.createElement('option');
+          opt.value = choice;
+          opt.textContent = choice;
+          opt.selected = choice === value;
+          select.appendChild(opt);
+        });
+        select.dataset.setting = setting.name;
+        label.appendChild(select);
+      } else {
+        label.textContent = setting.label || setting.name;
+        const input = document.createElement('input');
+        input.type = setting.type === 'int' ? 'number' : 'text';
+        input.value = value == null ? '' : String(value);
+        input.dataset.setting = setting.name;
+        label.appendChild(input);
+      }
+      form.appendChild(label);
+    });
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.className = 'btn';
+    save.textContent = 'Save settings';
+    save.disabled = busy;
+    save.addEventListener('click', () => moduleSaveSettings(card, form));
+    form.appendChild(save);
+    wrap.appendChild(form);
+  }
+  return wrap;
+}
+
+function moduleCollectValues(form, settings) {
+  const values = {};
+  (settings || []).forEach((setting) => {
+    const field = form.querySelector('[data-setting="' + setting.name + '"]');
+    if (!field) return;
+    if (setting.type === 'bool') values[setting.name] = field.checked;
+    else if (setting.type === 'int') {
+      if (field.value !== '') values[setting.name] = Number(field.value);
+    } else values[setting.name] = field.value;
+  });
+  return values;
+}
+
+// The remove dialog (§8): the Preserve data checkbox is checked by default, so
+// the destructive path is the one that requires unchecking a box *and* typing.
+function moduleRemoveDialog(card) {
+  const phrase = 'purge';
+  const body = document.createElement('div');
+  const keepLabel = document.createElement('label');
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.checked = true;
+  keepLabel.appendChild(cb);
+  keepLabel.appendChild(
+    document.createTextNode(" Keep this module's data (its database and files)"));
+  body.appendChild(keepLabel);
+  const warn = document.createElement('p');
+  warn.className = 'dialog-copy';
+  body.appendChild(warn);
+  const purgeWrap = document.createElement('div');
+  purgeWrap.hidden = true;
+  const purgeLabel = document.createElement('label');
+  purgeLabel.textContent = 'Type "' + phrase + '" to confirm';
+  purgeLabel.htmlFor = 'module-purge-' + card.id;
+  purgeWrap.appendChild(purgeLabel);
+  const field = document.createElement('input');
+  field.id = purgeLabel.htmlFor;
+  field.type = 'text';
+  field.autocomplete = 'off';
+  field.spellcheck = false;
+  purgeWrap.appendChild(field);
+  body.appendChild(purgeWrap);
+  return dialog({
+    title: 'Remove ' + card.name + '?',
+    copy: 'The module stops and its container is removed. Its platform '
+      + 'contributions (an MCP tool server, settings) stop applying immediately.',
+    dismiss: null,
+    body: body,
+    actions: [
+      {label: 'Cancel', kind: 'ghost', value: null},
+      {
+        label: 'Remove',
+        kind: 'danger',
+        primary: true,
+        disabled: true,
+        value: () => ({preserve: cb.checked, confirm: field.value}),
+      },
+    ],
+    build: (api) => {
+      const ok = api.ok;
+      const gate = () => {
+        const unchecking = !cb.checked;
+        purgeWrap.hidden = !unchecking;
+        warn.textContent = unchecking
+          ? "Deleting this module's data is permanent."
+          : 'Keeping the data means a later reinstall is lossless.';
+        ok.disabled = unchecking && field.value.trim().toLowerCase() !== phrase;
+      };
+      cb.addEventListener('change', () => {
+        gate();
+        if (!cb.checked) field.focus();
+      });
+      field.addEventListener('input', gate);
+      gate();
+    },
+  });
+}
+
+async function modulePost(id, action, body) {
+  moduleStatus('Working: ' + action + ' ' + id + '…');
+  try {
+    const res = await portalFetch('/_lemonseed/api/modules/' + id + '/' + action, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body || {}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 400 && data.confirm_text) {
+      moduleStatus('Type ' + data.confirm_text + ' to confirm deleting this '
+        + "module's data.", true);
+      return;
+    }
+    if (!res.ok) {
+      moduleStatus(data.reason || data.error
+        || ('Request refused (HTTP ' + res.status + ').'), true);
+      return;
+    }
+    loadModules();
+  } catch (_err) {
+    moduleStatus('Could not reach the control plane.', true);
+  }
+}
+
+async function moduleAction(card, action) {
+  if (action === 'remove') {
+    const answer = await moduleRemoveDialog(card);
+    if (!answer) return;
+    await modulePost(card.id, 'remove', answer);
+    return;
+  }
+  await modulePost(card.id, action, {});
+}
+
+async function moduleSaveSettings(card, form) {
+  const values = moduleCollectValues(form, card.settings);
+  moduleStatus('Saving settings…');
+  try {
+    const res = await portalFetch('/_lemonseed/api/modules/' + card.id + '/settings', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({values: values}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      moduleStatus(data.reason || data.error
+        || ('Save refused (HTTP ' + res.status + ').'), true);
+      return;
+    }
+    moduleStatus('Settings saved. The module container picks them up within a minute.');
+    loadModules();
+  } catch (_err) {
+    moduleStatus('Could not reach the control plane.', true);
+  }
+}
+
+function renderModules(data) {
+  const opEl = document.getElementById('module-op');
+  modulesOp = data.op || null;
+  if (modulesOp) {
+    opEl.hidden = false;
+    opEl.className = 'owui-status';
+    opEl.textContent = 'Working: ' + modulesOp.action + ' ' + modulesOp.id + '…';
+    if (!modulesTimer) {
+      modulesTimer = setTimeout(() => { modulesTimer = null; loadModules(); }, 3000);
+    }
+  } else {
+    opEl.hidden = true;
+  }
+  const errEl = document.getElementById('module-error');
+  if ((data.problems || []).length) {
+    errEl.hidden = false;
+    errEl.className = 'owui-status bad';
+    errEl.textContent = 'The module catalog could not load completely: '
+      + data.problems.join(' ');
+  } else {
+    errEl.hidden = true;
+  }
+  const installed = document.getElementById('module-installed');
+  installed.innerHTML = '';
+  (data.installed || []).forEach((card) => installed.appendChild(moduleCard(card)));
+  const catalog = document.getElementById('module-catalog');
+  catalog.innerHTML = '';
+  (data.catalog || []).forEach((card) => catalog.appendChild(moduleCard(card)));
+  if (!(data.catalog || []).length) {
+    const empty = document.createElement('p');
+    empty.className = 'lede';
+    empty.textContent = 'Nothing else is available in this appliance image.';
+    catalog.appendChild(empty);
+  }
+}
+
+async function loadModules() {
+  try {
+    const res = await portalFetch('/_lemonseed/api/modules');
+    if (!res.ok) return;
+    renderModules(await res.json());
+  } catch (_err) {}
+}
+
+loadModules();
 """
 
 
@@ -4227,8 +4558,19 @@ lights and no network, until someone presses the power button on the box.</p>
 <div class="pane" id="pane-modules" role="tabpanel" aria-labelledby="tab-modules" tabindex="-1" hidden>
 <section class="panel">
 <h2>Modules</h2>
-<p class="lede">Modules are the apps the appliance runs for you. The chat interface is the
-first of them; the others appear here as they become installable.</p>
+<p class="lede">Modules are the apps the appliance runs for you. The chat interface is
+the first of them; the others appear here as they become installable.</p>
+<p class="owui-status" id="module-status" hidden></p>
+<p class="owui-status" id="module-op" hidden></p>
+<p class="owui-status" id="module-error" hidden></p>
+</section>
+<section class="panel">
+<h2>Installed</h2>
+<div id="module-installed"></div>
+</section>
+<section class="panel">
+<h2>Available</h2>
+<div id="module-catalog"></div>
 </section>
 </div>
 </div>
@@ -4238,6 +4580,7 @@ first of them; the others appear here as they become installable.</p>
 <script>{UPDATE_JS}</script>
 <script>{HWPW_JS}</script>
 <script>{SETTINGS_JS}</script>
+<script>{MODULES_JS}</script>
 <script>
 async function refreshChat() {{
   try {{
@@ -5475,6 +5818,72 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json(202, result)
 
+    def _handle_module_post(self, raw: bytes, action: str) -> None:
+        """One shape for every module action (§8).
+
+        Lives in one place on purpose: the actor, the JSON contract, and the
+        mapping from a refused operation to a status code are the same for
+        install, enable, disable, remove and the settings write. The status
+        codes are the contract the portal JS branches on: 202 accepted (the
+        work happens in a worker thread and reports through the view), 200 for
+        the settings write, 400 a refused operation or a validation failure,
+        409 another operation is already running, 404 an unknown action.
+        """
+        module_id, _, verb = action.partition("/")
+        if not module_id or not verb:
+            self._json(404, {"error": "not found"})
+            return
+        try:
+            data = json.loads(raw.decode() or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._json(400, {"accepted": False, "reason": "expected a JSON body"})
+            return
+        if not isinstance(data, dict):
+            self._json(400, {"accepted": False, "reason": "expected a JSON object"})
+            return
+        actor = self._actor()
+        try:
+            if verb == "settings":
+                values = data.get("values")
+                result = module_manager.save_settings(
+                    module_id, values if isinstance(values, dict) else {}, actor=actor
+                )
+                if result.get("state") == "error":
+                    self._json(400, result)
+                    return
+                self._json(200, result)
+                return
+            if verb == "install":
+                result = module_manager.request_install(module_id, actor=actor)
+            elif verb == "enable":
+                result = module_manager.request_enable(module_id, actor=actor)
+            elif verb == "disable":
+                result = module_manager.request_disable(module_id, actor=actor)
+            elif verb == "remove":
+                result = module_manager.request_remove(
+                    module_id,
+                    preserve=bool(data.get("preserve", True)),
+                    confirm=str(data.get("confirm") or ""),
+                    actor=actor,
+                )
+            else:
+                self._json(404, {"error": "not found"})
+                return
+        except module_manager.ModuleError as exc:
+            self._json(400, {"accepted": False, "reason": str(exc)})
+            return
+        if result.get("accepted"):
+            self._json(202, result)
+            return
+        reason = str(result.get("reason") or "")
+        if "typing" in reason.lower() or "confirm" in reason.lower():
+            # The destructive confirm lives server-side on purpose (same as the
+            # Open WebUI reset): the word the portal shows is the one the CP
+            # checks, so a UI/CP drift cannot soften the destructive path.
+            self._json(400, {**result, "confirm_text": module_manager.PURGE_CONFIRM})
+        else:
+            self._json(409, result)
+
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         query = parse_qs(urlparse(self.path).query)
@@ -5535,6 +5944,16 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_admin():
                 return
             self._handle_wordlist_get()
+            return
+        if path == "/_lemonseed/api/modules":
+            # M9 P2: the modules view (§8). Admin-only here *and* in nginx:
+            # it carries every module's settings form, and a member must not
+            # enumerate the appliance's managed surface. /api/modules stays
+            # member-visible and keeps the Open WebUI block the shell reads.
+            if not self._require_admin():
+                return
+            module_manager.ensure_worker()
+            self._json(200, module_manager.catalog_view())
             return
         if path == "/_lemonseed/api/update":
             if not self._require_admin():
@@ -5608,7 +6027,14 @@ class Handler(BaseHTTPRequestHandler):
                     "setup": setup,
                     "chat": chat_ready.chat_snapshot(),
                     "data": data_services.data_snapshot(),
-                    "modules": modules.modules_snapshot(),
+                    # M9 P2: the module framework's cheap status rides the same
+                    # key as the Open WebUI block it is the successor of (§8) —
+                    # the OWUI snapshot stays under open_webui, the module
+                    # state machine's rows sit beside it.
+                    "modules": {
+                        **modules.modules_snapshot(),
+                        **module_manager.snapshot(),
+                    },
                     "auth": auth.auth_status(),
                     # The session store is what makes a session revocable, so an
                     # admin troubleshooting "nobody can sign in" needs to see it
@@ -5781,6 +6207,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._handle_owui_reset_post(raw)
             return
+        if path.startswith("/_lemonseed/api/modules/"):
+            # M9 P2: module lifecycle actions (§8). Admin-only, like the view.
+            if not self._require_admin():
+                return
+            self._handle_module_post(raw, path[len("/_lemonseed/api/modules/") :])
+            return
         if path == "/_lemonseed/api/power":
             # Only an admin may stop the appliance, in nginx and here.
             if not self._require_admin():
@@ -5931,6 +6363,10 @@ def main() -> None:
     data_services.ensure_data_worker()
     data_services.ensure_provision_worker()
     modules.ensure_module_worker()
+    # M9 P2: the module framework's supervisor (§7) — and the user-CRUD
+    # observer registration, which must happen before the first thread that
+    # could create an account runs.
+    module_manager.ensure_worker()
     auth.ensure_auth_gate_worker()
     # M8 P7: adopt the installer's Hardware-password bootstrap (retries until
     # Postgres is up; a pre-P7 box is an unperturbed no-op).

@@ -537,3 +537,43 @@ td.col-email { color: var(--muted); }
 .dialog-check input { width: auto; margin: 0; flex: 0 0 auto; }
 .dialog-check[title] { cursor: help; }
 .dialog-check input[disabled] + span { color: var(--muted); }
+
+/* --- Modules (M9 P2) ----------------------------------------------------------
+ * The Modules tab's cards. Deliberately plainer than the model picker: a module
+ * is a thing the appliance runs, with a state and a form, not a choice to make.
+ */
+.module-card {
+  border: 1px solid var(--line); border-radius: 12px;
+  padding: 0.85rem 1rem; margin: 0 0 0.75rem; background: transparent;
+}
+.module-card.broken { border-color: rgba(255, 143, 138, 0.55); }
+.module-card-head { display: flex; align-items: baseline; gap: 0.6rem; }
+.module-card-name { font-weight: 600; font-size: 0.95rem; }
+.module-card-state {
+  margin-left: auto; font-size: 0.78rem; color: var(--muted); white-space: nowrap;
+}
+.module-card-state.bad { color: #ffc4ba; }
+.module-card-desc {
+  color: var(--muted); font-size: 0.85rem; line-height: 1.45; margin: 0.4rem 0 0;
+}
+.module-card-status { color: var(--muted); font-size: 0.78rem; margin: 0.35rem 0 0; }
+/* The global .btn is a full-width call to action; inside a card it is a row of
+   small controls, so it is scoped back down here. */
+.module-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.7rem; }
+.module-actions .btn { width: auto; margin-top: 0; padding: 0.45rem 0.9rem; font-size: 0.88rem; }
+.module-settings { display: grid; gap: 0.55rem; margin-top: 0.7rem; }
+.module-settings label {
+  display: grid; grid-template-columns: minmax(7rem, 40%) minmax(0, 1fr);
+  align-items: center; gap: 0.75rem; color: var(--muted); font-size: 0.86rem;
+}
+.module-settings input[type="text"],
+.module-settings input[type="number"],
+.module-settings select {
+  width: 100%; box-sizing: border-box; padding: 0.4rem 0.55rem;
+  border: 1px solid var(--line); border-radius: 8px;
+  background: transparent; color: var(--ink); font: inherit;
+}
+.module-settings .btn {
+  width: auto; margin-top: 0; align-self: start;
+  padding: 0.45rem 0.9rem; font-size: 0.88rem;
+}

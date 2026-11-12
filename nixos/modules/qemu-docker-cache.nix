@@ -31,6 +31,16 @@ let
     hash = "sha256-cooDV26PtwfximfR/1zOReap5b7MTsIvZNxrcmIvYAM=";
   };
 
+  # M9 P2: the hello-world module image (traefik/whoami), so the QEMU smoke can
+  # install the module without pulling from the registry under TCG. The digest
+  # in the pin is what the fetch verifies — same trust chain as production.
+  helloTar = pullImage {
+    imageName = imagePins.hello_world.name;
+    imageDigest = imagePins.hello_world.digest;
+    finalImageTag = imagePins.hello_world.tag;
+    hash = "sha256-bwWR+Vex0aOUC+M/Q022ow8tsAjY1NO5KiydBJMLcyA=";
+  };
+
   loadDataImages = pkgs.writeShellApplication {
     name = "lemonseed-qemu-docker-load-data";
     runtimeInputs = [ pkgs.coreutils pkgs.docker ];
@@ -39,8 +49,8 @@ let
         raw = stripShebang (builtins.readFile ../../scripts/qemu-docker-load-data.sh);
       in
       lib.replaceStrings
-        [ "@POSTGRES_TAR@" "@VALKEY_TAR@" ]
-        [ "${postgresTar}" "${valkeyTar}" ]
+        [ "@POSTGRES_TAR@" "@VALKEY_TAR@" "@HELLO_TAR@" ]
+        [ "${postgresTar}" "${valkeyTar}" "${helloTar}" ]
         raw;
   };
 

@@ -665,6 +665,18 @@ in
         proxyPass = "http://127.0.0.1:8080";
         extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
+      # Modules (M9 P2). Admin-only: the view carries every module's settings
+      # form, and the lifecycle actions are the appliance's managed surface.
+      # /api/modules (no prefix) stays member-visible — it is the Open WebUI
+      # block the shell reads.
+      locations."= /_lemonseed/api/modules" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
+      locations."/_lemonseed/api/modules/" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
       # Reboot / shut down (M7 P5). Admin-only at the edge and in the CP: this is
       # the one button that takes the whole appliance away from everyone else.
       locations."= /_lemonseed/api/power" = {

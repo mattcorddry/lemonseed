@@ -266,6 +266,61 @@ class SupervisorTests(unittest.TestCase):
         rm_calls = [c for c in docker.call_args_list if c.args[0][:2] == ["rm", "-f"]]
         self.assertEqual(rm_calls, [])
 
+    def test_module_contributions_render_into_config(self) -> None:
+        with_servers = litellm.render_config(
+            "m1",
+            filtered_enabled=True,
+            mcp_servers=[{"name": "demo", "url": "http://x/mcp"}],
+        )
+        self.assertIn("mcp_servers:", with_servers)
+        self.assertIn("  demo:", with_servers)
+        self.assertIn("    url: http://x/mcp", with_servers)
+        self.assertIn("    transport: http", with_servers)
+        without = litellm.render_config("m1", filtered_enabled=True)
+        self.assertIn("mcp_servers: []", without)
+        self.assertNotIn("\n  demo:", without)
+
+    def test_module_contribution_change_recreates(self) -> None:
+        # An installed plugin's MCP contribution is a config change, and the
+        # proxy obeys the file — the same path a model switch takes.
+        litellm.write_config(litellm.render_config("m1", filtered_enabled=True))
+        litellm._set_applied_hash(litellm.config_fingerprint())
+        litellm._state[litellm.LITELLM_CONTAINER] = {
+            "state": "starting",
+            "since": litellm.time.monotonic(),
+        }
+        running = mock.Mock(returncode=0, stdout="true", stderr="")
+
+        def rm_calls() -> list:
+            return [
+                c
+                for c in docker.call_args_list
+                if c.args[0][:2] == ["rm", "-f"]
+            ]
+
+        with (
+            self._model("m1"),
+            mock.patch.object(litellm, "_container_running", return_value=True),
+            mock.patch.object(litellm, "_port_open", return_value=False),
+            mock.patch.object(litellm, "_docker", return_value=running) as docker,
+        ):
+            litellm.supervise_litellm_once()
+        self.assertEqual(rm_calls(), [])
+        with (
+            self._model("m1"),
+            mock.patch.object(litellm, "_container_running", return_value=True),
+            mock.patch.object(litellm, "_port_open", return_value=False),
+            mock.patch.object(
+                litellm,
+                "_module_contributions",
+                return_value=[{"name": "demo", "url": "http://x/mcp"}],
+            ),
+            mock.patch.object(litellm, "_docker", return_value=running) as docker,
+        ):
+            litellm.supervise_litellm_once()
+        self.assertEqual(len(rm_calls()), 1)
+        self.assertIn("mcp_servers:", self.config_path.read_text(encoding="utf-8"))
+
 
 class SnapshotTests(unittest.TestCase):
     def test_snapshot_shape(self) -> None:

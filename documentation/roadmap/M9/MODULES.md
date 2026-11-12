@@ -22,8 +22,9 @@ the catalog and the module directories read-only; the boot seeder copies the mer
 catalog into `/var/lib/lemonseed/modules/catalog/` so the future hosted-catalog
 refresh can replace that path without moving it. The CP installs/enables/disables/
 removes modules from the catalog with dependency resolution, provisioning, hooks and
-blue/green-free container management, and renders the portal's Modules page as two
-tabs (Catalog / Installed).
+blue/green-free container management, and renders the portal's Modules page as one
+tab with two groups (Installed / Available) — as built; the plan's original two-tab
+split was superseded because the settings rail is already five tabs wide.
 
 ## 2. In-tree layout
 
@@ -300,18 +301,21 @@ the portal with the recorded `error` and a retry action.
 
 ## 8. Portal
 
-- **Modules menu item → two tabs.** *Catalog*: every catalog entry that passes
-  `compat.min_lemonseed`, grouped by type (Applications / Plugins), with logo,
-  description, owners, license, maturity badge and an Install button (disabled
-  with a reason when dependencies are missing — they are auto-installed, so the
-  button rarely disables). *Installed*: one card per installed module — status
-  (docker's own wording, as today), version, settings form, enable/disable,
-  remove (a **Preserve data** checkbox in the confirm dialog — checked keeps
-  the data volume and database, unchecked purges).
+- **Modules menu item → one tab, two groups** (as built; the plan's two-tab
+  split was superseded because the rail is already five tabs wide). *Installed*:
+  one card per installed module — status (docker's own wording, as today), version,
+  error, settings form, enable/disable, remove. *Available*: every catalog entry
+  that passes `compat.min_lemonseed`, with logo, description, owners, license,
+  maturity badge and an Install button (dependencies are auto-installed, so the
+  button rarely disables). The remove confirm dialog carries the **Preserve data**
+  checkbox — **checked by default** (§11 Q1: the safe path needs no reading);
+  unchecking it summons the typed confirmation (`purge`), and the confirm word is
+  issued by the control plane (§8's `confirm_text` shape) so a UI/CP drift cannot
+  soften the destructive path.
 - **Top-bar entries**: an Application module that declares `app: {menu: …}` in a
   later revision gets a shell menu item to an iframe page. In v1 the only
   Application is Hermes (P6), so the field is specified there; P2 ships the
-  two-tab page and the generic install/status plumbing it hangs off.
+  one-tab page and the generic install/status plumbing it hangs off.
 - Module settings are rendered from the declared schema (`string`, `bool`,
   `int`, `enum`); saving rewrites the env file and recreates the container on the
   next supervision tick.
@@ -333,11 +337,15 @@ the portal with the recorded `error` and a retry action.
   - `litellm.render_config` gains the contributions argument (rendered into
     `mcp_servers`, fingerprint change drives recreate, disabled module's
     contribution absent).
-- **QEMU** (rides P3's first real module): install `mcp-gateway` from the seeded
-  catalog, assert the container, the LiteLLM registration, and health; disable and
-  assert the contribution disappears; remove with **Preserve data** checked and
-  assert the teardown (container gone, data volume and database retained);
-  remove unchecked and assert the database drop and the data volume's deletion.
+- **QEMU** (as built: the lifecycle rides hello-world; P3's gateway rides the
+  same harness when it lands, adding the LiteLLM-registration assertions):
+  install `hello-world` from the preloaded image, assert the container and the
+  install hook's marker; disable and assert the teardown (container parked,
+  data volume and database retained); remove with **Preserve data** checked and
+  assert the retention; reinstall, remove unchecked through the typed confirm
+  and assert the database drop and the data volume's deletion. The smoke also
+  asserts the admin-only gating and that every action (both remove paths
+  included) landed in the audit log.
 
 ## 10. Explicitly out of scope (v1)
 

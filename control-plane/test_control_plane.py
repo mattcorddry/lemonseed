@@ -49,7 +49,6 @@ import hardware  # noqa: E402
 import hardware_password  # noqa: E402
 import journal  # noqa: E402
 import model_store  # noqa: E402
-import modules  # noqa: E402
 import owui_policy  # noqa: E402
 import sessions  # noqa: E402
 import srp  # noqa: E402
@@ -57,6 +56,8 @@ import srp_client  # noqa: E402
 import stub  # noqa: E402
 import updates  # noqa: E402
 import usermgmt  # noqa: E402
+
+import modules  # noqa: E402
 
 # Minimal boot snapshot for tests that only need a page to render.
 _SNAP = {

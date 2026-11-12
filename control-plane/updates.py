@@ -24,9 +24,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 import chat_ready
-import modules
 import owui_policy
 import settings
+
+import modules
 
 UPDATER = "lemonseed-update"  # packaged in nixos/packages/lemonseed-update.nix
 ATTEMPT_FILE = Path("/var/lib/lemonseed/update-attempt.json")

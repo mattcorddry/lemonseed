@@ -194,6 +194,34 @@ install lifecycle, no dependency model, no hooks. A framework designed only as
 Catalog spec v1 published in `MODULES-FRAMEWORK.md` (open questions settled there),
 QEMU install/remove green, unit coverage for parsing and lifecycle.
 
+> **As built (M9 P2):** spec v1 published in `MODULES-FRAMEWORK.md` and the
+> owner's four decisions recorded in `M9/MODULES.md` §11; implementation landed.
+> The catalog lives at in-tree `modules/` (`modules_catalog.py` is the reader,
+> `scripts/build-modules-catalog.py` the build step; the merged catalog is a
+> **build artifact** in the image, seeded at boot into
+> `/var/lib/lemonseed/modules/catalog/catalog.json`). The lifecycle is
+> `module_manager.py`: one operation at a time, the container disposable with
+> the CP as authority, no silent hook failures, and **a pull failure is a
+> wait, never a verdict** — the registry is an external condition, so a module
+> blocked on it goes WAITING and the supervision tick retries, with BROKEN
+> reserved for what the data plane cannot fix. The remove flow carries the
+> **Preserve data** checkbox (§11 Q1): unchecking it is a typed confirmation
+> (`purge`), checked it keeps the volume and the module database. Deviations,
+> as built: **no blue/green** — updates overwrite in place on `run_hash`
+> drift (§11 Q2; blue/green and rollback are backlogged); hooks run as root
+> with a per-module `hooks.script_timeout` clamped to 5–600 s (default 120,
+> §11 Q3); the portal is **one Modules tab** with two groups (Installed /
+> Available) rather than the plan's two tabs, because the rail is already
+> five tabs and the two-tab split would have crowded it; **the top-bar entry
+> for Application modules is not built** (no Application module exists yet);
+> and the first module is **hello-world** (`traefik/whoami`, a self-harness in
+> `modules/hello-world/test/test.sh`), not the MCP gateway — P3 builds the
+> gateway on top of this framework. The QEMU smoke exercises the lifecycle
+> with hello-world instead of the gateway: install → enable → disable →
+> enable → settings → both remove paths, the admin-only gating, the audit
+> records, and the image preloaded by the QEMU profile so the install
+> satisfies the data-plane pull's tag fallback and never needs the registry.
+
 ---
 
 ## P3 — First module: MCP gateway (Plugin)

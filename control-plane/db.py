@@ -16,7 +16,7 @@ POSTGRES_ENV = Path("/var/lib/lemonseed/data/secrets/postgres.env")
 SECRETS_MODULES = Path("/var/lib/lemonseed/data/secrets/modules")
 CP_DB_NAME = "lemonseed_cp"
 CP_ROLE = "lemonseed_cp"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 # Shape created by ``_create_cp_tables`` (all `CREATE TABLE IF NOT EXISTS`).
 # A database with no recorded version is assumed to be at this shape, because
 # that is what the table creation immediately preceding the migration run leaves
@@ -314,6 +314,31 @@ def _migrate_v6(cur) -> None:
     )
 
 
+def _migrate_v7(cur) -> None:
+    """M9 P2 — the module lifecycle table (MODULES.md §7).
+
+    Additive, like every migration (``test_only_additive_migration_sql`` bans
+    destructive DDL here): rows are written and deleted by the lifecycle
+    layer, never by migration SQL, so a rolled-back slot can still read a
+    newer database. ``run_hash`` is the container run fingerprint — the digest
+    plus run args plus env file content — which is what makes "changed
+    settings recreate the container" a supervision tick instead of a race.
+    """
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS modules (
+          id TEXT PRIMARY KEY,
+          state TEXT NOT NULL,
+          version TEXT NOT NULL DEFAULT '',
+          settings JSONB NOT NULL DEFAULT '{}',
+          error TEXT,
+          run_hash TEXT NOT NULL DEFAULT '',
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+
+
 # Append-only, ascending. Bumping SCHEMA_VERSION without registering the step is
 # caught by test_migrations_cover_the_declared_version.
 MIGRATIONS: tuple[Migration, ...] = (
@@ -322,6 +347,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         "users: password_reset_required + owui_id; groups.system;"
         " group_attributes; audit_log",
         _migrate_v6,
+    ),
+    Migration(
+        7,
+        "modules: module lifecycle table (state, version, settings, run_hash)",
+        _migrate_v7,
     ),
 )
 
@@ -497,6 +527,232 @@ def provision_data_plane() -> dict[str, Any]:
         }
     except Exception as exc:  # noqa: BLE001
         return {"state": "error", "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Module data-plane provisioning and lifecycle rows (M9 P2)
+# ---------------------------------------------------------------------------
+
+
+def _module_role_name(module_id: str) -> str:
+    """The Postgres role a module gets: namespaced, so it can never collide
+    with a reserved role (lemonseed_cp, open_webui) or with a future one."""
+    return "mod_" + module_id.replace("-", "_")
+
+
+_RESERVED_DB_NAMES = frozenset(spec["db_name"] for spec in RESERVED_MODULES)
+
+
+def write_module_env(module_id: str, updates: dict[str, str]) -> dict[str, str]:
+    """Merge ``updates`` into the module's env file, returning the full payload.
+
+    The file is one artifact with several writers in sequence (data-plane
+    provisioning, then settings, then the settings an admin edits), so writers
+    merge rather than overwrite: the last one to write wins per key, and
+    nobody has to restate the others' keys.
+    """
+    existing = _module_credentials(module_id)
+    existing.update(updates)
+    _write_module_secret(module_id, existing)
+    return existing
+
+
+def provision_module_db(module_id: str, db_name: str) -> dict[str, str]:
+    """Create the role + database a module declared (§7 install step 3).
+
+    Mirrors ``provision_data_plane``: the same ``_ensure_role_and_db`` flow,
+    the same env payload (DATABASE_URL points at 127.0.0.1 — the host scope
+    the hooks read; the container run rewrites the host to the Postgres
+    service name, exactly like Open WebUI). Refuses a reserved name so a
+    module can never provision over a core service's database.
+    """
+    if db_name in _RESERVED_DB_NAMES:
+        raise RuntimeError(f"database name {db_name!r} is reserved by a core service")
+    if not postgres_admin_dsn():
+        raise RuntimeError("postgres.env missing")
+    role_name = _module_role_name(module_id)
+    admin = _connect("postgres")
+    try:
+        password = _ensure_role_and_db(admin, db_name, role_name, module_id)
+    finally:
+        admin.close()
+    host = os.environ.get("LEMONSEED_PG_HOST", "127.0.0.1")
+    port = os.environ.get("LEMONSEED_PG_PORT", "5432")
+    payload = {
+        "DATABASE_URL": (
+            f"postgresql://{role_name}:{password}@{host}:{port}/{db_name}"
+        ),
+        "DB_NAME": db_name,
+        "DB_USER": role_name,
+        "DB_PASSWORD": password,
+    }
+    conn = cp_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO module_db (module_id, db_name, role_name)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (module_id) DO UPDATE
+                  SET db_name = EXCLUDED.db_name,
+                      role_name = EXCLUDED.role_name
+                """,
+                (module_id, db_name, role_name),
+            )
+    finally:
+        conn.close()
+    return payload
+
+
+def drop_module_db(module_id: str) -> dict[str, Any]:
+    """Purge: drop the module's database and role (§7 remove, preserve off).
+
+    ``WITH (FORCE)`` (Postgres 13+) terminates the module's connections rather
+    than failing on an idle one — a purge must not depend on the module being
+    quiet.
+    """
+    conn = cp_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT db_name, role_name FROM module_db WHERE module_id = %s",
+                (module_id,),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return {"state": "absent"}
+    db_name, role_name = row
+    if not postgres_admin_dsn():
+        raise RuntimeError("postgres.env missing")
+    admin = _connect("postgres")
+    try:
+        with admin.cursor() as cur:
+            cur.execute(f'DROP DATABASE IF EXISTS "{db_name}" WITH (FORCE)')
+            cur.execute(f'DROP ROLE IF EXISTS "{role_name}"')
+    finally:
+        admin.close()
+    conn = cp_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM module_db WHERE module_id = %s", (module_id,))
+    finally:
+        conn.close()
+    return {"state": "dropped", "db_name": db_name, "role_name": role_name}
+
+
+_MODULE_COLUMNS = (
+    "id",
+    "state",
+    "version",
+    "settings",
+    "error",
+    "run_hash",
+    "updated_at",
+)
+
+
+def _module_row_dict(row: Any) -> Optional[dict[str, Any]]:
+    if not row:
+        return None
+    data: dict[str, Any] = dict(zip(_MODULE_COLUMNS, row))
+    data["settings"] = data.get("settings") or {}
+    return data
+
+
+def module_row(module_id: str) -> Optional[dict[str, Any]]:
+    conn = cp_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {', '.join(_MODULE_COLUMNS)} FROM modules WHERE id = %s",
+                (module_id,),
+            )
+            return _module_row_dict(cur.fetchone())
+    finally:
+        conn.close()
+
+
+def module_rows() -> list[dict[str, Any]]:
+    conn = cp_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {', '.join(_MODULE_COLUMNS)} FROM modules ORDER BY id"
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return [d for d in (_module_row_dict(r) for r in rows) if d]
+
+
+def set_module_state(
+    module_id: str,
+    state: str,
+    *,
+    version: Optional[str] = None,
+    error: Optional[str] = None,
+    run_hash: Optional[str] = None,
+    settings: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Upsert the module row.
+
+    ``state`` and ``error`` always overwrite (``None`` clears the error).
+    ``version``, ``run_hash`` and ``settings`` overwrite only when provided,
+    so a caller that knows one fact does not have to restate the others.
+    """
+    existing = module_row(module_id) or {}
+    row = {
+        "id": module_id,
+        "state": state,
+        "version": version if version is not None else str(existing.get("version") or ""),
+        "settings": (
+            json.dumps(settings)
+            if settings is not None
+            else json.dumps(existing.get("settings") or {})
+        ),
+        "error": error,
+        "run_hash": (
+            run_hash if run_hash is not None else str(existing.get("run_hash") or "")
+        ),
+    }
+    conn = cp_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO modules (id, state, version, settings, error, run_hash)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE
+                  SET state = EXCLUDED.state,
+                      version = EXCLUDED.version,
+                      settings = EXCLUDED.settings,
+                      error = EXCLUDED.error,
+                      run_hash = EXCLUDED.run_hash,
+                      updated_at = NOW()
+                """,
+                (
+                    row["id"],
+                    row["state"],
+                    row["version"],
+                    row["settings"],
+                    row["error"],
+                    row["run_hash"],
+                ),
+            )
+    finally:
+        conn.close()
+    return module_row(module_id) or {"id": module_id, "state": state}
+
+
+def drop_module_row(module_id: str) -> None:
+    conn = cp_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM modules WHERE id = %s", (module_id,))
+    finally:
+        conn.close()
 
 
 def cp_connect():

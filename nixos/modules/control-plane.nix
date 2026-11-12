@@ -5,9 +5,29 @@
 let
   cpSrc = ../../control-plane;
   bootSrc = ../../boot;
+  # M9 P2: the in-tree modules directory — the module.yaml specs and the
+  # host-side hooks. They ship beside the CP code so the runtime loader can
+  # verify each spec's digest against the image that carries them (§4).
+  modulesSrc = ../../modules;
+  scriptsSrc = ../../scripts;
   # The SYSTEM panel's update job and failed-update detector spawn the same
   # updater the CLI and the weekly timer use (packaged once, see packages/).
   lemonseedUpdate = import ../packages/lemonseed-update.nix { inherit pkgs lib; };
+
+  # M9 P2: the merged module catalog is a build artifact, not a checked-in
+  # file. The merge step is the one place that validates every spec, so it
+  # runs at build time with the strict reader — one invalid module fails the
+  # build, because a catalog that half-works is worse than none (the installer
+  # would offer a module the box cannot actually run).
+  buildModulesCatalog = pkgs.writeShellApplication {
+    name = "build-modules-catalog";
+    runtimeInputs = [ (pkgs.python3.withPackages (ps: [ ps.pyyaml ])) ];
+    text = ''
+      exec "${pkgs.python3.withPackages (ps: [ ps.pyyaml ])}/bin/python3" \
+        "${scriptsSrc}/build-modules-catalog.py" "$@"
+    '';
+  };
+
   cpRoot = pkgs.runCommand "lemonseed-control-plane-src" { } ''
     mkdir -p "$out/catalog" "$out/static/brand"
     cp ${cpSrc}/stub.py ${cpSrc}/hardware.py ${cpSrc}/catalog.py ${cpSrc}/chat_ready.py \
@@ -18,10 +38,19 @@ let
        ${cpSrc}/owui_client.py \
        ${cpSrc}/owui_policy.py ${cpSrc}/owui_portal.py ${cpSrc}/owui-policy.json \
        ${cpSrc}/image_pins.py ${cpSrc}/container-images.json \
+       ${cpSrc}/modules_catalog.py ${cpSrc}/module_manager.py \
        ${cpSrc}/litellm.py \
        ${cpSrc}/words-en_US.txt "$out/"
     cp ${cpSrc}/catalog/models.json "$out/catalog/"
     cp -r ${cpSrc}/static/brand/. "$out/static/brand/"
+    # M9 P2: build the merged module catalog into the image, then copy the
+    # modules tree beside it. The loader reads the catalog from here (and
+    # seeds a writable copy from it at boot), and re-hashes every module.yaml
+    # against the image's own bytes.
+    LEMONSEED_CP_DIR="$out" ${buildModulesCatalog}/bin/build-modules-catalog \
+      --modules "${modulesSrc}" --out "$out/modules-catalog.json"
+    mkdir -p "$out/modules"
+    cp -r ${modulesSrc}/. "$out/modules/"
     # GRUB template for the A/B updater to refresh on the ESP (the installed
     # system keeps no other copy of boot/grub.cfg in SquashFS).
     mkdir -p "$out/lemonseed"

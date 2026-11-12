@@ -1,0 +1,47 @@
+# Hello World — the framework's first module (M9 P2).
+#
+# Deliberately trivial: it exists to exercise the whole module pipeline
+# (catalog merge, image pins, provisioning, hooks, supervision, portal)
+# against a container that cannot fail for interesting reasons. The hook
+# below writes the GREETING setting into the module's data volume, which is
+# the one place a settings value is observable without a browser.
+#
+# The HTTP side is upstream's whoami server: any request is answered with a
+# header dump, which is a fine health probe and a terrible product — do not
+# build on it.
+
+spec_version: 1
+id: hello-world
+name: Hello World
+type: application
+version: 1.0.0
+maturity: alpha
+license: Apache-2.0
+owners: [wago]
+homepage: https://lemonseed.ai
+description: >-
+  A tiny web server that exists to prove the module pipeline works: catalog
+  install, hooks, data provisioning, settings delivery, supervision and
+  removal. Not a product; remove it once a real module covers the same paths.
+
+docker:
+  image: hello_world
+  container: lemonseed-hello-world
+  network: lemon
+  ports:
+    - "127.0.0.1:18100:80"
+  volumes:
+    - /var/lib/lemonseed/modules/hello-world:/data
+  probe:
+    port: 18100
+    path: /
+
+hooks:
+  script_timeout: 120
+
+settings:
+  - name: GREETING
+    type: string
+    default: "Hello from Lemonseed"
+    label: Greeting
+    required: false

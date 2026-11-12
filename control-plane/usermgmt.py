@@ -28,8 +28,9 @@ from typing import Any, Callable, Optional
 import audit
 import auth
 import db
-import modules
 import srp
+
+import modules
 
 # Events passed to observers (D-32). Strings, not enums: a future module should
 # be able to subscribe to an event this file does not know about yet.

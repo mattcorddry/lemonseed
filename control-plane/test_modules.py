@@ -18,6 +18,7 @@ sys.path.insert(0, str(CP))
 
 import auth  # noqa: E402
 import image_pins  # noqa: E402
+
 import modules  # noqa: E402
 
 

@@ -2341,6 +2341,195 @@ assert int(d.get("retention_days") or 0) > 0, d
 print("OK: %d rows kept; admin actions and self-service actions carry different authors" % len(d.get("events") or []))
 ' "${M7_USER}" "${M7_GROUP}" "${ADMIN_USERNAME}"
 
+# ===========================================================================
+# M9 P2 — the module framework, through the real gateway.
+#
+# What only a booted appliance can prove here:
+#   1. The module routes exist *in nginx* with the right gates. The
+#      /_lemonseed pair is admin-only (an anonymous request answers the edge
+#      gate's JSON 401), while /api/modules stays member-visible for the chat
+#      block the shell reads. A control-plane unit test calls the handler
+#      directly, so a missing location block is invisible to it.
+#   2. A module actually installs, runs and removes on real Docker, with the
+#      host-side hooks running as root. The image is preloaded by the QEMU
+#      profile (qemu-docker-cache.nix), so the install satisfies the
+#      data-plane pull's tag fallback and never needs the registry.
+#   3. The lifecycle contract the portal JS branches on: 202 accepted (the op
+#      runs in a worker thread and reports through the view), 409 a refused
+#      operation, 400 a typed-confirm failure — and the audit log records
+#      every action, both remove paths included.
+#
+# Re-runnable on a persistent user-data disk: the module is removed (purging)
+# before it is installed.
+# ===========================================================================
+MODS_ID="hello-world"
+mods_fail() {  # mods_fail <the call that failed> <status>
+  echo "$1: $2" >&2
+  head -c 400 /tmp/qemu-m7.body >&2 || true
+  echo "" >&2
+  exit 1
+}
+mods_post() {  # mods_post <verb> <body> — status on stdout, body in /tmp/qemu-m7.body
+  m7_post "${COOKIE_JAR}" "/_lemonseed/api/modules/${MODS_ID}/$1" "$2"
+}
+mods_read() {  # the admin session reads the module view into /tmp/qemu-m7.body
+  m7_get "${COOKIE_JAR}" "/_lemonseed/api/modules" >/dev/null
+}
+mods_card() {  # print the hello-world card from the view (empty if absent)
+  MODS_ID="${MODS_ID}" python3 -c '
+import json, os
+d = json.load(open("/tmp/qemu-m7.body"))
+for c in (d.get("installed") or []) + (d.get("catalog") or []):
+    if c.get("id") == os.environ["MODS_ID"]:
+        print(json.dumps(c))
+        break
+'
+}
+mods_expect() {  # mods_expect <state|gone> — one-shot assertion on the card
+  MODS_WANT="${1}" MODS_ID="${MODS_ID}" python3 -c '
+import json, os, sys
+d = json.load(open("/tmp/qemu-m7.body"))
+cards = {c.get("id"): c for c in (d.get("installed") or []) + (d.get("catalog") or [])}
+card = cards.get(os.environ["MODS_ID"])
+want = os.environ["MODS_WANT"]
+if want == "gone":
+    ok = card is None or card.get("installed") is False
+else:
+    ok = card is not None and str(card.get("state")) == want
+if not ok:
+    print("hello-world: state=%r installed=%r want=%r" % (
+        (card or {}).get("state"), (card or {}).get("installed"), want), file=sys.stderr)
+sys.exit(0 if ok else 1)
+'
+}
+mods_wait() {  # mods_wait <state|gone> <seconds>
+  local want="$1" budget="$2"
+  local deadline=$((SECONDS + budget))
+  while (( SECONDS < deadline )); do
+    mods_read
+    if mods_expect "${want}" 2>/dev/null; then
+      echo "  ok: hello-world state=${want}"
+      return 0
+    fi
+    sleep 3
+  done
+  echo "hello-world did not reach state=${want} within ${budget}s" >&2
+  head -c 400 /tmp/qemu-m7.body >&2 || true
+  exit 1
+}
+
+echo "==> M9 P2: the module API is admin-only"
+mods_anon_code="$(curl -sS -o /dev/null -w '%{http_code}' \
+  -H "Host: ${AUTH_HOST}" -H 'X-Requested-With: fetch' \
+  "http://127.0.0.1:${HOST_PORT}/_lemonseed/api/modules")"
+[[ "${mods_anon_code}" == "401" ]] || {
+  echo "GET /_lemonseed/api/modules anonymous: expected the edge gate's 401, got ${mods_anon_code}" >&2
+  exit 1
+}
+
+echo "==> M9 P2: the catalog reads; hello-world is offered"
+mods_read
+mods_card | python3 -c '
+import json, sys
+card = json.load(sys.stdin)
+assert card is not None, "hello-world missing from the module view"
+print("OK: the module view reads; hello-world is offered (state=%s)" % card.get("state"))
+'
+
+echo "==> M9 P2: pre-remove (re-runnable on a persistent disk)"
+mods_post remove '{"preserve":false,"confirm":"purge"}' >/dev/null
+mods_wait gone 120
+
+echo "==> M9 P2: install hello-world"
+code="$(mods_post install '{}')"
+[[ "${code}" == "202" ]] || mods_fail "POST install" "${code}"
+mods_wait enabled 600
+mods_read
+mods_card | python3 -c '
+import json, sys
+card = json.load(sys.stdin)
+assert card.get("state") == "enabled", card
+assert card.get("docker_status") == "running", card
+print("OK: hello-world installed and running")
+'
+
+echo "==> M9 P2: the state machine refuses a redundant enable"
+code="$(mods_post enable '{}')"
+[[ "${code}" == "409" ]] || mods_fail "POST enable on an enabled module (expected 409)" "${code}"
+
+echo "==> M9 P2: disable parks the module; enable brings it back"
+code="$(mods_post disable '{}')"
+[[ "${code}" == "202" ]] || mods_fail "POST disable" "${code}"
+mods_wait installed 120
+mods_read
+mods_card | python3 -c '
+import json, sys
+card = json.load(sys.stdin)
+assert card.get("state") == "installed", card
+assert not card.get("docker_status"), card
+print("OK: disabled — container parked")
+'
+code="$(mods_post enable '{}')"
+[[ "${code}" == "202" ]] || mods_fail "POST enable" "${code}"
+mods_wait enabled 300
+
+echo "==> M9 P2: a settings write lands on the row and the env"
+code="$(mods_post settings '{"values":{"GREETING":"Hello from the QEMU smoke"}}')"
+[[ "${code}" == "200" ]] || mods_fail "POST settings" "${code}"
+mods_read
+mods_card | python3 -c '
+import json, sys
+card = json.load(sys.stdin)
+assert card.get("values", {}).get("GREETING") == "Hello from the QEMU smoke", card
+print("OK: settings visible in the view")
+'
+
+echo "==> M9 P2: remove with Preserve data (the default the portal sends)"
+code="$(mods_post remove '{"preserve":true}')"
+[[ "${code}" == "202" ]] || mods_fail "POST remove (preserve)" "${code}"
+mods_wait gone 120
+
+echo "==> M9 P2: reinstall, then remove with the typed purge confirm"
+code="$(mods_post install '{}')"
+[[ "${code}" == "202" ]] || mods_fail "POST install (reinstall)" "${code}"
+mods_wait enabled 600
+# The purge path refuses without the word, server-side (§8) — the same
+# confirm_text shape the portal's typed dialog branches on.
+code="$(mods_post remove '{"preserve":false}')"
+[[ "${code}" == "400" ]] || mods_fail "POST remove purge without the word (expected 400)" "${code}"
+grep -q '"confirm_text"' /tmp/qemu-m7.body || {
+  mods_fail "the 400 did not carry confirm_text" "${code}"
+}
+code="$(mods_post remove '{"preserve":false,"confirm":"purge"}')"
+[[ "${code}" == "202" ]] || mods_fail "POST remove (purge)" "${code}"
+mods_wait gone 120
+
+echo "==> M9 P2: the purge refuses on a module that is not installed"
+code="$(mods_post remove '{"preserve":false,"confirm":"purge"}')"
+[[ "${code}" == "409" ]] || mods_fail "POST remove on a removed module (expected 409)" "${code}"
+
+echo "==> M9 P2: the audit log recorded every action, both remove paths"
+audit_json="$(poll_http "/_lemonseed/api/audit?limit=300" 20 "${COOKIE_JAR}" "${AUTH_HOST}" 2>/dev/null || true)"
+if [[ -z "${audit_json}" ]]; then
+  echo "GET /_lemonseed/api/audit with an admin session returned nothing" >&2; exit 1
+fi
+printf '%s' "${audit_json}" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+admin = sys.argv[1]
+ev = [(str(e.get("action")), e.get("detail") or {}, str(e.get("actor")))
+      for e in d.get("events") or [] if str(e.get("target")) == "hello-world"]
+actions = {a for a, _, _ in ev}
+for want in ("module.install", "module.enable", "module.disable", "module.settings", "module.remove"):
+    assert want in actions, (want, sorted(actions))
+admin_actions = {a for a, _, actor in ev if actor == admin}
+for want in ("module.install", "module.enable", "module.disable", "module.settings", "module.remove"):
+    assert want in admin_actions, (want, sorted(admin_actions))
+removes = {detail.get("preserve") for a, detail, _ in ev if a == "module.remove"}
+assert True in removes and False in removes, removes
+print("OK: %d module events; admin actor, both remove paths recorded" % len(ev))
+' "${ADMIN_USERNAME}"
+
 echo "==> Open endpoints stay open (unauthenticated)"
 for p in /healthz /api/status; do
   code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${HOST_PORT}${p}")"
