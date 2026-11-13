@@ -2464,8 +2464,11 @@ mods_card | python3 -c '
 import json, sys
 card = json.load(sys.stdin)
 assert card.get("state") == "enabled", card
-assert card.get("docker_status") == "running", card
-print("OK: hello-world installed and running")
+# docker_status is docker'"'"'s own wording (the portal shows what `docker ps`
+# shows); a running container is "Up <duration>", never the bare word.
+status = card.get("docker_status") or ""
+assert status.startswith("Up"), card
+print("OK: hello-world installed and running (" + status + ")")
 '
 
 echo "==> M9 P2: the state machine refuses a redundant enable"
