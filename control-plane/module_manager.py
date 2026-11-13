@@ -426,16 +426,25 @@ def _install_order(catalog_modules: dict[str, Any], module_id: str) -> list[str]
     return order
 
 
-class _DataPlaneWait(ModuleError):
-    """The data plane is still coming up — transient on a supervision retry,
-    a real failure for an admin-initiated operation."""
+def _declares_litellm(spec: Optional[dict[str, Any]]) -> bool:
+    deps = ((spec or {}).get("dependencies") or {}).get("core") or []
+    return "litellm" in deps
 
 
-def _wait_data_plane() -> None:
+def _wait_data_plane(
+    specs: Optional[list[dict[str, Any]]] = None,
+) -> tuple[bool, str]:
     """Core services first (§7 install step 2): Postgres/Valkey must be
-    serving before DB provisioning; LiteLLM before a chat-dependent module.
-    lemond is accepted as present — the engine is systemd-managed and the
-    model load is the chat worker's concern, not a module install's."""
+    serving before DB provisioning. LiteLLM is a gate only when the chain
+    being installed declares it (``dependencies.core: litellm``) — the proxy
+    only starts once a model is chosen, so an appliance that has not picked a
+    model yet is a normal state, not a failure, and a chat-dependent chain
+    waits for it the same way it waits for the registry. lemond is accepted as
+    present — the engine is systemd-managed and the model load is the chat
+    worker's concern, not a module install's.
+
+    Returns (``True, ""``) or (``False, reason``): a wait is a wait, never a
+    verdict — the row records the reason and the supervision tick retries."""
     from data_services import ensure_provision_worker, ensure_provisioned
 
     ensure_provision_worker()
@@ -446,14 +455,21 @@ def _wait_data_plane() -> None:
             break
         time.sleep(2)
     else:
-        raise _DataPlaneWait("the data plane did not become ready")
+        return False, "the data plane did not become ready"
+    if not any(_declares_litellm(s) for s in (specs or [])):
+        return True, ""
     try:
         import litellm  # noqa: PLC0415 — lazy: litellm supervises through data_services
-
-        if not litellm.litellm_ready():
-            raise ModuleError("the LiteLLM proxy is not ready")
     except ImportError:
-        pass
+        return True, ""
+    # Its own budget: a chat-dependent chain should not inherit whatever was
+    # left of the Postgres/Valkey window.
+    deadline = time.monotonic() + max(10, budget)
+    while time.monotonic() < deadline:
+        if litellm.litellm_ready():
+            return True, ""
+        time.sleep(2)
+    return False, "the LiteLLM proxy is not ready"
 
 
 def _pull_step(
@@ -640,8 +656,15 @@ def _do_install(module_id: str, *, actor: str = "") -> dict[str, Any]:
     spec = loaded["modules"].get(module_id)
     if spec is None:
         raise ModuleError("module is no longer in the catalog")
-    _wait_data_plane()
     order = _install_order(loaded["modules"], module_id)
+    ok, reason = _wait_data_plane(
+        [loaded["modules"][dep] for dep in order[:-1]] + [spec]
+    )
+    if not ok:
+        # The core services (or a chat path the chain declares) are not up
+        # yet: a wait, never a verdict — the tick retries the whole bring-up.
+        db.set_module_state(module_id, WAITING, error=reason)
+        return {"state": "wait", "id": module_id}
     for dep in order[:-1]:
         if not db.module_row(dep) and _install_one(
             dep, loaded["modules"][dep], actor=actor
@@ -680,7 +703,12 @@ def _do_enable(module_id: str, *, actor: str = "") -> dict[str, Any]:
     spec = _spec_for(module_id)
     if spec is None:
         raise ModuleError("module is no longer in the catalog")
-    _wait_data_plane()
+    ok, reason = _wait_data_plane([spec])
+    if not ok:
+        # Same rule as install: the core services (or the chat path this
+        # module declares) are not up yet — a wait, never a verdict.
+        db.set_module_state(module_id, WAITING, error=reason)
+        return {"state": "wait", "id": module_id}
     _apply_settings_env(module_id, spec)
     was_running = _container_running(_container_name(module_id))
     status, detail = _bring_up_fresh(
@@ -909,16 +937,15 @@ def supervise_once() -> None:
 
 
 def _retry_waiting(row: dict[str, Any]) -> None:
-    """A WAITING row is a bring-up blocked on the registry (§7 install step
-    6's data-services semantics): the tick re-runs the full install flow,
-    skipping dependencies that are already installed. The data plane being
-    down keeps the wait; a real bring-up failure (a hook exit, a run failure,
-    a health timeout) marks the module broken."""
+    """A WAITING row is a bring-up blocked on something external (§7 install
+    step 6's data-services semantics): the registry, or the core services a
+    chat-dependent chain needs. The tick re-runs the full install flow,
+    skipping dependencies that are already installed; a wait keeps the row
+    waiting, and a real bring-up failure (a hook exit, a run failure, a
+    health timeout) marks the module broken."""
     module_id = row["id"]
     try:
         _do_install(module_id)
-    except _DataPlaneWait:
-        return
     except Exception as exc:  # noqa: BLE001 — the row records it
         db.set_module_state(module_id, BROKEN, error=str(exc)[:500])
 

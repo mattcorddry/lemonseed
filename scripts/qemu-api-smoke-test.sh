@@ -16,11 +16,21 @@ HOST_PORT="${QEMU_API_HOST_PORT:-19080}"
 TIMEOUT="${QEMU_API_TIMEOUT:-1200}"
 PIDFILE="${ROOT}/out/qemu-api-smoke.pid"
 LOG="${ROOT}/out/qemu-api-smoke.log"
-# 16 GiB: large enough for the CPU-path e2e (QEMU_E2E_CHAT=1) to select + load
-# Gemma E4B (needs ram >= min_vram 8 + min_ram 6 = 14 GiB; the largest Gemma
-# that fits at 16 GiB CPU). 8 GiB would leave the planner in not-ready, which
-# is what the default (non-e2e) run asserts.
-MEM="${QEMU_MEM:-16384}"
+# Guest RAM follows the e2e opt-in. The CPU-path e2e (QEMU_E2E_CHAT=1) needs
+# enough to select + load Gemma E4B (ram >= min_vram 8 + min_ram 6 = 14 GiB; the
+# largest Gemma that fits at 16 GiB CPU), so the e2e keeps 16 GiB. The default
+# (non-e2e) run only needs the planner to record an outcome, so it takes the
+# 8 GiB floor — the same default run-qemu.sh uses — because a 16 GiB guest on a
+# ~22 GiB host drives QEMU into the OOM killer (QEMU's oom_score_adj is 200, so
+# it is the likely victim) and the smoke dies with no verdict. QEMU_MEM
+# overrides either way.
+if [[ -n "${QEMU_MEM:-}" ]]; then
+  MEM="${QEMU_MEM}"
+elif [[ "${QEMU_E2E_CHAT:-0}" == "1" ]]; then
+  MEM=16384
+else
+  MEM=8192
+fi
 SMP="${QEMU_SMP:-2}"
 VIRTFS_DIR="${QEMU_OWUI_VIRTFS:-${ROOT}/out/qemu-owui-virtfs}"
 # Opt-in full model-load e2e: POST /_lemonseed/api/models to pick Gemma, then poll

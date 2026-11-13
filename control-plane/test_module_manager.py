@@ -21,6 +21,7 @@ from unittest import mock
 CP = Path(__file__).resolve().parent
 sys.path.insert(0, str(CP))
 
+import data_services  # noqa: E402
 import module_manager as mm  # noqa: E402
 import modules_catalog as mc  # noqa: E402
 
@@ -31,6 +32,26 @@ WAITING = mm.WAITING
 INSTALLED = mm.INSTALLED
 ENABLED = mm.ENABLED
 BROKEN = mm.BROKEN
+
+# The ModuleCase patches _wait_data_plane away (every lifecycle test would
+# otherwise wait on the real data plane); the one test that exercises the real
+# gate restores it from this import-time capture.
+REAL_WAIT_DATA_PLANE = mm._wait_data_plane
+
+
+class FakeClock:
+    """time.monotonic that ticks 1 s per call and never actually sleeps, so
+    the wait loops reach their deadline without a real wait."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        self.now += 1.0
+        return self.now
+
+    def sleep(self, _seconds: float) -> None:
+        pass
 
 
 def spec_for(module_id: str, **overrides: object) -> dict:
@@ -198,7 +219,7 @@ class ModuleCase(unittest.TestCase):
             mock.patch.object(mm, "_pull_image", lambda image, name: (True, "")),
             mock.patch.object(mm, "_resolve_ref", lambda image: "ref:local"),
             mock.patch.object(mm, "_ensure_lemon_network", lambda: True),
-            mock.patch.object(mm, "_wait_data_plane", lambda: None),
+            mock.patch.object(mm, "_wait_data_plane", lambda specs=None: (True, "")),
             mock.patch.object(mm, "DATA_ROOT", self.data_root),
             mock.patch.object(mm, "run_hook", fake_run_hook),
             mock.patch.object(audit_mod(), "record", lambda *args, **kwargs: True),
@@ -369,6 +390,65 @@ class InstallTests(ModuleCase):
             self._wait_op_done()
         self.assert_state("demo", BROKEN)
         self.assertIn("hooks/install.sh failed", self.row("demo")["error"])
+
+
+class DataPlaneTests(ModuleCase):
+    """The core-services wait (§7 install step 2): a wait is a wait, never a
+    verdict, and the LiteLLM gate applies only to a chain that declares it —
+    an appliance that has not picked a model yet is a normal state."""
+
+    def test_wait_marks_waiting_and_the_tick_retries(self) -> None:
+        self.add_module("demo")
+        with mock.patch.object(
+            mm, "_wait_data_plane", lambda specs=None: (False, "the LiteLLM proxy is not ready")
+        ):
+            result = mm.request_install("demo")
+            self.assertTrue(result["accepted"], result)
+            self._wait_op_done()
+        self.assert_state("demo", WAITING)
+        self.assertIn("LiteLLM", self.row("demo")["error"])
+        self.assertEqual(self.docker.runs(), [])
+        mm.supervise_once()
+        self.assert_state("demo", ENABLED)
+
+    def test_enable_waits_when_the_data_plane_is_not_ready(self) -> None:
+        self.add_module("demo")
+        self.db.rows["demo"] = {
+            "state": INSTALLED,
+            "version": "1.0.0",
+            "settings": {},
+            "error": None,
+            "run_hash": "",
+        }
+        with mock.patch.object(
+            mm, "_wait_data_plane", lambda specs=None: (False, "the data plane did not become ready")
+        ):
+            result = mm.request_enable("demo")
+            self.assertTrue(result["accepted"], result)
+            self._wait_op_done()
+        self.assert_state("demo", WAITING)
+        self.assertIn("data plane", self.row("demo")["error"])
+
+    def test_litellm_gate_applies_only_when_declared(self) -> None:
+        """The real gate: no model chosen yet is a normal state, so a chain
+        that does not declare litellm installs straight through, and one that
+        does waits."""
+        fake = type("FakeLiteLLM", (), {"litellm_ready": staticmethod(lambda: False)})
+        clock = FakeClock()
+        with mock.patch.dict(sys.modules, {"litellm": fake}):
+            with mock.patch.object(mm, "time", clock), mock.patch.object(
+                mm, "_wait_data_plane", REAL_WAIT_DATA_PLANE
+            ), mock.patch.object(
+                data_services, "ensure_provision_worker", lambda: None
+            ), mock.patch.object(
+                data_services, "ensure_provisioned", lambda: {"state": "ready"}
+            ):
+                ok, reason = mm._wait_data_plane([spec_for("demo")])
+                self.assertTrue(ok, reason)
+                chat = spec_for("demo", dependencies={"core": ["litellm"]})
+                ok, reason = mm._wait_data_plane([chat])
+                self.assertFalse(ok)
+                self.assertIn("LiteLLM", reason)
 
 
 class EnableDisableTests(ModuleCase):
