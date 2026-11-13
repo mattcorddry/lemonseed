@@ -535,6 +535,24 @@ class RemoveTests(ModuleCase):
         self.assertEqual(self.db.dropped_dbs, ["demo"])
         self.assertFalse(mm._module_volume("demo").exists())
 
+    def test_remove_purge_tolerates_a_volume_that_never_existed(self) -> None:
+        """A purge deletes what is there; a module that never installed (the
+        smoke's first-run case, a row left broken by a failed install) has no
+        volume to delete, and the purge must not fail on that."""
+        self.add_module("demo")
+        self.db.rows["demo"] = {
+            "state": BROKEN,
+            "version": "",
+            "settings": {},
+            "error": None,
+            "run_hash": "",
+        }
+        self.assertFalse(mm._module_volume("demo").exists())
+        result = mm.request_remove("demo", preserve=False, confirm="purge")
+        self.assertTrue(result["accepted"], result)
+        self._wait_op_done()
+        self.assertNotIn("demo", self.db.rows)
+
     def test_remove_purge_requires_typed_confirm(self) -> None:
         self._enabled()
         result = mm.request_remove("demo", preserve=False, confirm="remove")

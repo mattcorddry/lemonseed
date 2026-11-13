@@ -813,7 +813,9 @@ def _do_remove(module_id: str, *, preserve: bool, actor: str = "") -> dict[str, 
             db.set_module_state(module_id, BROKEN, error=f"could not drop the database: {exc}")
             raise
         try:
-            shutil.rmtree(_module_volume(module_id))
+            volume = _module_volume(module_id)
+            if volume.exists():
+                shutil.rmtree(volume)
         except OSError as exc:
             db.set_module_state(module_id, BROKEN, error=f"could not delete the data volume: {exc}")
             raise

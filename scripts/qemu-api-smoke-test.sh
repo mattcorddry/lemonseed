@@ -2447,7 +2447,12 @@ print("OK: the module view reads; hello-world is offered (state=%s)" % card.get(
 '
 
 echo "==> M9 P2: pre-remove (re-runnable on a persistent disk)"
-mods_post remove '{"preserve":false,"confirm":"purge"}' >/dev/null
+mods_pre_code="$(mods_post remove '{"preserve":false,"confirm":"purge"}')"
+# 409 here means it was not installed to begin with; either way, wait for gone.
+case "${mods_pre_code}" in
+  202|409) ;;
+  *) mods_fail "POST pre-remove" "${mods_pre_code}";;
+esac
 mods_wait gone 120
 
 echo "==> M9 P2: install hello-world"
