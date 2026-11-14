@@ -2403,6 +2403,15 @@ mods_post() {  # mods_post <verb> <body> — status on stdout, body in /tmp/qemu
 }
 mods_read() {  # the admin session reads the module view into /tmp/qemu-m7.body
   m7_get "${COOKIE_JAR}" "/_lemonseed/api/modules" >/dev/null
+  # The view GET lands in the login redirect unless the admin session's
+  # cookie is valid — so assert the body is JSON before the assertions run.
+  MODS_ID="${MODS_ID}" python3 -c '
+import json, sys
+d = json.load(open("/tmp/qemu-m7.body"))
+if "installed" not in d:
+    print("the module view did not carry an installed list — the admin session cookie is not valid", file=sys.stderr)
+    sys.exit(1)
+'
 }
 mods_card() {  # print the hello-world card from the view (empty if absent)
   MODS_ID="${MODS_ID}" python3 -c '
