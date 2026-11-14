@@ -110,7 +110,7 @@ because (a) is defeated if the test itself is flaky.
 - **Firmware and GPU.** OVMF is not the real UEFI; QEMU has no AMD GPU, no
   NVIDIA GPU, and under TCG it is slow enough to force large timeouts.
 
-### E — VM smoke *(proposed: Proxmox API)*
+### E — VM smoke (Proxmox API)
 
 A narrow phase, deliberately: it exists to close exactly the Phase-D lies, and
 not to be a bigger QEMU. A real VM on a real bridge gives the appliance a real
@@ -125,13 +125,32 @@ The release drill's `lemonseed-update check --url` mechanics (RELEASE.md part
 4) become automatable here: the drill's URL-serving half runs against a VM
 instead of a bare-metal box, which is why this phase pays for itself.
 
+The harness is `scripts/vm-test.py`, reached with `make test-vm` (opt-in like
+D, and only after D passes).
+
 Design constraints, recorded so they are not rediscovered:
 
-- **Do not duplicate the smoke.** The prerequisite is a refactor that splits
-  `qemu-api-smoke-test.sh` into a boot harness (QEMU-specific) and an
-  **endpoint-parametric assertion library** (takes a base URL and a cookie
-  jar). The VM harness reuses the assertions verbatim against the VM's real
-  IP; otherwise we would maintain two copies of the smoke and they would drift.
+- **The allowlist is the phase's first invariant.** The host serves real
+  workloads — the 192 GiB `llama` VM is the box that runs this agent, and
+  `circ-dataplane-test` (id 120, 192.168.1.82) is a **different project's**
+  test VM built by Hermes in another thread, never touched — so the harness
+  refuses any VM id or name outside `LEMONSEED_VM_ALLOWLIST` (a
+  comma-separated set of numeric ids, or a name pattern like `lemonseed-*`)
+  and any storage outside `LEMONSEED_STORAGE_ALLOWLIST` (default
+  `local-zfs`, the only pool with the free space). The check runs before
+  every state-changing call — create, start, stop, delete, resize, config —
+  and fails loudly rather than guessing. The pattern `lemonseed-*` is the
+  whole default: a specific numeric id is an explicit, deliberate choice.
+- **Do not duplicate the smoke.** The VM phase runs the QEMU smoke suite
+  **unchanged** through two small hooks: the suite's base URL is
+  `http://127.0.0.1:19080` (the QEMU port-forward), so the harness forwards
+  that local port to the VM's :80; and `SMOKE_SKIP_BOOT=1` skips the suite's
+  boot harness (the artifacts, the QEMU start, the signing sets) so the
+  assertions run against a live appliance. The assertion library is the same
+  code the QEMU smoke runs; a refactor that splits them into a
+  boot-harness + a library remains the long-term shape, but for now the
+  hooks are enough to reuse the suite verbatim without maintaining two
+  copies.
 - **GPU inference is out of scope by construction.** The Proxmox host has no
   spare GPU, so the VM is a CPU-only box — which is also a useful *negative*
   test point: with no GPU, `/v1/system-info` reports none and the model planner
@@ -147,6 +166,36 @@ Design constraints, recorded so they are not rediscovered:
   the repo — the same hygiene as every other secret.
 - **Not in `make test`:** the phase needs a hypervisor host and the network, so
   it is its own target, opt-in like D.
+
+The harness runs the phase end to end, in five steps:
+
+1. **The ISO reaches the node by URL, not by upload.** The node pulls it via
+   `POST …/storage/local/download-url` from the dev box's `dev-httpd` server —
+   no base64 upload through the API, no SSH on the node. The privilege the
+   node needs for this is `Datastore.AllocateTemplate` on the storage (the
+   API's 403 names it when missing).
+2. **`vm-test.py create`** builds the VM: 4 cores, 16 GiB, a 40 GiB disk on the
+   storage allowlist, `vmbr0` (the internal network, where the dev box is —
+   the mDNS claim must be on the same network the finder resolves it from;
+   `vmbr1` is PROD) so the LAN identity and the mDNS claim are both reachable,
+   the ISO as the boot
+   medium. The id is allocated in the 200–219 range so it can never collide
+   with a real workload; the name is always `lemonseed-vm-…` so the allowlist
+   pattern covers it. 16 GiB because the ISO's live `/var` is a tmpfs at 50%
+   of RAM, and the release set's 4.3 GiB payload must fit while the installer
+   extracts it.
+3. **`vm-test.py install`** boots the ISO, finds the installer via mDNS
+   (`lemonseed.local`), and drives the web installer's own API: `GET /api/disks`
+   → `POST /api/install` with `channel=dev` and `source_url` pointing at the
+   dev box's artifact server → wait for the install → `POST /api/reboot`.
+4. **`vm-test.py smoke`** waits for the installed image's portal, starts a
+   local TCP forward from `127.0.0.1:19080` to the VM's :80, and runs the
+   QEMU smoke suite unchanged with `SMOKE_SKIP_BOOT=1`.
+5. **`vm-test.py delete`** tears the VM down; the disk is deleted with it.
+
+The e2e's 14–16 GiB model load fits in this footprint, so the e2e is an
+explicit opt-in (`--e2e-chat`) because it is the long pole (~20 min per
+model pull/load), not because the host can't afford it.
 
 ### F — Release drill (human)
 

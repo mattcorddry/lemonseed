@@ -56,6 +56,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# cleanup_server is called by cleanup() above on EXIT, so its definition must
+# exist unconditionally — the skip-boot mode (the VM phase: the VM is already
+# up, so no QEMU and no signing sets) skips the block that would otherwise
+# define it.
+SIGN_PID=""
+cleanup_server() {
+  if [[ -n "${SIGN_PID}" ]]; then
+    kill "${SIGN_PID}" 2>/dev/null || true
+    wait "${SIGN_PID}" 2>/dev/null || true
+  fi
+}
+
 deadline=$((SECONDS + TIMEOUT))
 
 # Nix may not be on PATH in non-login shells (single-user installs live in
@@ -93,6 +105,9 @@ elif [[ -n "${1:-}" ]]; then
   exit 2
 fi
 
+# The whole QEMU boot harness is skipped in skip-boot mode (the VM phase: the
+# VM is already running, so no artifacts, no QEMU, no virtio-fs, no KVM).
+if [[ "${SMOKE_SKIP_BOOT:-0}" == "0" ]]; then
 if [[ ! -f "${ARTIFACT_DIR}/vmlinuz" ]]; then
   if [[ "${BUILD}" -eq 1 ]]; then
     echo "==> Building QEMU artifacts"
@@ -170,25 +185,20 @@ if [[ -r /dev/kvm && -w /dev/kvm ]]; then
 else
   echo "==> /dev/kvm not usable; falling back to TCG (slow)"
 fi
+fi
 
 # --- M8 P2 signing + sharding smoke: build + serve the release sets the guest
 # consumes. `good` is a full sharded release set (built by the real packer,
 # signed with the QEMU-only key); the tampered variants exercise the payload
 # hash check and the manifest signature respectively. One server on
 # 127.0.0.1:${QEMU_SIGN_PORT} (the guest reaches it as 10.0.2.2).
+# Skipped in skip-boot mode (the VM phase): the suite's assertions never read
+# the sets — they are for the guest's updater only.
+if [[ "${SMOKE_SKIP_BOOT:-0}" == "0" ]]; then
 SIGN_PORT="${QEMU_SIGN_PORT:-18081}"
 SIGN_DIR="${ROOT}/out/qemu-signing"
 rm -rf "${SIGN_DIR}"
 mkdir -p "${SIGN_DIR}"
-# Defined before anything can fail: the EXIT trap above calls it, and the
-# smoke sets are built (and can fail) before the server starts.
-SIGN_PID=""
-cleanup_server() {
-  if [[ -n "${SIGN_PID}" ]]; then
-    kill "${SIGN_PID}" 2>/dev/null || true
-    wait "${SIGN_PID}" 2>/dev/null || true
-  fi
-}
 python3 - "${SIGN_DIR}" "${ROOT}/keys/qemu/qemu-release-v1.priv" "${ROOT}" <<'PYSIGN'
 import hashlib
 import json
@@ -312,6 +322,7 @@ cleanup_server
 python3 -m http.server "${SIGN_PORT}" --bind 127.0.0.1 --directory "${SIGN_DIR}" >/dev/null 2>&1 &
 SIGN_PID=$!
 echo "==> Serving signing-smoke sets on 127.0.0.1:${SIGN_PORT} (pid ${SIGN_PID})"
+fi
 
 SERIAL="file:${LOG}"
 if [[ "$DEBUG" == 1 ]] ; then
@@ -332,6 +343,11 @@ fi
 # - must pass cpu=host, owui container requires at least X86_V2 caps
 # - owui docker img tarball passed in via VIRTFS, read by systemd service
 #
+# The QEMU args reference variables the skipped boot harness never defined
+# (VMLINUZ, ACCEL_ARGS, VIRTFS_ARGS), so both the array and the QEMU start
+# must be skipped together in skip-boot mode (the VM phase: the VM is already
+# running, the suite runs against a live appliance instead of booting one).
+if [[ "${SMOKE_SKIP_BOOT:-0}" == "0" ]]; then
 QEMU_ARGS=()
 for arg in \
   -machine q35 \
@@ -353,7 +369,6 @@ for arg in \
 do
   QEMU_ARGS+=("${arg}")
 done
-
 echo "==> Starting QEMU (host API http://127.0.0.1:${HOST_PORT}/ → guest :80)"
 # debug mode: exec qemu, the rest of this script does not run
 if [[ "$DEBUG" == 1 ]] ; then
@@ -366,6 +381,7 @@ if [[ "$DEBUG" == 1 ]] ; then
 else
     "${QEMU_BIN}" "${QEMU_ARGS[@]}" >"${LOG}" 2>&1 &
     echo $! >"${PIDFILE}"
+fi
 fi
 
 # poll_http PATH MAX_TIME [COOKIE_JAR] [HOST]
@@ -390,10 +406,13 @@ while (( SECONDS < deadline )); do
   if poll_http "/healthz" 2 >/dev/null 2>&1; then
     break
   fi
-  if ! kill -0 "$(cat "${PIDFILE}")" 2>/dev/null; then
-    echo "QEMU exited early; tail ${LOG}:" >&2
-    tail -40 "${LOG}" >&2 || true
-    exit 1
+  if [[ "${SMOKE_SKIP_BOOT:-0}" == "0" ]]; then
+    # skip-boot mode has no QEMU process to check for an early exit
+    if ! kill -0 "$(cat "${PIDFILE}")" 2>/dev/null; then
+      echo "QEMU exited early; tail ${LOG}:" >&2
+      tail -40 "${LOG}" >&2 || true
+      exit 1
+    fi
   fi
   sleep 2
 done
