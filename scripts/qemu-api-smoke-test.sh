@@ -1870,6 +1870,12 @@ m7_get() {
     -b "${jar}" -c "${jar}" --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
     "http://${AUTH_HOST}:${HOST_PORT}${path}"
 }
+m7_get_follow() {
+  local jar="$1" path="$2"
+  curl -sSL -o /tmp/qemu-m7.body -D "${M7_HDR}" -w '%{http_code}' --max-time 60 \
+    -b "${jar}" -c "${jar}" --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
+    "http://${AUTH_HOST}:${HOST_PORT}${path}"
+}
 
 m7_stop() {  # m7_stop <the call that failed> <status we got>
   echo "$1: expected 200, got ${2}" >&2
@@ -2402,12 +2408,20 @@ mods_post() {  # mods_post <verb> <body> — status on stdout, body in /tmp/qemu
   m7_post "${COOKIE_JAR}" "/_lemonseed/api/modules/${MODS_ID}/$1" "$2"
 }
 mods_read() {  # the admin session reads the module view into /tmp/qemu-m7.body
-  m7_get "${COOKIE_JAR}" "/_lemonseed/api/modules" >/dev/null
+  # Follow the login redirect: without it, the body file carries the OWUI
+  # SPA's HTML, not JSON — and the JSON read fails silently.
+  m7_get_follow "${COOKIE_JAR}" "/_lemonseed/api/modules" >/dev/null
   # The view GET lands in the login redirect unless the admin session's
   # cookie is valid — so assert the body is JSON before the assertions run.
+  # If the body is not JSON (e.g. the OWUI SPA's HTML), the session cookie
+  # is not valid and the assertions would fail silently — so exit 1.
   MODS_ID="${MODS_ID}" python3 -c '
 import json, sys
-d = json.load(open("/tmp/qemu-m7.body"))
+try:
+    d = json.load(open("/tmp/qemu-m7.body"))
+except json.JSONDecodeError as e:
+    print("the module view did not return JSON — the admin session cookie is not valid (%s)" % e, file=sys.stderr)
+    sys.exit(1)
 if "installed" not in d:
     print("the module view did not carry an installed list — the admin session cookie is not valid", file=sys.stderr)
     sys.exit(1)
