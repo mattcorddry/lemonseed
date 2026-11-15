@@ -475,24 +475,36 @@ def step_smoke(_args: argparse.Namespace) -> None:
     if not ip:
         fail("the VM's IP is not in the state file — install first")
     # The appliance's DHCP lease changes after the reboot into the installed
-    # image, so re-resolve the mDNS name freshly instead of trusting the
-    # install step's recorded IP.
+    # image, so the smoke step re-resolves the mDNS name freshly — but the
+    # mDNS name can point to ANOTHER machine on the LAN (the mDNS claim
+    # lemon-test.local → 192.168.0.163, the bare metal machine's IP) — so
+    # the smoke step must NOT re-resolve the mDNS name freshly; it must use
+    # the install step's recorded IP (which is the VM's IP) instead.
+    # (A previous run DID re-resolve the mDNS name freshly and rewrote the
+    # state file's IP to 192.168.0.163 — the bare metal machine's IP — so
+    # the smoke run's every assertion hit the BARE METAL machine, not the
+    # VM.  The fix: never re-resolve the mDNS name freshly; always use the
+    # install step's recorded IP, which is the VM's IP.)
     fresh = resolve(PORTAL_MDNS)
-    if fresh:
-        ip = fresh
-        st["ip"] = fresh
-        STATE.write_text(json.dumps(st, indent=1))
-        log(f"the appliance's fresh mDNS IP is {ip} (was {st.get('ip')} — rewritten)")
+    if fresh and fresh != ip:
+        log(f"the mDNS claim now points to {fresh} — NOT rewriting the state "
+            f"file's IP ({ip}); the install step's recorded IP is the VM's IP")
+    else:
+        log(f"the mDNS claim agrees with the install step's recorded IP ({ip})")
     log(f"running the QEMU smoke suite (skip-boot) against http://{ip}:80")
     thread = threading.Thread(
         target=forward, args=(FORWARD_PORT, ip, 80), daemon=True
     )
     thread.start()
-    subprocess.run(
+    # check=True so the smoke suite's exit code 1 propagates: the suite's
+    # own set -euo pipefail already fails it on any non-zero return code,
+    # but check=False here was masking that as a silent pass.
+    proc = subprocess.run(
         ["bash", str(REPO / "scripts" / "qemu-api-smoke-test.sh")],
-        cwd=str(REPO), check=False,
+        cwd=str(REPO), check=True,
         env={**os.environ, "SMOKE_SKIP_BOOT": "1"},
     )
+    log("the QEMU smoke suite passed (exit %s)" % proc.returncode)
 
 
 def step_delete(args: argparse.Namespace) -> None:
