@@ -1,25 +1,79 @@
+/* Lemonseed installer — shares the control-plane portal's design system.
+ * The palette below is the same Neon spec (DESIGN.md, pulled from typeui.sh)
+ * that control-plane/static/lemonseed.css serves; edit both together or drift
+ * will creep in. Legacy variable names are kept as aliases because every rule
+ * below was written against them.
+ */
 :root {
-  --bg0: #0f1c18;
-  --bg1: #173028;
-  --ink: #f2f7f4;
-  --muted: #a7bfb4;
-  --accent: #c6f27a;
-  --accent-ink: #142018;
+  /* DESIGN.md tokens */
+  --primary: #BBF351;
+  --secondary: #00BCFF;
+  --success: #16A34A;
+  --warning: #D97706;
+  --danger: #DC2626;
+  --surface-dk: #0b1014;
+  --surface-dk-2: #141a20;
+  --text-dk: #f5f7fa;
+  /* Hairline for borders — Neon has no explicit border token, so it is
+     derived from the dark text end at low opacity (same value as the portal). */
+  --line: rgba(245, 247, 250, 0.14);
+  --glow: 0 0 12px rgba(187, 243, 81, 0.28);
+  /* Legacy names, aliased onto the tokens above. */
+  --bg0: var(--surface-dk);
+  --bg1: var(--surface-dk-2);
+  --ink: var(--text-dk);
+  --muted: #9aa6b2;
+  --accent: var(--primary);
+  --accent-ink: #111827; /* Neon text token — dark ink on the lime accent */
   --warn-bg: #3a2a12;
   --warn-ink: #ffe2a8;
-  --err: #ff8f8f;
-  --line: rgba(242, 247, 244, 0.14);
-  --radius: 14px;
-  --font: "Segoe UI", "Helvetica Neue", sans-serif;
+  --err: rgba(252, 164, 164, 0.9);
+  --radius: 8px; /* Neon rounded md (was a non-token 14px) */
+  --font: "Roboto", "Segoe UI", "Helvetica Neue", sans-serif;
+  --font-display: "STIX Two Text", Georgia, serif;
+  --font-mono: "Source Code Pro", ui-monospace, monospace;
+}
+
+/* --- Bundled webfonts (the DESIGN.md type system) ---------------------------
+ * Variable-weight latin-subset woff2, self-hosted so the installer renders
+ * correctly with no network. Licenses live beside the files in fonts/.
+ */
+@font-face {
+  font-family: "Roboto";
+  src: url("fonts/roboto-latin.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "STIX Two Text";
+  src: url("fonts/stix-two-text-latin.woff2") format("woff2");
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Source Code Pro";
+  src: url("fonts/source-code-pro-latin.woff2") format("woff2");
+  font-weight: 200 900;
+  font-style: normal;
+  font-display: swap;
 }
 
 * { box-sizing: border-box; }
+/* Dark-native chrome: without color-scheme, browsers paint light scrollbars
+   and form widgets over the near-black surface. */
+:root { color-scheme: dark; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(245, 247, 250, 0.18); border-radius: 999px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(245, 247, 250, 0.28); }
 html, body {
   margin: 0;
   min-height: 100%;
   background:
-    radial-gradient(1200px 600px at 10% -10%, #2a5a45 0%, transparent 55%),
-    radial-gradient(900px 500px at 100% 0%, #1c3d55 0%, transparent 50%),
+    radial-gradient(1200px 600px at 10% -10%, #1c2a20 0%, transparent 55%),
+    radial-gradient(900px 500px at 100% 0%, #0e1c26 0%, transparent 50%),
     var(--bg0);
   color: var(--ink);
   font-family: var(--font);
@@ -43,10 +97,11 @@ html, body {
   margin: 0;
   border-radius: 50%;
   object-fit: cover;
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
+  box-shadow: var(--glow);
   flex-shrink: 0;
 }
 .brand .wordmark {
+  font-family: var(--font-display);
   font-size: clamp(1.35rem, 5vw, 1.65rem);
   font-weight: 700;
   letter-spacing: 0.14em;
@@ -54,8 +109,9 @@ html, body {
 }
 .brand h1 {
   margin: 0.55rem 0 0.4rem;
+  font-family: var(--font-display);
   font-size: clamp(2rem, 8vw, 2.6rem);
-  font-weight: 650;
+  font-weight: 700;
   letter-spacing: -0.03em;
 }
 .lede {
@@ -69,7 +125,7 @@ html, body {
   padding: 1.15rem 1.1rem 1.25rem;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: rgba(15, 28, 24, 0.55);
+  background: rgba(11, 16, 20, 0.55);
   backdrop-filter: blur(8px);
 }
 .panel h2 {
@@ -100,7 +156,7 @@ html, body {
 }
 .disk.selected {
   border-color: var(--accent);
-  box-shadow: inset 0 0 0 1px var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent), var(--glow);
 }
 .disk .title { font-weight: 600; }
 .disk .meta { color: var(--muted); font-size: 0.9rem; }
@@ -158,14 +214,14 @@ html, body {
   padding: 0.3rem 0.5rem;
   border-radius: 8px;
   border: 1px solid var(--line);
-  background: rgba(15, 28, 24, 0.55);
+  background: rgba(11, 16, 20, 0.55);
   color: var(--ink);
   font: inherit;
   max-width: 14rem;
 }
 .row input[type="url"] {
   width: 13rem;
-  font-family: ui-monospace, monospace;
+  font-family: var(--font-mono);
   font-size: 0.85rem;
 }
 
@@ -178,7 +234,7 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(15, 28, 24, 0.75);
+  background: rgba(4, 10, 8, 0.78);
   z-index: 10;
 }
 .modal-card {
@@ -201,8 +257,8 @@ html, body {
   padding: 0.85rem 0.9rem;
   border: 1px solid var(--line);
   border-radius: 12px;
-  background: rgba(15, 28, 24, 0.55);
-  font-family: ui-monospace, monospace;
+  background: rgba(11, 16, 20, 0.55);
+  font-family: var(--font-mono);
   font-size: 1.15rem;
   letter-spacing: 0.04em;
   user-select: all;
@@ -214,9 +270,9 @@ html, body {
   padding: 0.85rem 0.9rem;
   border: 1px solid var(--line);
   border-radius: 12px;
-  background: rgba(15, 28, 24, 0.55);
+  background: rgba(11, 16, 20, 0.55);
   color: var(--ink);
-  font-family: ui-monospace, monospace;
+  font-family: var(--font-mono);
   font-size: 1.05rem;
 }
 .hw-copy {
@@ -291,7 +347,7 @@ html, body {
 #bar-fill {
   height: 100%;
   width: 0%;
-  background: linear-gradient(90deg, #7dcf6a, var(--accent));
+  background: linear-gradient(90deg, var(--success), var(--accent));
   transition: width 0.35s ease;
 }
 .pct { margin: 0.5rem 0 0; color: var(--muted); font-variant-numeric: tabular-nums; }
