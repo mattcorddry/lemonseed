@@ -2855,6 +2855,17 @@ print("OK: local chat ready model=%s display=%s" % (d.get("model_id"), d.get("di
     exit 1
   fi
 
+  # The module section uninstalls mcp-gateway before this block; bring it
+  # back so something is registered for the usage test to reach.
+  echo "==> M9 e2e MCP: reinstall the gateway module"
+  MODS_ID="mcp-gateway"
+  mods_read
+  if ! mods_card | grep -q '"installed": true'; then
+    code="$(mods_post install '{}')"
+    [[ "${code}" == "202" ]] || mods_fail "POST mcp-gateway install (e2e)" "${code}"
+  fi
+  mods_wait enabled 600
+
   echo "==> M9 e2e MCP: use the time tool through LiteLLM (time-delta proof)"
   # Deterministic MCP usage via the CP's admin proxy onto LiteLLM's REST
   # surface (/mcp-rest): the model is loaded, so the config rendered with the
