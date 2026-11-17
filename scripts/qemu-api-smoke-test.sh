@@ -606,11 +606,25 @@ except Exception:
     fi
     sleep 5
   done
+  # The function runs in a command substitution at its call sites, so its
+  # globals would not survive — persist the handshake facts to a state file
+  # the parent sources (the M2/wrong-password assertions after the FIRST
+  # sign-in read CID/CH_SALT/CLI_A/CLI_M1/CLI_EXPECT_M2).
+  cat > "${SRP_STATE:-/tmp/qemu-srp-state}" <<EOF
+CID=${CID-}
+CH_SALT=${CH_SALT-}
+CLI_A=${CLI_A-}
+CLI_M1=${CLI_M1-}
+CLI_EXPECT_M2=${CLI_EXPECT_M2-}
+verify_code=${verify_code:-never-tried}
+EOF
   echo "${verify_code:-never-tried}"
 }
 
 echo "==> SRP sign-in: challenge + verify over the gateway"
 verify_code="$(smoke_srp_signin "${COOKIE_JAR}")"
+# shellcheck disable=SC1090
+source "${SRP_STATE:-/tmp/qemu-srp-state}"
 if [[ "${verify_code}" != "200" ]]; then
   echo "SRP verify: expected 200, got ${verify_code:-never-tried}" >&2
   cat /tmp/qemu-verify-body.json >&2 || true

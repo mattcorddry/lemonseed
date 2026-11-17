@@ -555,8 +555,18 @@ def step_install(args: argparse.Namespace) -> None:
             time.sleep(10)
         else:
             fail("the install did not finish within an hour")
-    # A 409 here means "not yet": the phase can flip to can_reboot a beat
-    # after our poll sees it, so retry within a short window before failing.
+    # The installer's own verdict is "remove the USB, then click Reboot" —
+    # and the same applies to us: with the ISO still attached, OVMF's NVRAM
+    # boot entry from the first boot wins over our hd-first order and the
+    # reboot lands back in the installer. Eject before rebooting.
+    try:
+        dom.updateDeviceFlags(
+            f"<disk type='volume' device='cdrom'>"
+            f"<driver name='qemu' type='raw'/>"
+            f"<target dev='sda' bus='sata'/><readonly/></disk>", 0)
+        log("the installer ISO is ejected")
+    except host.libvirt.libvirtError as e:
+        fail(f"ejecting the ISO -> {e}")
     code = data = None
     for attempt in range(12):
         code, data = post_json(f"http://{ip}/api/reboot", {})
@@ -566,17 +576,18 @@ def step_install(args: argparse.Namespace) -> None:
     if code not in (200, 202):
         fail(f"/api/reboot -> {code} {data}")
     log("rebooting into the installed image")
-    # Boot order needs no rewrite: hd precedes cdrom in the domain XML, so the
-    # reboot lands on the installed disk. The lease is stable across reboots —
-    # same MAC, same network — and the recorded IP below stays THE VM's IP.
+    # The lease is stable across reboots — same MAC, same network — and the
+    # recorded IP below stays THE VM's IP. But HTTP 200 alone is not enough:
+    # the installer answers it too, so wait for the control plane's own role.
     deadline = time.monotonic() + 600
     while time.monotonic() < deadline:
-        code, _ = curl(f"http://{ip}/api/status", timeout=8)
-        if code == 200:
+        code, st_now = curl(f"http://{ip}/api/status", timeout=8)
+        if code == 200 and isinstance(st_now, dict) and st_now.get("role") != "installer":
             break
         time.sleep(5)
     else:
-        fail(f"the installed image did not come back on {ip} within 600s")
+        fail(f"the installed image did not come back on {ip} within 600s "
+             f"(last status: {st_now})")
     state_write(name, ip)
     log(f"{name} is serving the portal at http://{ip}:80")
 
