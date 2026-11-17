@@ -65,7 +65,7 @@ future breaking change ships as spec v2 alongside a v1 reader.
 ```yaml
 spec_version: 1
 id: mcp-gateway                  # [a-z][a-z0-9-]{1,30}; = directory name
-name: MCP Gateway                # display name
+name: Basic AI Tools             # display name
 type: plugin                     # application | plugin
 version: 1.0.0                   # upstream release this catalog entry tracks
 maturity: beta                   # alpha | beta | production
