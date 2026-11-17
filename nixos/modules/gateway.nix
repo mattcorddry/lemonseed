@@ -677,6 +677,16 @@ in
         proxyPass = "http://127.0.0.1:8080";
         extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
       };
+      # LiteLLM's MCP surface, via the CP proxy (M9 P3 follow-up). Admin-only:
+      # it executes tools server-side. The master key never leaves the box.
+      locations."= /_lemonseed/api/mcp/tools" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
+      locations."= /_lemonseed/api/mcp/call" = {
+        proxyPass = "http://127.0.0.1:8080";
+        extraConfig = "${authGate}\n${adminGate}\n${cpProxy}\nerror_page 500 502 503 504 =503 /_lemonseed/cp-down;";
+      };
       # Reboot / shut down (M7 P5). Admin-only at the edge and in the CP: this is
       # the one button that takes the whole appliance away from everyone else.
       locations."= /_lemonseed/api/power" = {

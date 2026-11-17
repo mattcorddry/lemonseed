@@ -27,6 +27,6 @@
   "mcp_gateway": {
     "name": "lemonseed/mcp-gateway",
     "tag": "0.1.0",
-    "digest": "sha256:0bae043229f29c74194c64a1004d830c96f050e513dd4df465e8b25fb2067f62"
+    "digest": "sha256:3c85d4aa1490164ad65498cdd74396d6f826d05df625a4e2e89a793ca082797d"
   }
 }

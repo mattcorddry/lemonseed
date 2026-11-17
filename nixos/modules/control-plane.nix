@@ -39,6 +39,7 @@ let
        ${cpSrc}/owui_policy.py ${cpSrc}/owui_portal.py ${cpSrc}/owui-policy.json \
        ${cpSrc}/image_pins.py ${cpSrc}/container-images.json \
        ${cpSrc}/modules_catalog.py ${cpSrc}/module_manager.py \
+       ${cpSrc}/mcp_proxy.py \
        ${cpSrc}/litellm.py \
        ${cpSrc}/words-en_US.txt "$out/"
     cp ${cpSrc}/catalog/models.json "$out/catalog/"

@@ -5955,6 +5955,16 @@ class Handler(BaseHTTPRequestHandler):
             module_manager.ensure_worker()
             self._json(200, module_manager.catalog_view())
             return
+        if path == "/_lemonseed/api/mcp/tools":
+            # M9 P3 follow-up: the admin's window onto LiteLLM's MCP surface.
+            # Session-gated here; nginx gates the whole /_lemonseed prefix.
+            if not self._require_admin():
+                return
+            import mcp_proxy  # noqa: PLC0415 — lazy, like the module worker
+
+            status, body = mcp_proxy.tools_list()
+            self._json(status, body)
+            return
         if path == "/_lemonseed/api/update":
             if not self._require_admin():
                 return
@@ -6212,6 +6222,29 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_admin():
                 return
             self._handle_module_post(raw, path[len("/_lemonseed/api/modules/") :])
+            return
+        if path == "/_lemonseed/api/mcp/call":
+            # Deterministic MCP usage through LiteLLM (the smoke's time-delta
+            # proof; a future portal panel would use the same route).
+            if not self._require_admin():
+                return
+            import mcp_proxy  # noqa: PLC0415 — lazy, like the module worker
+
+            try:
+                payload = json.loads(raw or "{}")
+            except ValueError:
+                self._json(400, {"error": "invalid JSON"})
+                return
+            tool = str(payload.get("tool") or "")
+            if not tool:
+                self._json(400, {"error": "tool is required"})
+                return
+            status, body = mcp_proxy.tool_call(
+                str(payload.get("server") or ""),
+                tool,
+                payload.get("arguments") or {},
+            )
+            self._json(status, body)
             return
         if path == "/_lemonseed/api/power":
             # Only an admin may stop the appliance, in nginx and here.

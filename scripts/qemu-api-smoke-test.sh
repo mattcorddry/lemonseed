@@ -2846,6 +2846,36 @@ assert d.get("progress") == 100, d
 print("OK: local chat ready model=%s display=%s" % (d.get("model_id"), d.get("display_name")))
 '
 
+  echo "==> M9 e2e MCP: use the time tool through LiteLLM (time-delta proof)"
+  # Deterministic MCP usage via the CP's admin proxy onto LiteLLM's REST
+  # surface (/mcp-rest): the model is loaded, so the config rendered with the
+  # mcp-gateway contribution and the tools are live. "Use" means executing
+  # get_current_time and comparing against this box's clock — a listing would
+  # prove nothing about reachability.
+  MCP_BEFORE="$(date -u +%s)"
+  mcp_code="$(curl -sS -o /tmp/qemu-mcp-call.json --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
+    -w '%{http_code}' \
+    -X POST "http://${AUTH_HOST}:${HOST_PORT}/_lemonseed/api/mcp/call" \
+    -H 'Content-Type: application/json' \
+    -d '{"server":"mcp_gateway","tool":"get_current_time","arguments":{"zone":"UTC"}}')"
+  [[ "${mcp_code}" == "200" ]] || {
+    echo "POST /_lemonseed/api/mcp/call: expected 200, got ${mcp_code}" >&2
+    cat /tmp/qemu-mcp-call.json >&2 || true; echo "" >&2; exit 1
+  }
+  MCP_AFTER="$(date -u +%s)"
+  printf '%s' "${MCP_BEFORE} ${MCP_AFTER}" | python3 -c '
+import json, sys
+from datetime import datetime
+
+before_s, after_s = (int(x) for x in sys.stdin.read().split())
+d = json.load(open("/tmp/qemu-mcp-call.json"))
+assert d.get("result") and not isinstance(d["result"], str), d
+dt = datetime.fromisoformat(d["result"]["datetime"])
+skew = abs(dt.timestamp() - (before_s + after_s) / 2)
+assert skew < 300, f"tool clock {dt} is {skew:.0f}s off the appliance wall clock"
+print("OK: MCP tool used through LiteLLM; gateway clock %ds from ours" % round(skew))
+'
+
   echo "==> M6.5 e2e GC: fill the model volume, pull a second model, expect eviction"
   # Disk-space guard e2e (unit tests cover the algorithm; this proves the
   # wiring on a real appliance):
