@@ -21,6 +21,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 DATA_DIR = Path(os.environ.get("MCP_DATA_DIR", "/data"))
 MEMORY_PATH = DATA_DIR / "memory.jsonl"
@@ -29,6 +30,20 @@ PORT = int(os.environ.get("MCP_PORT", "7860"))
 
 mcp = FastMCP(
     name="lemonseed-mcp-gateway",
+    # uvicorn binds 0.0.0.0 (main()), so tell the SDK: a localhost host here
+    # silently turns on DNS-rebinding protection with a localhost-only Host
+    # allowlist, which 421s every container-to-container caller (LiteLLM's
+    # Host header is the lemon-network DNS name). Keep the protection ON but
+    # allow exactly the hosts that may call this endpoint.
+    host="0.0.0.0",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[
+            "localhost:*",
+            "127.0.0.1:*",
+            "lemonseed-mcp-gateway:*",  # the litellm container's route in
+        ],
+    ),
     instructions=(
         "Lemonseed bundled tools: fetch, ddg_search, memory (knowledge "
         "graph), time."
@@ -244,7 +259,7 @@ def main() -> None:  # pragma: no cover — process entrypoint
     # answers a bare GET with 4xx, so /healthz rides in the same app.
     app = mcp.streamable_http_app()
     app.router.routes.append(Route("/healthz", healthz))
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level=os.environ.get("MCP_LOG_LEVEL", "info"))
 
 
 if __name__ == "__main__":
