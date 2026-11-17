@@ -2888,7 +2888,16 @@ print("OK: local chat ready model=%s display=%s" % (d.get("model_id"), d.get("di
   done
   if [[ "${mcp_code}" != "200" ]]; then
     echo "POST /_lemonseed/api/mcp/call: expected 200, got ${mcp_code} after retries" >&2
-    cat /tmp/qemu-mcp-call.json >&2 || true; echo "" >&2; exit 1
+    cat /tmp/qemu-mcp-call.json >&2 || true; echo "" >&2
+    echo "--- the mcp-gateway card at failure:" >&2
+    mods_read
+    mods_card | python3 -c '
+import json, sys
+card = json.load(sys.stdin)
+print(json.dumps({k: card.get(k) for k in (
+    "state", "chat_registered", "chat_registration_note", "mcp_server")}))
+' >&2 || true
+    exit 1
   fi
   MCP_AFTER="$(date -u +%s)"
   printf '%s' "${MCP_BEFORE} ${MCP_AFTER}" | python3 -c '
