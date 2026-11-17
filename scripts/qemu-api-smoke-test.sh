@@ -2862,7 +2862,7 @@ print("OK: local chat ready model=%s display=%s" % (d.get("model_id"), d.get("di
   # get_current_time and comparing against this box's clock — a listing would
   # prove nothing about reachability.
   MCP_BEFORE="$(date -u +%s)"
-  mcp_code="$(curl -sS -o /tmp/qemu-mcp-call.json --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
+  mcp_code="$(curl -sS -o /tmp/qemu-mcp-call.json -b "${COOKIE_JAR}" --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
     -w '%{http_code}' \
     -X POST "http://${AUTH_HOST}:${HOST_PORT}/_lemonseed/api/mcp/call" \
     -H 'Content-Type: application/json' \
