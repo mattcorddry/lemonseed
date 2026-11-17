@@ -2765,7 +2765,7 @@ css_code="$(curl -sS -o /tmp/qemu-theme.css -D /tmp/qemu-theme.hdr -w '%{http_co
 grep -qi 'content-type: text/css' /tmp/qemu-theme.hdr || {
   echo "the theme is not served as css:" >&2; cat /tmp/qemu-theme.hdr >&2; exit 1
 }
-grep -q -- '--accent' /tmp/qemu-theme.css || {
+grep -qE '^\s*--(accent|primary)' /tmp/qemu-theme.css || {
   echo "the theme served by nginx has no palette variables" >&2; exit 1
 }
 echo "OK: open endpoints answer, including the shared theme"
