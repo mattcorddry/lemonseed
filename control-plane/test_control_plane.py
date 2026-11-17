@@ -3968,7 +3968,9 @@ class SharedThemeTests(unittest.TestCase):
         """gateway.nix serves control-plane/static/lemonseed.css by name."""
         css = THEME_CSS
         self.assertIn(":root", css)
-        self.assertIn("--accent", css)
+        # The Neon restyle renamed the accent token; assert the current token,
+        # not a name that only the pre-restyle palette had.
+        self.assertIn("--primary", css)
         # Rules that used to live in Python must have moved with it, or the
         # rendered pages are now unstyled for those components.
         for selector in (".model-card", ".owui-actions", ".login-card"):

@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""Lemonseed VM test harness (the Proxmox phase, TESTING.md phase E).
+"""Lemonseed VM test harness — the appliance smoke phase (TESTING.md, one block).
 
-Creates a VM on the Proxmox node, boots the installer ISO, drives the web
-installer's own API to install, and hands the installed image to the QEMU
-smoke suite (unchanged, through a local TCP forward to the VM's :80 — the
-suite's assertion library is the same one the QEMU smoke uses).
+Runs the whole appliance contract against a real VM under this host's libvirt:
+define + boot the installer ISO from the default NAT network's storage, drive
+the web installer's own API to install, and hand the installed image to the
+QEMU smoke suite unchanged (through a local TCP forward to the VM's :80 — the
+suite's assertion library is the same one `make test-qemu` uses).
 
-The allowlist is the phase's first invariant. The host serves real workloads
-(a 192 GiB VM among them), so the harness refuses any VM id or name outside
-``LEMONSEED_VM_ALLOWLIST`` (a comma-separated set of numeric ids, or name
-patterns like ``lemonseed-*``) and any storage outside
-``LEMONSEED_STORAGE_ALLOWLIST`` (default ``local-zfs``). The check runs
-before every state-changing call — create, start, stop, delete, config — and
-fails loudly rather than guessing.
+Everything talks to libvirt through its **native Python bindings** (`import
+libvirt`, python3-libvirt) — no virsh callouts. IP discovery reads the NAT
+network's DHCP leases (`net.DHCPLeases()`), keyed on the VM's own MAC, which is
+what killed the mDNS-discovery class of failures: a lease maps one machine to
+one IP, while an mDNS name answers with whichever box claimed it last.
+
+The allowlist is still the phase's first invariant: this hypervisor may serve
+other workloads some day, so the harness refuses any domain whose name is not
+covered by ``LEMONSEED_VM_ALLOWLIST`` (default ``lemonseed-*``) and only ever
+creates volumes named after an allowed domain in the storage pool.
 """
 from __future__ import annotations
 
@@ -20,13 +24,11 @@ import argparse
 import json
 import os
 import socket
-import ssl
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import NoReturn
@@ -35,16 +37,18 @@ REPO = Path(__file__).resolve().parent.parent
 OUT = REPO / "out"
 STATE = OUT / "vm-state.json"
 
+LIBVIRT_URI = os.environ.get("LEMONSEED_LIBVIRT_URI", "qemu:///system")
+NETWORK_NAME = "default"  # the libvirt NAT network (virbr0); DHCP leases live here
+POOL_NAME = os.environ.get("LEMONSEED_STORAGE_POOL", "default")
+
 VM_ALLOWLIST_ENV = "LEMONSEED_VM_ALLOWLIST"
-STORAGE_ALLOWLIST_ENV = "LEMONSEED_STORAGE_ALLOWLIST"
-VM_ID_RANGE = (200, 219)  # never collide with a real workload (ids 100-120)
 VM_NAME_PREFIX = "lemonseed-vm-"
 INSTALLER_MDNS = "lemonseed.local"
-PORTAL_MDNS = "lemonseed.local"
 ISO_NAME = "lemonseed-installer.iso"
 FORWARD_PORT = 19080  # the smoke suite's default
+MDNS_IFACE = "virbr0"  # the NAT bridge the appliance multicasts on
 
-FOOTPRINT = {"cores": 4, "memory": 16384, "disk_gib": 40}  # 16 GiB: /var's tmpfs
+FOOTPRINT = {"vcpu": 4, "memory_mib": 16384, "disk_gib": 40}  # 16 GiB: /var's tmpfs
 # (50% of RAM) must hold the release set's 4.3 GiB payload while the
 # installer extracts it; an 8 GiB guest ran out at 45% ("staging filesystem
 # is full while extracting the payload").
@@ -71,125 +75,216 @@ def _matches(rule: str, value: str) -> bool:
     return value.startswith(rule[:-1]) if rule.endswith("*") else rule == value
 
 
-def ensure_vms_allowed(pve: "Pve", ids: list[int], names: list[str] | None = None) -> None:
-    """Refuse to touch a VM outside the allowlist, before any action. The
-    caller's own names are checked first (a VM about to be created does not
-    exist yet, so the API lookup cannot find it)."""
-    rules = allowlist(VM_ALLOWLIST_ENV, "")
-    if not rules:
-        fail(f"{VM_ALLOWLIST_ENV} is not set — refusing to touch any VM")
-    names = names or []
-    for i, vmid in enumerate(ids):
-        if any(_matches(r, str(vmid)) for r in rules):
-            continue
-        name = names[i] if i < len(names) else pve.vmid_name(vmid)
-        if name and any(_matches(r, name) for r in rules):
-            continue
+def ensure_name_allowed(name: str) -> None:
+    rules = allowlist(VM_ALLOWLIST_ENV, "lemonseed-*")
+    if not any(_matches(r, name) for r in rules):
         fail(
-            f"VM {vmid} ({name or 'unnamed'}) is not in {VM_ALLOWLIST_ENV}="
-            f"{','.join(rules)} — refusing"
+            f"domain {name} is not covered by {VM_ALLOWLIST_ENV}"
+            f"={','.join(rules)} — refusing"
         )
 
 
-def ensure_storage_allowed(storage: str) -> None:
-    rules = allowlist(STORAGE_ALLOWLIST_ENV, "local-zfs")
-    if storage not in rules:
-        fail(f"storage {storage} is not in {STORAGE_ALLOWLIST_ENV}={','.join(rules)} — refusing")
+def ensure_pool_allowed(pool_name: str) -> None:
+    """Only our own prefixed volumes may ever be created; the pool itself is
+    local, so a wrong pool costs disk space at worst — but stay explicit."""
+    if not pool_name:
+        fail("storage pool name is empty — refusing")
 
 
-# ------------------------------------------------------------ Proxmox API
+# ---------------------------------------------------------------- libvirt
 
 
-class Pve:
-    """A thin Proxmox API client over the token's env vars."""
+class Host:
+    """A thin native-bindings client: domain lifecycle, volumes, DHCP leases."""
 
     def __init__(self) -> None:
-        for var in ("PVE_HOST", "PVE_API_KEY_USER", "PVE_API_KEY_ID", "PVE_API_KEY"):
-            if not os.environ.get(var):
-                fail(f"{var} is not set — the token's env vars are required")
-        self.host = os.environ["PVE_HOST"]
-        self.base = f"https://{self.host}:8006/api2/json"
-        self.auth = "PVEAPIToken={user}!{id}={secret}".format(
-            user=os.environ["PVE_API_KEY_USER"],
-            id=os.environ["PVE_API_KEY_ID"],
-            secret=os.environ["PVE_API_KEY"],
-        )
-        self.ctx = ssl._create_unverified_context()
-
-    def _call(self, method: str, path: str, body: dict | None, timeout: float) -> tuple[int, object]:
-        url = f"{self.base}{path}"
-        data = urllib.parse.urlencode(body or {}).encode() if method == "POST" else None
-        req = urllib.request.Request(url, data=data, method=method, headers={"Authorization": self.auth})
         try:
-            with urllib.request.urlopen(req, timeout=timeout, context=self.ctx) as r:
-                return r.status, json.loads(r.read() or b"{}").get("data")
-        except urllib.error.HTTPError as e:
-            payload = e.read()
-            try:
-                return e.code, json.loads(payload)
-            except Exception:
-                return e.code, {"message": payload.decode(errors="replace")}
-
-    def get(self, path: str, **params: object) -> list | dict:
-        q = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
-        code, data = self._call("GET", f"{path}?{q}" if q else path, None, 60)
-        if code != 200:
-            fail(f"GET {path} -> {code} {data}")
-        return data if isinstance(data, (list, dict)) else []
-
-    def post(self, path: str, body: dict | None = None, timeout: float = 60) -> tuple[int, dict]:
-        code, data = self._call("POST", path, body or {}, timeout)
-        return code, (data if isinstance(data, dict) else {"data": data})
-
-    def delete(self, path: str, timeout: float = 60) -> tuple[int, dict]:
-        code, data = self._call("DELETE", path, None, timeout)
-        return code, (data if isinstance(data, dict) else {"data": data})
-
-    def _qemu(self, vmid: int) -> dict:
-        rows = self.get("/nodes/pve/qemu")
-        for r in rows:
-            if int(r["vmid"]) == vmid:
-                return r
-        fail(f"VM {vmid} is not on {self.host}")
-
-    def vmid_name(self, vmid: int) -> str:
-        return str(self._qemu(vmid).get("name") or "")
-
-    def vmid_status(self, vmid: int) -> str:
-        return str(self._qemu(vmid).get("status") or "")
-
-    def alloc_vmid(self) -> int:
-        taken = {int(r["vmid"]) for r in self.get("/nodes/pve/qemu")}
-        for v in range(VM_ID_RANGE[0], VM_ID_RANGE[1] + 1):
-            if v not in taken:
-                return v
-        fail(f"no free vmid in {VM_ID_RANGE}")
-
-    def wait_task(self, upid: str, timeout: float) -> None:
-        node = upid.split(":")[1]
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            st = self.get(
-                f"/nodes/{node}/tasks/{urllib.parse.quote(upid, safe='')}/status"
+            import libvirt  # (python3-libvirt; see TESTING.md requirements)
+        except ImportError as e:
+            fail(f"the libvirt Python bindings are missing ({e}) — install python3-libvirt")
+        self.libvirt = libvirt
+        try:
+            self.conn = libvirt.open(LIBVIRT_URI)
+        except libvirt.libvirtError as e:
+            fail(
+                f"cannot connect to {LIBVIRT_URI}: {e} — if this is a fresh"
+                " membership in the `libvirt` group, log out and back in first"
+                " (a running desktop session keeps its old supplementary groups)"
             )
-            if isinstance(st, dict) and st.get("status") == "finished":
-                if st.get("exitstatus") == "OK":
-                    return
-                tail = self.get(
-                    f"/nodes/{node}/tasks/{urllib.parse.quote(upid, safe='')}/log?limit=20"
-                )
-                lines = [str(r.get("t", "")) for r in tail] if isinstance(tail, list) else []
-                fail(f"task {upid} -> {st.get('exitstatus')} ({'; '.join(lines[-5:])})")
-            time.sleep(2)
-        fail(f"task {upid} did not finish within {timeout:.0f}s")
+
+    # -- domain ------------------------------------------------------------
+
+    def domain(self, name: str):
+        try:
+            return self.conn.lookupByName(name)
+        except self.libvirt.libvirtError:
+            return None
+
+    def state_of(self, dom) -> str:
+        state, _reason = dom.state()  # (state, reason); see VIR_DOMAIN_* enums
+        names = {
+            1: "running", 3: "paused", 4: "shutting-down", 5: "stopped",
+            7: "crashed", 8: "suspended",
+        }
+        return names.get(state, f"state{state}")
+
+    def start(self, name: str) -> None:
+        ensure_name_allowed(name)
+        dom = self.domain(name)
+        if dom is None:
+            fail(f"domain {name} does not exist — create first")
+        if self.state_of(dom) != "running":
+            dom.create()
+        log(f"VM {name} started")
+
+    def destroy_if_running(self, name: str) -> None:
+        ensure_name_allowed(name)
+        dom = self.domain(name)
+        if dom is None:
+            return
+        if self.state_of(dom) == "running":
+            try:
+                dom.destroy()
+            except self.libvirt.libvirtError as e:
+                fail(f"cannot stop {name}: {e}")
+            log(f"VM {name} stopped")
+
+    # -- volumes -----------------------------------------------------------
+
+    def volume(self, name: str):
+        pool = self.conn.storagePoolLookupByName(POOL_NAME)
+        try:
+            return pool.storageVolLookupByName(name)
+        except self.libvirt.libvirtError:
+            return None
+
+    def create_disk_volume(self, name: str, size_gib: int) -> None:
+        ensure_name_allowed(name)
+        if self.volume(name) is not None:
+            log(f"volume {name} already exists — reusing it")
+            return
+        pool = self.conn.storagePoolLookupByName(POOL_NAME)
+        vol_xml = (
+            f"<volume><name>{name}</name>"
+            f"<capacity unit='G'>{size_gib}</capacity>"
+            f"<target><format type='qcow2'/></target></volume>"
+        )
+        pool.createXML(vol_xml, 0)
+
+    def upload_iso(self, iso_path: Path) -> None:
+        """The installer ISO reaches the pool by stream upload from this host —
+        no HTTP hop, no node-side pull. Reused when the size already matches."""
+        ensure_name_allowed(ISO_NAME.rsplit(".", 1)[0])
+        pool = self.conn.storagePoolLookupByName(POOL_NAME)
+        iso_size = iso_path.stat().st_size
+        try:
+            vol = pool.storageVolLookupByName(ISO_NAME)
+            if vol.info()[1] == iso_size:  # (type, capacity-bytes, …) — exact match
+                log("the pool already holds the ISO (same size) — skipping the upload")
+                return
+        except self.libvirt.libvirtError:
+            pass
+        try:
+            old = pool.storageVolLookupByName(ISO_NAME)
+            old.delete(0)  # a stale ISO of a different build — replace it
+        except self.libvirt.libvirtError:
+            pass
+        vol_xml = (
+            f"<volume><name>{ISO_NAME}</name>"
+            f"<capacity unit='bytes'>{iso_size}</capacity>"
+            f"<target><format type='raw'/></target></volume>"
+        )
+        vol = pool.createXML(vol_xml, 0)
+        st = self.conn.newStream(0)
+        vol.upload(st, 0, iso_size, 0)
+
+        def sink(stream, _n, opaque):
+            return f.read(opaque[0])
+
+        with open(iso_path, "rb") as f:
+            st.sendAll(sink, (1024 * 1024,))
+            st.finish()
+        log("the ISO is in the pool")
+
+    def delete_volumes(self, name: str) -> None:
+        ensure_name_allowed(name)
+        for vol_name in (f"{name}-disk.qcow2",):
+            vol = self.volume(vol_name)
+            if vol is not None:
+                vol.delete(0)
+                log(f"volume {vol_name} deleted")
+
+    # -- network -----------------------------------------------------------
+
+    def lease_ip(self, mac: str) -> str | None:
+        """The VM's DHCP lease on the NAT network, keyed by its own MAC —
+        never an mDNS name (an mDNS claim answers with whichever box took it)."""
+        net = self.conn.networkLookupByName(NETWORK_NAME)
+        for lease in net.DHCPLeases():
+            if str(lease.get("mac", "")).lower() == mac.lower():
+                ipaddr = lease.get("ipaddr")
+                if ipaddr:
+                    return str(ipaddr)
+        return None
+
+    def wait_lease(self, mac: str, deadline_s: float) -> str:
+        deadline = time.monotonic() + deadline_s
+        while time.monotonic() < deadline:
+            ip = self.lease_ip(mac)
+            if ip:
+                return ip
+            time.sleep(3)
+        fail(f"no DHCP lease for {mac} on {NETWORK_NAME} within {deadline_s:.0f}s")
+
+
+# ------------------------------------------------------- domain XML (create)
+
+
+def domain_xml(name: str) -> str:
+    """UEFI (firmware=efi autoselect), hd before cdrom — an empty disk falls
+    through to the installer ISO, and after the install the same boot order
+    boots the installed image, which retires the pve-era boot-order rewrite."""
+    return f"""<domain type='kvm'>
+  <name>{name}</name>
+  <memory unit='MiB'>{FOOTPRINT['memory_mib']}</memory>
+  <vcpu placement='static'>{FOOTPRINT['vcpu']}</vcpu>
+  <os firmware='efi'>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <boot dev='hd'/>
+    <boot dev='cdrom'/>
+  </os>
+  <features><acpi/><apic/></features>
+  <cpu mode='host-model'/>
+  <clock offset='utc'/>
+  <on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash>
+  <devices>
+    <disk type='volume' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source pool='{POOL_NAME}' volume='{name}-disk.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <disk type='volume' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source pool='{POOL_NAME}' volume='{ISO_NAME}'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>
+    <interface type='network'>
+      <source network='{NETWORK_NAME}'/>
+    </interface>
+    <console type='pty'><target type='serial' port='0'/></console>
+    <graphics type='none'/>
+    <video><model type='virtio'/></video>
+  </devices>
+</domain>"""
 
 
 # ------------------------------------------------------------- find helpers
 
 
-def state_write(vmid: int, ip: str | None) -> None:
+def state_write(name: str, ip: str | None) -> None:
     OUT.mkdir(exist_ok=True)
-    STATE.write_text(json.dumps({"vmid": vmid, "ip": ip}, indent=1))
+    STATE.write_text(json.dumps({"domain": name, "ip": ip}, indent=1))
 
 
 def state_read() -> dict:
@@ -201,58 +296,30 @@ def state_read() -> dict:
 def curl(url: str, timeout: float = 10) -> tuple[int, dict | None]:
     req = urllib.request.Request(url)
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ssl._create_unverified_context()) as r:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx()) as r:
             return r.status, json.loads(r.read() or b"{}")
     except urllib.error.HTTPError as e:
         return e.code, None
     except Exception:
         return 0, None
+
+
+def _ssl_ctx():
+    import ssl
+
+    return ssl._create_unverified_context()
 
 
 def post_json(url: str, body: dict) -> tuple[int, dict | None]:
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, method="POST", headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=60, context=ssl._create_unverified_context()) as r:
+        with urllib.request.urlopen(req, timeout=60, context=_ssl_ctx()) as r:
             return r.status, json.loads(r.read() or b"{}")
     except urllib.error.HTTPError as e:
         return e.code, None
     except Exception:
         return 0, None
-
-
-def resolve(name: str) -> str | None:
-    """mDNS/DNS lookup via getent (systemd-resolved's mDNS)."""
-    r = subprocess.run(
-        ["getent", "hosts", name], check=False, capture_output=True, text=True, timeout=10
-    )
-    for line in (r.stdout or "").splitlines():
-        parts = line.split()
-        if len(parts) >= 2 and parts[0].startswith("192.168."):
-            return parts[0]
-    return None
-
-
-def find_installer(deadline_s: float = 300) -> tuple[str, dict]:
-    """The installer ISO advertises lemonseed.local; a LAN device already
-    claims it (lemonseed1.corddry.net), in which case avahi renames the second
-    responder — so try the renamed forms too and take the one whose
-    /api/status answers."""
-    deadline = time.monotonic() + deadline_s
-    names = [INSTALLER_MDNS]
-    for n in range(2, 10):
-        names.append(INSTALLER_MDNS.replace(".local", f"-{n}.local"))
-    log("finding the installer via mDNS (%s …)" % ", ".join(names[:3]))
-    while time.monotonic() < deadline:
-        for name in names:
-            ip = resolve(name)
-            if not ip:
-                continue
-            code, data = curl(f"http://{ip}/api/status", timeout=5)
-            if code == 200 and isinstance(data, dict) and data.get("role") == "installer":
-                return ip, data
-        time.sleep(5)
-    fail(f"no installer answered within {deadline_s:.0f}s")
 
 
 def wait_portal(ip: str, deadline_s: float = 600) -> None:
@@ -311,83 +378,64 @@ def forward(src_port: int, dst_host: str, dst_port: int) -> None:
 
 
 def step_status(_args: argparse.Namespace) -> None:
-    pve = Pve()
-    rules = allowlist(VM_ALLOWLIST_ENV, "")
-    log("allowlist: %s=%s  %s=%s" % (
-        VM_ALLOWLIST_ENV, ",".join(rules) or "(unset — refusing)",
-        STORAGE_ALLOWLIST_ENV, ",".join(allowlist(STORAGE_ALLOWLIST_ENV, "local-zfs"))))
-    log("the VMs the token can see:")
-    for r in pve.get("/nodes/pve/qemu"):
-        vmid = int(r["vmid"])
-        name = str(r.get("name") or "?")
-        allowed = any(_matches(rule, str(vmid)) or _matches(rule, name) for rule in rules)
-        log("  id %-4s %-24s status=%-8s cores=%-3s mem=%-5d MiB %s" % (
-            vmid, name, r.get("status"), r.get("cpus"), (r.get("maxmem") or 0) // 1024,
-            "ALLOWED" if allowed else "off-limits"))
+    host = Host()
+    rules = allowlist(VM_ALLOWLIST_ENV, "lemonseed-*")
+    log(f"allowlist: {VM_ALLOWLIST_ENV}={','.join(rules)}  pool={POOL_NAME}")
+    log(f"domains on {LIBVIRT_URI}:")
+    for dom in sorted(host.conn.listAllDomains(), key=lambda d: d.name()):
+        allowed = any(_matches(rule, dom.name()) for rule in rules)
+        desc = dom.XMLDesc(0)
+        mac = "-"
+        if 'mac address="' in desc:
+            mac = desc.split('mac address="')[1].split('"')[0]
+        ip = host.lease_ip(mac) if mac != "-" and allowed else None
+        log("  %-28s %-12s %s%s" % (
+            dom.name(), host.state_of(dom),
+            f"ip={ip} " if ip else "",
+            "" if allowed else "(off-limits)"))
 
 
 def step_create(args: argparse.Namespace) -> None:
-    if not args.dev_httpd:
-        fail("--dev-httpd is required for create")
-    pve = Pve()
-    vmid = pve.alloc_vmid()
+    host = Host()
     name = f"{VM_NAME_PREFIX}{time.strftime('%Y%m%d%H%M')}"
-    log(f"allocating vmid {vmid} name {name}")
-    ensure_vms_allowed(pve, [vmid], [name])
-    storage = args.storage or "local-zfs"
-    ensure_storage_allowed(storage)
+    ensure_name_allowed(name)
+    ensure_pool_allowed(POOL_NAME)
     iso = OUT / "latest-installer" / ISO_NAME
     if not iso.is_file():
         fail(f"{iso} is missing — run make build-installer first")
-    # Skip the 1.3 GiB pull when the node already holds the same file.
-    node_iso = [r for r in pve.get("/nodes/pve/storage/local/content?content=iso")
-                if str(r.get("volid", "")).endswith(ISO_NAME)]
-    if not node_iso or int(node_iso[0].get("size", 0) or 0) != iso.stat().st_size:
-        code, data = pve.post(
-            "/nodes/pve/storage/local/download-url",
-            {"url": f"http://{args.dev_httpd}/latest-installer/{ISO_NAME}",
-             "filename": ISO_NAME, "content": "iso"},
-            timeout=1200,
-        )
-        if code not in (200, 201, 202, 204):
-            fail(f"download-url -> {code} {data}")
-        log("the ISO is on the node")
-    else:
-        log("the node already holds the ISO (same size) — skipping the pull")
-    body = {
-        "vmid": vmid,
-        "name": name,
-        "cores": FOOTPRINT["cores"],
-        "memory": FOOTPRINT["memory"],
-        "net0": f"virtio,bridge={args.bridge}",
-        "scsihw": "virtio-scsi-pci",
-        "scsi0": f"{storage}:{FOOTPRINT['disk_gib']}",
-        "efidisk0": f"{storage}:1,efitype=4m,pre-enrolled-keys=0,size=528K",
-        "ide2": f"local:iso/{ISO_NAME},media=cdrom",
-        "boot": "order=ide2;scsi0",
-        "ostype": "l26",
-        "agent": 0,
-        "serial0": "socket",
-        "vga": "serial0",
-    }
-    code, data = pve.post("/nodes/pve/qemu", body, timeout=300)
-    if code not in (200, 201, 202, 204):
-        fail(f"VM create -> {code} {data}")
-    state_write(vmid, None)
-    log(f"VM {vmid} created ({name}) — {FOOTPRINT['cores']} cores, {FOOTPRINT['memory']} MiB, {FOOTPRINT['disk_gib']} GiB on {storage}")
+    dom = host.domain(name)
+    if dom is not None:
+        log(f"domain {name} already exists — reusing it")
+        state_write(name, None)
+        return
+    log(f"creating {name}: {FOOTPRINT['vcpu']} vCPU, {FOOTPRINT['memory_mib']} MiB,"
+        f" {FOOTPRINT['disk_gib']} GiB qcow2 in pool {POOL_NAME}")
+    host.create_disk_volume(f"{name}-disk.qcow2", FOOTPRINT["disk_gib"])
+    host.upload_iso(iso)
+    try:
+        host.conn.defineXML(domain_xml(name))
+    except host.libvirt.libvirtError as e:
+        fail(f"define {name} -> {e}")
+    state_write(name, None)
+    log(f"VM {name} defined — start it with: vm-test.py start")
 
 
 def step_start(args: argparse.Namespace) -> None:
-    if not args.vmid:
-        fail("--vmid is required for start")
-    pve = Pve()
-    vmid = int(args.vmid)
-    ensure_vms_allowed(pve, [vmid])
-    # The power endpoints live under the VM's status path, not the VM itself.
-    code, data = pve.post(f"/nodes/pve/qemu/{vmid}/status/start", timeout=300)
-    if code not in (200, 201, 202, 204):
-        fail(f"VM start -> {code} {data}")
-    log(f"VM {vmid} started")
+    st = state_read()
+    name = args.vmid or st.get("domain")
+    if not name:
+        fail("no domain to start — create first (or pass its name)")
+    host = Host()
+    host.start(name)
+    dom = host.domain(name)
+    # The MAC is stable for the VM's lifetime: read it from the defined XML,
+    # so every later lease lookup keys on exactly this NIC.
+    desc = dom.XMLDesc(0)
+    mac = desc.split('mac address="')[1].split('"')[0]
+    log(f"VM {name} booted ({mac}) — waiting for its DHCP lease")
+    ip = host.wait_lease(mac, deadline_s=300)
+    state_write(name, ip)
+    log(f"{name} is at {ip}")
 
 
 def _newest_release_dir() -> str:
@@ -404,19 +452,35 @@ def _newest_release_dir() -> str:
 def step_install(args: argparse.Namespace) -> None:
     if not args.artifacts_host:
         fail("--artifacts-host is required for install")
-    pve = Pve()
+    host = Host()
     st = state_read()
-    vmid = int(st["vmid"])
-    ensure_vms_allowed(pve, [vmid])
-    if pve.vmid_status(vmid) != "running":
+    name = str(st["domain"])
+    ensure_name_allowed(name)
+    dom = host.domain(name)
+    if dom is None:
+        fail(f"domain {name} is missing — create first")
+    if host.state_of(dom) != "running":
         log("the VM is not running — starting it")
-        step_start(argparse.Namespace(vmid=str(vmid)))
-    ip, st = find_installer()
-    log(f"the installer is at {ip} (state={st.get('state')})")
-    if st.get("phase") == "await_usb" or st.get("can_reboot"):
+        step_start(argparse.Namespace(vmid=name))
+    mac = dom.XMLDesc(0).split('mac address="')[1].split('"')[0]
+    ip = host.lease_ip(mac)
+    if not ip:
+        fail(f"no DHCP lease for {name} ({mac}) — start it again")
+    deadline = time.monotonic() + 300
+    installer_status: dict = {}
+    while time.monotonic() < deadline:
+        code, data = curl(f"http://{ip}/api/status", timeout=5)
+        if code == 200 and isinstance(data, dict) and data.get("role") == "installer":
+            installer_status = data
+            break
+        time.sleep(5)
+    else:
+        fail(f"no installer answered on {ip} within 300s")
+    log(f"the installer is at {ip} (state={installer_status.get('state')})")
+    if installer_status.get("phase") == "await_usb" or installer_status.get("can_reboot"):
         # A previous install already completed (the VM is rebooted from an
         # earlier run's state): do not wipe the disk and reinstall.
-        log(f"the install is already complete ({st.get('message')}) — skipping the reinstall")
+        log(f"the install is already complete ({installer_status.get('message')}) — skipping the reinstall")
     else:
         code, disks = curl(f"http://{ip}/api/disks", timeout=10)
         if code != 200 or not isinstance(disks, dict) or not disks.get("disks"):
@@ -424,8 +488,7 @@ def step_install(args: argparse.Namespace) -> None:
         disk = disks["disks"][0]["path"]
         log(f"installing onto {disk}")
         # The artifacts the installer downloads are the release set
-        # (out/release-<version>/: manifest + signature + payload parts), not the
-        # QEMU boot assets. Default to the newest staged set.
+        # (out/release-<version>/), served by this host's artifact server.
         artifacts_dir = args.artifacts_dir or _newest_release_dir()
         if not (OUT / artifacts_dir).is_dir():
             fail(f"{OUT / artifacts_dir} is missing — run make release first")
@@ -441,15 +504,15 @@ def step_install(args: argparse.Namespace) -> None:
         log(f"install started (source {artifacts}) — waiting for it to finish")
         deadline = time.monotonic() + 3600
         while time.monotonic() < deadline:
-            code, st = curl(f"http://{ip}/api/status", timeout=10)
-            if code == 200 and isinstance(st, dict):
+            code, st_now = curl(f"http://{ip}/api/status", timeout=10)
+            if code == 200 and isinstance(st_now, dict):
                 # "await_usb" is the installer's own 'is installed; remove the
                 # USB, then click Reboot' verdict — can_reboot is True there.
-                if st.get("phase") == "await_usb" or st.get("can_reboot"):
-                    log(f"install finished: {st.get('message')}")
+                if st_now.get("phase") == "await_usb" or st_now.get("can_reboot"):
+                    log(f"install finished: {st_now.get('message')}")
                     break
-                if st.get("phase") == "error":
-                    fail(f"install failed: {st.get('error')} (detail: {st.get('detail')})")
+                if st_now.get("phase") == "error":
+                    fail(f"install failed: {st_now.get('error')} (detail: {st_now.get('detail')})")
             time.sleep(10)
         else:
             fail("the install did not finish within an hour")
@@ -457,16 +520,19 @@ def step_install(args: argparse.Namespace) -> None:
     if code not in (200, 202):
         fail(f"/api/reboot -> {code} {data}")
     log("rebooting into the installed image")
-    # Boot the disk, not the ISO: the firmware's boot order still prefers
-    # ide2 (the ISO), so the reboot would run the installer again.
-    code, data = pve.post(
-        f"/nodes/pve/qemu/{vmid}/config", {"boot": "order=scsi0"}, timeout=60
-    )
-    if code not in (200, 201, 202, 204):
-        fail(f"VM boot order -> {code} {data}")
-    log("VM boot order set to the disk (order=scsi0)")
-    state_write(vmid, ip)
-    wait_portal(ip, deadline_s=900)
+    # Boot order needs no rewrite: hd precedes cdrom in the domain XML, so the
+    # reboot lands on the installed disk. The lease is stable across reboots —
+    # same MAC, same network — and the recorded IP below stays THE VM's IP.
+    deadline = time.monotonic() + 600
+    while time.monotonic() < deadline:
+        code, _ = curl(f"http://{ip}/api/status", timeout=8)
+        if code == 200:
+            break
+        time.sleep(5)
+    else:
+        fail(f"the installed image did not come back on {ip} within 600s")
+    state_write(name, ip)
+    log(f"{name} is serving the portal at http://{ip}:80")
 
 
 def step_smoke(_args: argparse.Namespace) -> None:
@@ -474,24 +540,11 @@ def step_smoke(_args: argparse.Namespace) -> None:
     ip = st.get("ip")
     if not ip:
         fail("the VM's IP is not in the state file — install first")
-    # The appliance's DHCP lease changes after the reboot into the installed
-    # image, so the smoke step re-resolves the mDNS name freshly — but the
-    # mDNS name can point to ANOTHER machine on the LAN (the mDNS claim
-    # lemon-test.local → 192.168.0.163, the bare metal machine's IP) — so
-    # the smoke step must NOT re-resolve the mDNS name freshly; it must use
-    # the install step's recorded IP (which is the VM's IP) instead.
-    # (A previous run DID re-resolve the mDNS name freshly and rewrote the
-    # state file's IP to 192.168.0.163 — the bare metal machine's IP — so
-    # the smoke run's every assertion hit the BARE METAL machine, not the
-    # VM.  The fix: never re-resolve the mDNS name freshly; always use the
-    # install step's recorded IP, which is the VM's IP.)
-    fresh = resolve(PORTAL_MDNS)
-    if fresh and fresh != ip:
-        log(f"the mDNS claim now points to {fresh} — NOT rewriting the state "
-            f"file's IP ({ip}); the install step's recorded IP is the VM's IP")
-    else:
-        log(f"the mDNS claim agrees with the install step's recorded IP ({ip})")
-    log(f"running the QEMU smoke suite (skip-boot) against http://{ip}:80")
+    # The recorded IP is the install step's DHCP-lease fact for this VM's own
+    # MAC. Never re-resolve an mDNS name here: a name answers with whichever
+    # box claimed it, and every assertion would hit that other machine while
+    # looking green.
+    log(f"running the smoke suite (skip-boot) against http://{ip}:80")
     thread = threading.Thread(
         target=forward, args=(FORWARD_PORT, ip, 80), daemon=True
     )
@@ -504,28 +557,137 @@ def step_smoke(_args: argparse.Namespace) -> None:
         cwd=str(REPO), check=True,
         env={**os.environ, "SMOKE_SKIP_BOOT": "1"},
     )
-    log("the QEMU smoke suite passed (exit %s)" % proc.returncode)
+    log("the smoke suite passed (exit %s)" % proc.returncode)
 
 
 def step_delete(args: argparse.Namespace) -> None:
-    if not args.vmid:
-        fail("--vmid is required for delete")
-    pve = Pve()
-    vmid = int(args.vmid)
-    ensure_vms_allowed(pve, [vmid])
-    name = pve.vmid_name(vmid)
-    if pve.vmid_status(vmid) == "running":
-        code, _ = pve.post(f"/nodes/pve/qemu/{vmid}/status/stop", timeout=300)
-        log(f"stop -> {code}")
-    deadline = time.monotonic() + 120
-    while time.monotonic() < deadline and pve.vmid_status(vmid) != "stopped":
-        time.sleep(2)
-    code, data = pve.delete(f"/nodes/pve/qemu/{vmid}")
-    if code not in (200, 202, 204):
-        fail(f"VM delete -> {code} {data}")
-    if isinstance(data, dict) and data.get("data"):
-        pve.wait_task(str(data["data"]), timeout=300)
-    log(f"VM {vmid} ({name}) deleted")
+    st = state_read()
+    name = args.vmid or st.get("domain")
+    if not name:
+        fail("no domain to delete — create first (or pass its name)")
+    host = Host()
+    host.destroy_if_running(name)
+    dom = host.domain(name)
+    if dom is not None:
+        try:
+            dom.undefine()
+        except host.libvirt.libvirtError as e:
+            fail(f"undefine {name} -> {e}")
+    host.delete_volumes(name)
+    log(f"VM {name} deleted")
+
+
+# ------------------------------------------------------- mDNS function test
+
+
+def step_mdns_probe(args: argparse.Namespace) -> None:
+    """Prove the appliance's mDNS advertising works on the NAT segment —
+    without touching this host's system avahid (which may not listen on
+    virbr0 at all). A single stdlib mDNS query is multicasted onto the bridge
+    and every response is dumped: name, IP, TTL. Zero new dependencies."""
+    iface = args.iface or MDNS_IFACE
+    want_name = args.name or INSTALLER_MDNS
+    try:
+        import struct
+
+        ifaces_output = subprocess.run(
+            ["ip", "-o", "-4", "addr", "show", "dev", iface],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        host_ip = ifaces_output.split("inet ")[1].split("/")[0]
+    except Exception as e:
+        fail(f"cannot find an IPv4 address on {iface}: {e}")
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((host_ip, 0))
+    mcast_group = socket.inet_aton("224.0.0.251") + socket.inet_aton(host_ip)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mcast_group)
+    sock.settimeout(1.0)
+
+    def qname(name: str) -> bytes:
+        out = b""
+        for part in name.split("."):
+            out += struct.pack("B", len(part)) + part.encode()
+        return out + b"\x00"
+
+    # One-shot A query for the appliance's mDNS name (and PTR of _http._tcp
+    # so service advertisement is exercised, not just hostname resolution).
+    queries = [(qname(want_name), 1)]  # type IN=A
+    packet = struct.pack(">HHHHHH", 0, 0x0100, 1, 0, 0, 0) + b"".join(
+        qn + struct.pack(">HH", 1, 0x0001) for qn, _ in queries
+    )
+    ptr_packet = (
+        struct.pack(">HHHHHH", 0, 0x0100, 1, 0, 0, 0)
+        + qname("_http._tcp.local") + struct.pack(">HH", 12, 0x0001)
+    )
+
+    deadline = time.monotonic() + args.timeout
+    sock.sendto(packet, ("224.0.0.251", 5353))
+    sock.sendto(ptr_packet, ("224.0.0.251", 5353))
+    log(f"mDNS probe on {iface} ({host_ip}) for '{want_name}' — dumping responses")
+    responders: dict[str, list[str]] = {}
+
+    def read_name(data: bytes, off: int) -> tuple[str, int]:
+        # Minimal DNS name reader with compression support (RFC 1035 §4.1.4).
+        labels: list[str] = []
+        jumps = 0
+        while True:
+            if off >= len(data) or jumps > 8:
+                return ".".join(labels), off + 1
+            length = data[off]
+            if length == 0:
+                return ".".join(labels), off + 1
+            if length & 0xC0:  # a compression pointer to an earlier name
+                ptr = ((length & 0x3F) << 8) | data[off + 1]
+                tail, _ = read_name(data, ptr)
+                return (".".join(labels + [tail]) if tail else ".".join(labels)), off + 2
+            labels.append(data[off + 1:off + 1 + length].decode(errors="replace"))
+            off += 1 + length
+            jumps += 1
+
+    while time.monotonic() < deadline:
+        try:
+            data, addr = sock.recvfrom(4096)
+        except socket.timeout:
+            continue
+        # Skip the header (12 bytes) and one question to reach the answers.
+        off = 12
+        try:
+            qdcount = struct.unpack(">H", data[4:6])[0]
+            for _ in range(qdcount):
+                _, off = read_name(data, off)
+                off += 4
+            ancount = struct.unpack(">H", data[6:8])[0]
+            names: list[str] = []
+            for _ in range(ancount):
+                name, off = read_name(data, off)
+                rtype, _rclass, _ttl, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+                off += 10
+                if name:
+                    names.append(name)
+                if rtype == 12 and rdlen:  # PTR — the service points at a host
+                    ptr_name, _ = read_name(data, off)
+                    if ptr_name:
+                        names.append(ptr_name)
+                off += rdlen
+        except Exception:
+            continue
+        responders.setdefault(addr[0], [])
+        for n in names:
+            if n not in responders[addr[0]]:
+                responders[addr[0]].append(n)
+    sock.close()
+    if not responders:
+        fail(f"no mDNS responses on {iface} within {args.timeout:.0f}s — "
+             f"the appliance's avahi is not advertising on the NAT bridge")
+    for ip, names in sorted(responders.items()):
+        log(f"  responder {ip}: {', '.join(names[:6])}")
+    hit = any(want_name.split(".")[0] in n or want_name == n
+              for ns in responders.values() for n in ns)
+    if not hit:
+        fail(f"no mDNS responder answered for '{want_name}' — advertising is broken")
+    log(f"OK: the appliance's mDNS name '{want_name}' answers on {iface}")
 
 
 # ------------------------------------------------------------------- main
@@ -536,16 +698,17 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--dev-httpd", default=None, help="host:port serving ./out for the ISO pull")
         p.add_argument("--artifacts-host", default=None, help="host:port serving the artifacts for the install")
         p.add_argument("--artifacts-dir", default=None, help="the release set's dir name (e.g. release-20261114.01)")
-        p.add_argument("--bridge", default="vmbr0")
-        p.add_argument("--storage", default=None)
-        p.add_argument("--vmid", default=None, help="the VM id to act on (create/start/delete)")
+        p.add_argument("--vmid", default=None, help="the domain name to act on (start/delete; defaults to the state file)")
 
     common(ap)
     for name in ("status", "create", "start", "install", "smoke", "delete"):
         common(sub.add_parser(name))
+    probe = sub.add_parser("mdns-probe", help="test mDNS advertising on the NAT bridge")
+    probe.add_argument("--iface", default=None, help=f"the interface to multicast on (default {MDNS_IFACE})")
+    probe.add_argument("--name", default=None, help=f"the mDNS name to query (default {INSTALLER_MDNS})")
+    probe.add_argument("--timeout", type=float, default=10.0)
     args = ap.parse_args()
     {
         "status": step_status,
@@ -554,6 +717,7 @@ def main() -> None:
         "install": step_install,
         "smoke": step_smoke,
         "delete": step_delete,
+        "mdns-probe": step_mdns_probe,
     }[args.cmd](args)
 
 

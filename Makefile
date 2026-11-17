@@ -109,6 +109,9 @@ dev-httpd-start:
 dev-httpd-stop:
 	"$(ROOT)/scripts/dev-httpd.sh" stop
 
+test-vm:
+	python3 "$(ROOT)/scripts/vm-test.py" $(VM_STEP)
+
 run-qemu:
 	@if [[ ! -f "$(ROOT)/out/latest-qemu/vmlinuz" \
 	   || ! -f "$(ROOT)/out/latest-qemu/root.squashfs" \
