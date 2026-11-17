@@ -19,6 +19,7 @@
     ./modules/ab-root.nix
     ./modules/ab-boot.nix
     ./modules/update.nix
+    ./modules/mcp-gateway-image.nix
   ];
 
   # Setup owns the hostname, so NixOS must not: a non-empty networking.hostName

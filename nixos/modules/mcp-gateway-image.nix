@@ -18,7 +18,10 @@
 }:
 
 let
-  mcpGatewayImage = pkgs.callPackage ../pkgs/mcp-gateway { };
+  # Two levels up: this module lives in nixos/modules/, so the repo root's
+  # pkgs/ is ../../ (the same depth every other module uses for scripts and
+  # control-plane). The first release build failed on exactly this.
+  mcpGatewayImage = pkgs.callPackage ../../pkgs/mcp-gateway { };
 in
 
 {
