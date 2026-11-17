@@ -56,17 +56,24 @@ def tool_call(server_name: str, tool: str, arguments: dict[str, object]) -> tupl
     status, listing = tools_list()
     if status != 200:
         return status, {"error": f"tool listing failed: {listing}"}
+    # The REST surface lists UNPREFIXED names (the /v1/mcp/tools view is the
+    # one that prefixes with the server name); match on both.
     full_name = f"{server_name}-{tool}"
     server_id = None
+    rest_name = None
     for entry in listing.get("tools", []):
-        if entry.get("name") == full_name:
-            server_id = (entry.get("mcp_info") or {}).get("server_id")
+        info = entry.get("mcp_info") or {}
+        if info.get("server_name") != server_name:
+            continue
+        if entry.get("name") in (tool, full_name):
+            rest_name = entry["name"]
+            server_id = info.get("server_id")
             break
-    if not server_id:
+    if not server_id or not rest_name:
         return 404, {"error": f"no tool {full_name!r} is registered"}
     status, body = _request(
         "/mcp-rest/tools/call",
-        {"name": full_name, "server_id": server_id, "arguments": arguments},
+        {"name": rest_name, "server_id": server_id, "arguments": arguments},
     )
     if status != 200:
         return status, {"error": f"tool call failed: {body}"}
