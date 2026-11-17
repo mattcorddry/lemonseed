@@ -1123,20 +1123,30 @@ def _docker_status(container: str) -> Optional[tuple[str, str]]:
     return modules.owui_container_status(container)
 
 
-def _config_contains(server: dict[str, str]) -> Optional[bool]:
+def _registration_state(server: dict[str, str]) -> tuple[bool, Optional[str]]:
     """Is this contribution in the rendered config LiteLLM actually runs?
 
     Ground truth for the portal card's ``chat_registered`` — not the intent
-    (a module row), the file the proxy was last handed. Unknown (None) when
-    the config cannot be read, never a lie.
+    (a module row), the file the proxy was last handed. With no model chosen
+    yet nothing is rendered at all: that is reported as False with a note,
+    not an error, because there is no chat path to register into until the
+    first model exists.
     """
     try:
         from litellm import CONFIG_PATH  # noqa: PLC0415 — service boundary
 
         text = CONFIG_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return (
+            False,
+            "no rendered chat configuration yet — pick a model and it will "
+            "register with the first render",
+        )
     except Exception:  # noqa: BLE001 — view helper must not fail the view
-        return None
-    return f"url: {server.get('url', '')}" in text
+        return False, "the chat configuration could not be read"
+    if f"url: {server.get('url', '')}" in text:
+        return True, None
+    return False, "the rendered configuration does not carry this contribution"
 
 
 def _module_card(
@@ -1147,6 +1157,9 @@ def _module_card(
     docker_status = None
     if row is not None and row["state"] in (ENABLED, BROKEN):
         docker_status = _docker_status(_container_name(module_id))
+    registered, note = (None, None)
+    if (card_server := (((spec or {}).get("platform") or {}).get("litellm") or {}).get("mcp_server")):
+        registered, note = _registration_state(card_server)
     card: dict[str, Any] = {
         "id": module_id,
         "name": (spec or {}).get("name") or module_id,
@@ -1170,11 +1183,8 @@ def _module_card(
         # the rendered config file — true only once the proxy actually has it.
         "mcp_server": (((spec or {}).get("platform") or {}).get("litellm") or {})
         .get("mcp_server"),
-        "chat_registered": (
-            _config_contains(card_server)
-            if (card_server := (((spec or {}).get("platform") or {}).get("litellm") or {}).get("mcp_server"))
-            else None
-        ),
+        "chat_registered": registered,
+        "chat_registration_note": note,
     }
     if spec is None:
         card["spec_missing"] = True

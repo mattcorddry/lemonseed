@@ -2675,7 +2675,7 @@ print("OK: mcp-gateway enabled — the guest-side /healthz probe passed")
 '
 
 echo "==> M9 P3: LiteLLM's rendered config carries the registration"
-# chat_registered on the card is ground truth: the module manager reads the
+# chat_registered on the card is ground truth — the module manager reads the
 # same config.yaml the proxy container runs. The render happens on the next
 # supervise tick (10 s), so poll rather than assert immediately.
 mcp_deadline=$(( SECONDS + 120 ))
@@ -2687,21 +2687,27 @@ while (( SECONDS < mcp_deadline )); do
   sleep 3
 done
 mods_read
-mods_card | python3 -c '
-import json, sys
-card = json.load(sys.stdin)
-assert card is not None and card.get("chat_registered") is True, (
-    "the rendered LiteLLM config does not register the module:",
-    (card or {}).get("chat_registered"))
-print("OK: the rendered LiteLLM config registers mcp_gateway")
-'
+if mods_card | grep -q '"chat_registered": true'; then
+  echo "OK: the rendered LiteLLM config registers mcp_gateway"
+else
+  # With no model chosen there is no chat path at all, so nothing can be
+  # registered into yet — the card says exactly that. Skip explicitly rather
+  # than fail; the E2E_CHAT=1 run covers registration end to end.
+  if mods_card | grep -q 'no rendered chat configuration yet'; then
+    echo "SKIP: no model chosen, so LiteLLM has rendered nothing — registration rides the first render (covered by E2E_CHAT runs)"
+  else
+    echo "chat_registered did not become true after enable:" >&2
+    mods_card | head -c 400 >&2; echo "" >&2; exit 1
+  fi
+fi
 
 echo "==> M9 P3: uninstall removes the registration"
 code="$(mods_post remove '{"preserve":false,"confirm":"purge"}')"
 [[ "${code}" == "202" ]] || mods_fail "POST mcp-gateway purge" "${code}"
 mods_wait gone 120
 # The card survives removal as a catalog entry (installed=false); its
-# chat_registered must flip to false once the config re-renders without it.
+# chat_registered must NOT stay true — either the config re-rendered without
+# it, or there is no rendered config at all. Both mean: not registered.
 mcp_deadline=$(( SECONDS + 120 ))
 unregistered=""
 while (( SECONDS < mcp_deadline )); do
