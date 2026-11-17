@@ -91,6 +91,22 @@ def ensure_pool_allowed(pool_name: str) -> None:
         fail("storage pool name is empty — refusing")
 
 
+def _qemu_permissions() -> str:
+    """Volume permissions that let QEMU open the file. libvirtd on this host
+    does not chown dynamically (dynamic_ownership is off with AppArmor), so a
+    volume created root:root 0600 leaves qemu-system-x86_64 with EACCES at
+    boot. Owner/group come from the actual `libvirt-qemu` user; when it does
+    not exist (unusual setups), fall back to world-readable."""
+    try:
+        import pwd
+
+        uid = pwd.getpwnam("libvirt-qemu").pw_uid
+        gid = pwd.getpwnam("libvirt-qemu").pw_gid
+        return f"<permissions><mode>0640</mode><owner>{uid}</owner><group>{gid}</group></permissions>"
+    except KeyError:
+        return "<permissions><mode>0644</mode></permissions>"
+
+
 # ---------------------------------------------------------------- libvirt
 
 
@@ -167,7 +183,7 @@ class Host:
         vol_xml = (
             f"<volume><name>{name}</name>"
             f"<capacity unit='G'>{size_gib}</capacity>"
-            f"<target><format type='qcow2'/></target></volume>"
+            f"<target><format type='qcow2'/>{_qemu_permissions()}</target></volume>"
         )
         pool.createXML(vol_xml, 0)
 
@@ -192,7 +208,7 @@ class Host:
         vol_xml = (
             f"<volume><name>{ISO_NAME}</name>"
             f"<capacity unit='bytes'>{iso_size}</capacity>"
-            f"<target><format type='raw'/></target></volume>"
+            f"<target><format type='raw'/>{_qemu_permissions()}</target></volume>"
         )
         vol = pool.createXML(vol_xml, 0)
         st = self.conn.newStream(0)
@@ -256,6 +272,11 @@ def domain_xml(name: str) -> str:
   <features><acpi/><apic/></features>
   <cpu mode='host-model'/>
   <clock offset='utc'/>
+  <!-- AppArmor confinement without virt-aa-helper's generated per-disk rules
+       denies every image open (the .files include is never written on this
+       host), so the dev-box VM runs unconfined and leans on DAC instead: the
+       volumes are owned by libvirt-qemu with 0640 via _qemu_permissions(). -->
+  <seclabel type='none' model='none'/>
   <on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash>
   <devices>
     <disk type='volume' device='disk'>
@@ -273,8 +294,6 @@ def domain_xml(name: str) -> str:
       <source network='{NETWORK_NAME}'/>
     </interface>
     <console type='pty'><target type='serial' port='0'/></console>
-    <graphics type='none'/>
-    <video><model type='virtio'/></video>
   </devices>
 </domain>"""
 
@@ -570,7 +589,9 @@ def step_delete(args: argparse.Namespace) -> None:
     dom = host.domain(name)
     if dom is not None:
         try:
-            dom.undefine()
+            # NVRAM: UEFI domains get a per-domain VARS file; undefining
+            # without this flag refuses ("cannot undefine domain with nvram").
+            dom.undefineFlags(host.libvirt.VIR_DOMAIN_UNDEFINE_NVRAM)
         except host.libvirt.libvirtError as e:
             fail(f"undefine {name} -> {e}")
     host.delete_volumes(name)
