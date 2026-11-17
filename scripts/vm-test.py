@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -253,6 +254,17 @@ class Host:
         fail(f"no DHCP lease for {mac} on {NETWORK_NAME} within {deadline_s:.0f}s")
 
 
+def domain_mac(host: "Host", dom) -> str:
+    """The NIC MAC from the domain's XML — live config first (a running
+    domain always carries it), then the inactive definition."""
+    active = getattr(host.libvirt, "VIR_DOMAIN_XML_ACTIVE", 1)
+    for flags in (active, 0):
+        m = re.search(r"mac address=['\"]([0-9a-fA-F:]+)['\"]", dom.XMLDesc(flags))
+        if m:
+            return m.group(1)
+    fail(f"domain {dom.name()} has no NIC MAC — is an interface defined?")
+
+
 # ------------------------------------------------------- domain XML (create)
 
 
@@ -266,6 +278,13 @@ def domain_xml(name: str) -> str:
   <vcpu placement='static'>{FOOTPRINT['vcpu']}</vcpu>
   <os firmware='efi'>
     <type arch='x86_64' machine='q35'>hvm</type>
+    <!-- The appliance's bootloader is not Microsoft-signed: booting with SB
+         on (libvirt's autoselection picks OVMF_CODE_4M.ms.fd) strands the
+         guest in the firmware. The pve harness made the same choice via
+         efidisk0 pre-enrolled-keys=0. -->
+    <firmware>
+      <feature enabled='no' name='secure-boot'/>
+    </firmware>
     <boot dev='hd'/>
     <boot dev='cdrom'/>
   </os>
@@ -291,7 +310,11 @@ def domain_xml(name: str) -> str:
       <readonly/>
     </disk>
     <interface type='network'>
+      <!-- The appliance kernel is a NixOS modules-shrunk build: it carries
+           virtio_net but no rtl8139, and libvirt's default NIC model is
+           rtl8139 — a guest that boots with no working NIC at all. -->
       <source network='{NETWORK_NAME}'/>
+      <model type='virtio'/>
     </interface>
     <console type='pty'><target type='serial' port='0'/></console>
   </devices>
@@ -403,10 +426,8 @@ def step_status(_args: argparse.Namespace) -> None:
     log(f"domains on {LIBVIRT_URI}:")
     for dom in sorted(host.conn.listAllDomains(), key=lambda d: d.name()):
         allowed = any(_matches(rule, dom.name()) for rule in rules)
-        desc = dom.XMLDesc(0)
-        mac = "-"
-        if 'mac address="' in desc:
-            mac = desc.split('mac address="')[1].split('"')[0]
+        m = re.search(r"mac address=['\"]([0-9a-fA-F:]+)['\"]", dom.XMLDesc(0))
+        mac = m.group(1) if m else "-"
         ip = host.lease_ip(mac) if mac != "-" and allowed else None
         log("  %-28s %-12s %s%s" % (
             dom.name(), host.state_of(dom),
@@ -447,10 +468,9 @@ def step_start(args: argparse.Namespace) -> None:
     host = Host()
     host.start(name)
     dom = host.domain(name)
-    # The MAC is stable for the VM's lifetime: read it from the defined XML,
+    # The MAC is stable for the VM's lifetime: read it from the live XML,
     # so every later lease lookup keys on exactly this NIC.
-    desc = dom.XMLDesc(0)
-    mac = desc.split('mac address="')[1].split('"')[0]
+    mac = domain_mac(host, dom)
     log(f"VM {name} booted ({mac}) — waiting for its DHCP lease")
     ip = host.wait_lease(mac, deadline_s=300)
     state_write(name, ip)
@@ -481,7 +501,7 @@ def step_install(args: argparse.Namespace) -> None:
     if host.state_of(dom) != "running":
         log("the VM is not running — starting it")
         step_start(argparse.Namespace(vmid=name))
-    mac = dom.XMLDesc(0).split('mac address="')[1].split('"')[0]
+    mac = domain_mac(host, dom)
     ip = host.lease_ip(mac)
     if not ip:
         fail(f"no DHCP lease for {name} ({mac}) — start it again")
@@ -535,7 +555,14 @@ def step_install(args: argparse.Namespace) -> None:
             time.sleep(10)
         else:
             fail("the install did not finish within an hour")
-    code, data = post_json(f"http://{ip}/api/reboot", {})
+    # A 409 here means "not yet": the phase can flip to can_reboot a beat
+    # after our poll sees it, so retry within a short window before failing.
+    code = data = None
+    for attempt in range(12):
+        code, data = post_json(f"http://{ip}/api/reboot", {})
+        if code in (200, 202):
+            break
+        time.sleep(5)
     if code not in (200, 202):
         fail(f"/api/reboot -> {code} {data}")
     log("rebooting into the installed image")
