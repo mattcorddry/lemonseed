@@ -1123,6 +1123,22 @@ def _docker_status(container: str) -> Optional[tuple[str, str]]:
     return modules.owui_container_status(container)
 
 
+def _config_contains(server: dict[str, str]) -> Optional[bool]:
+    """Is this contribution in the rendered config LiteLLM actually runs?
+
+    Ground truth for the portal card's ``chat_registered`` — not the intent
+    (a module row), the file the proxy was last handed. Unknown (None) when
+    the config cannot be read, never a lie.
+    """
+    try:
+        from litellm import CONFIG_PATH  # noqa: PLC0415 — service boundary
+
+        text = CONFIG_PATH.read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001 — view helper must not fail the view
+        return None
+    return f"url: {server.get('url', '')}" in text
+
+
 def _module_card(
     module_id: str,
     spec: Optional[dict[str, Any]],
@@ -1150,9 +1166,15 @@ def _module_card(
         "logo": _logo_url(module_id, spec),
         # The platform contribution the portal should tell the admin about:
         # an MCP tool server that rides the chat path while the module is
-        # enabled (§6).
+        # enabled (§6). ``chat_registered`` is the same fact checked against
+        # the rendered config file — true only once the proxy actually has it.
         "mcp_server": (((spec or {}).get("platform") or {}).get("litellm") or {})
         .get("mcp_server"),
+        "chat_registered": (
+            _config_contains(card_server)
+            if (card_server := (((spec or {}).get("platform") or {}).get("litellm") or {}).get("mcp_server"))
+            else None
+        ),
     }
     if spec is None:
         card["spec_missing"] = True

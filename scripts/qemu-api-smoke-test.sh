@@ -2674,49 +2674,49 @@ assert card is not None and card.get("state") == "enabled", card
 print("OK: mcp-gateway enabled — the guest-side /healthz probe passed")
 '
 
-echo "==> M9 P3: LiteLLM registered the contribution (serial log)"
-# The control plane writes config.yaml whenever the module layer changes and
-# logs the count; wait for a 1-server write that is NEWER than this block's
-# install. Read from the serial log because :4000 is not published anywhere.
-mcp_serial_deadline=$(( SECONDS + 90 ))
-mcp_registered=""
-while (( SECONDS < mcp_serial_deadline )); do
-  if grep -q 'litellm supervise: wrote config (1 mcp server' "${LOG}"; then
-    mcp_registered=1; break
+echo "==> M9 P3: LiteLLM's rendered config carries the registration"
+# chat_registered on the card is ground truth: the module manager reads the
+# same config.yaml the proxy container runs. The render happens on the next
+# supervise tick (10 s), so poll rather than assert immediately.
+mcp_deadline=$(( SECONDS + 120 ))
+while (( SECONDS < mcp_deadline )); do
+  mods_read
+  if mods_card | grep -q '"chat_registered": true'; then
+    break
   fi
   sleep 3
 done
-[[ "${mcp_registered}" == "1" ]] || {
-  echo "no 'wrote config (1 mcp server(s))' in the serial log after enable" >&2
-  grep -c 'litellm supervise: wrote config' "${LOG}" || true
-  exit 1
-}
-# Byte offset of the one-server write; the uninstall's zero-write must land
-# after it or it is just an old boot-time line.
-MCP_ONE_OFFSET="$(grep -abo 'litellm supervise: wrote config (1 mcp server' "${LOG}" \
-  | tail -1 | cut -d: -f1)"
-echo "OK: LiteLLM rendered exactly one mcp server for the enabled plugin"
+mods_read
+mods_card | python3 -c '
+import json, sys
+card = json.load(sys.stdin)
+assert card is not None and card.get("chat_registered") is True, (
+    "the rendered LiteLLM config does not register the module:",
+    (card or {}).get("chat_registered"))
+print("OK: the rendered LiteLLM config registers mcp_gateway")
+'
 
 echo "==> M9 P3: uninstall removes the registration"
 code="$(mods_post remove '{"preserve":false,"confirm":"purge"}')"
 [[ "${code}" == "202" ]] || mods_fail "POST mcp-gateway purge" "${code}"
 mods_wait gone 120
-mcp_serial_deadline=$(( SECONDS + 90 ))
-while (( SECONDS < mcp_serial_deadline )); do
-  # The zero line must appear after the one-server write: the registration is
-  # really gone, not just re-rendered identically. Byte offsets make that an
-  # order check on the log file itself.
-  if grep -abo 'litellm supervise: wrote config (0 mcp server' "${LOG}" \
-      | awk -F: -v after="${MCP_ONE_OFFSET}" '$1 > after { found = 1 } END { exit !found }'; then
-    break
+# The card survives removal as a catalog entry (installed=false); its
+# chat_registered must flip to false once the config re-renders without it.
+mcp_deadline=$(( SECONDS + 120 ))
+unregistered=""
+while (( SECONDS < mcp_deadline )); do
+  mods_read
+  if mods_card | grep -q '"chat_registered": false'; then
+    unregistered=1; break
   fi
   sleep 3
 done
-if ! grep -abo 'litellm supervise: wrote config (0 mcp server' "${LOG}" \
-    | awk -F: -v after="${MCP_ONE_OFFSET}" '$1 > after { found = 1 } END { exit !found }'; then
-  echo "no zero-mcp-server config write after uninstall" >&2; exit 1
-fi
-echo "OK: the uninstall removed the LiteLLM registration"
+[[ "${unregistered}" == "1" ]] || {
+  echo "chat_registration did not clear after uninstall" >&2
+  head -c 400 /tmp/qemu-m7.body >&2 || true
+  exit 1
+}
+echo "OK: the uninstalled module is out of LiteLLM's rendered config"
 
 echo "==> M9 P2: the audit log recorded every action, both remove paths"
 audit_json="$(poll_http "/_lemonseed/api/audit?limit=300" 20 "${COOKIE_JAR}" "${AUTH_HOST}" 2>/dev/null || true)"
