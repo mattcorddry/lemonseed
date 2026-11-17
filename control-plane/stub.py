@@ -2697,7 +2697,7 @@ def page_setup(
         # submit runs, so it is not in the body at all.
         admin_fields = """
 <label for="admin_display_name">Your name</label>
-<input id="admin_display_name" name="admin_display_name" maxlength="80" autocomplete="off" placeholder="Optional"/>
+<input id="admin_display_name" name="admin_display_name" maxlength="80" autocomplete="off" placeholder="Optional" autofocus/>
 <label for="admin_username">Admin username</label>
 <input id="admin_username" name="admin_username" maxlength="16" autocomplete="off" value="admin" required/>
 <label for="admin_password">Admin password</label>
@@ -2711,7 +2711,7 @@ def page_setup(
 <h2>{heading}</h2>
 <form id="setup-form" method="POST" action="/setup" autocomplete="off">
 <label for="name">Name</label>
-<input id="name" name="name" maxlength="64" autocomplete="off" value="{escape(name, quote=True)}" required/>
+<input id="name" name="name" maxlength="64" autocomplete="off" value="{escape(name, quote=True)}" required autofocus/>
 <p class="lede" style="margin-top:0.75rem">Lemonseed will be available at <span id="portal-url">{escape(portal_url)}</span>.</p>
 <label for="timezone">Timezone</label>
 <select id="timezone" name="timezone" required>

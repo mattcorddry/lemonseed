@@ -22,7 +22,10 @@
  * accent and a glow. Typography lands STIX Two Text for display, Roboto for
  * body and Source Code Pro for mono (webfonts only if a font stack is added
  * here); the spacing scale lands 4/8/12/16/24/32 and the radius tokens land
- * 4/8 (sm/md) alongside the 999px pill shapes.
+ * 4/8 (sm/md). Buttons are always sm: no pill shapes on interactive controls
+ * (2026-11, matching Circuitous's portal); pills survive only where they are
+ * an indicator, not a control — progress bars, the scrollbar thumb and the
+ * .owui-pill status badge.
  */
 :root {
   /* DESIGN.md tokens (Lemonseed + Circuitous share one spec) */
@@ -34,13 +37,6 @@
   --surface: #FFFFFF;
   --text: #111827;
   --neutral: #FFFFFF;
-  /* Neon's glow + a dark-surface dark end (the appliance is dark, so the
-     surface token stays the light end and the dark end lands as bg0/bg1) */
-  --surface-dk: #0b1014;
-  --surface-dk-2: #141a20;
-  --surface-dk-3: #1a242c;
-  --text-dk: #f5f7fa;
-  --text-dk-2: #9aa6b2;
   /* Neon's glow + a dark-surface dark end (the appliance is dark, so the
      surface token stays the light end and the dark end lands as bg0/bg1) */
   --surface-dk: #0b1014;
@@ -63,6 +59,10 @@
 }
 
 * { box-sizing: border-box; }
+/* Keyboard focus is never invisible: the outline shows for tab navigation and
+   programmatic .focus() (:focus-visible suppresses it for mouse clicks). Same
+   rule as Circuitous's portal theme — the two appliances share one spec. */
+:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 /* Dark-native chrome: without color-scheme, browsers paint light scrollbars
    and form widgets over the near-black surface. */
 :root { color-scheme: dark; }
@@ -175,8 +175,8 @@ input, select {
   border: 1px solid var(--line); background: rgba(0,0,0,0.25); color: var(--text-dk);
 }
 .cta {
-  margin-top: var(--sp-2); width: 100%; border: 0; border-radius: 999px;
-  padding: 0.9rem 1rem; font-size: var(--fs-1); font-weight: 700;
+  margin-top: var(--sp-2); width: 100%; border: 0; border-radius: var(--rd-0);
+  padding: 0.9rem 1rem; font-size: var(--fs-1); font-weight: 600;
   background: var(--primary); color: var(--text); cursor: pointer;
 }
 .err { color: var(--danger); margin-top: var(--sp-1); }
@@ -201,7 +201,7 @@ input, select {
 .app-bar .nav { display: flex; align-items: center; gap: var(--sp-0); }
 .app-bar .nav a, .app-bar .nav span {
   color: var(--text-dk-2); text-decoration: none; font-size: 0.88rem; font-weight: 600;
-  padding: var(--sp-0) var(--sp-1); border-radius: 999px;
+  padding: var(--sp-0) var(--sp-1); border-radius: var(--rd-0);
 }
 .app-bar .nav a:hover { color: var(--primary); background: rgba(255,255,255,0.06); }
 .app-bar .nav a.active { color: var(--text); background: var(--primary); }
@@ -279,11 +279,14 @@ input, select {
 .login-card .field { text-align: left; }
 .login-error { color: var(--danger); margin: var(--sp-1) 0 0; }
 .btn {
-  margin-top: var(--sp-2); width: 100%; border: 0; border-radius: 999px;
-  padding: 0.85rem 1rem; font-size: var(--fs-1); font-weight: 700; cursor: pointer;
+  margin-top: var(--sp-2); width: 100%; border: 0; border-radius: var(--rd-0);
+  padding: 0.85rem 1rem; font-size: var(--fs-1); font-weight: 600; cursor: pointer;
   background: var(--primary); color: var(--text);
 }
 .btn.primary { background: var(--primary); color: var(--text); }
+/* A filled action glows on hover; ghosts and danger keep their borders.
+   Same behaviour as Circuitous's portal buttons. */
+.cta:hover, .btn:not(.ghost):not(.danger):not([disabled]):hover { box-shadow: var(--glow); }
 
 /* --- Gateway not-ready page (control-plane/static/cp-down.html) -----------
  * Same file, deliberately scoped. Unscoped, `p { color: var(--muted) }` and the
@@ -380,7 +383,7 @@ input, select {
    button on its own line. */
 .owui-actions button {
   display: inline-flex; align-items: center; gap: 0.45rem;
-  padding: var(--sp-0) var(--sp-1); border: 1px solid var(--line); border-radius: 999px;
+  padding: var(--sp-0) var(--sp-1); border: 1px solid var(--line); border-radius: var(--rd-0);
   background: transparent; color: var(--text-dk);
   font: inherit; font-size: 0.9rem; font-weight: 600; cursor: pointer;
 }
