@@ -2873,15 +2873,23 @@ print("OK: local chat ready model=%s display=%s" % (d.get("model_id"), d.get("di
   # get_current_time and comparing against this box's clock — a listing would
   # prove nothing about reachability.
   MCP_BEFORE="$(date -u +%s)"
-  mcp_code="$(curl -sS -o /tmp/qemu-mcp-call.json -b "${COOKIE_JAR}" --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
-    -w '%{http_code}' \
-    -X POST "http://${AUTH_HOST}:${HOST_PORT}/_lemonseed/api/mcp/call" \
-    -H 'Content-Type: application/json' \
-    -d '{"server":"mcp_gateway","tool":"get_current_time","arguments":{"zone":"UTC"}}')"
-  [[ "${mcp_code}" == "200" ]] || {
-    echo "POST /_lemonseed/api/mcp/call: expected 200, got ${mcp_code}" >&2
+  mcp_code=""
+  mcp_deadline=$(( SECONDS + 120 ))
+  # The enable re-renders LiteLLM's config and recreates its container, so
+  # the first attempts race that restart (502: proxy still coming up).
+  while (( SECONDS < mcp_deadline )); do
+    mcp_code="$(curl -sS -o /tmp/qemu-mcp-call.json -b "${COOKIE_JAR}" --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
+      -w '%{http_code}' \
+      -X POST "http://${AUTH_HOST}:${HOST_PORT}/_lemonseed/api/mcp/call" \
+      -H 'Content-Type: application/json' \
+      -d '{"server":"mcp_gateway","tool":"get_current_time","arguments":{"zone":"UTC"}}')"
+    [[ "${mcp_code}" == "200" ]] && break
+    sleep 5
+  done
+  if [[ "${mcp_code}" != "200" ]]; then
+    echo "POST /_lemonseed/api/mcp/call: expected 200, got ${mcp_code} after retries" >&2
     cat /tmp/qemu-mcp-call.json >&2 || true; echo "" >&2; exit 1
-  }
+  fi
   MCP_AFTER="$(date -u +%s)"
   printf '%s' "${MCP_BEFORE} ${MCP_AFTER}" | python3 -c '
 import json, sys
