@@ -342,6 +342,14 @@ def supervise_litellm_once() -> None:
         if config_fingerprint() != current_hash:
             try:
                 write_config(content)
+                # The smoke asserts this line in the serial log to prove an
+                # installed plugin's MCP contribution really reached the
+                # rendered config — and that removing it un-registers.
+                print(
+                    "litellm supervise: wrote config"
+                    f" ({len(_module_contributions())} mcp server(s))",
+                    flush=True,
+                )
             except OSError as exc:
                 state["state"] = "error"
                 state["error"] = f"cannot write config: {exc}"

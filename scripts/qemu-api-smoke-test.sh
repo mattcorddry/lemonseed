@@ -2618,6 +2618,129 @@ echo "==> M9 P2: the purge refuses on a module that is not installed"
 code="$(mods_post remove '{"preserve":false,"confirm":"purge"}')"
 [[ "${code}" == "409" ]] || mods_fail "POST remove on a removed module (expected 409)" "${code}"
 
+# ===========================================================================
+# M9 P3 — the first plugin module: the MCP gateway.
+#
+# One container bundling four MCP tool services behind one streamable-HTTP
+# endpoint, registered with LiteLLM through the platform.litellm.mcp_server
+# contribution (MODULES.md §6). Proven here:
+#   1. The catalog offers it and install/enable runs on real Docker from the
+#      in-tree image the QEMU profile bakes in.
+#   2. The gateway answers on its host port, and a full MCP handshake lists
+#      the bundled tools under stable names.
+#   3. LiteLLM's rendered config carries exactly one mcp server after enable,
+#      and zero again after uninstall — read from the control plane's own
+#      "wrote config (N mcp server(s))" serial line, which is emitted on every
+#      real config write.
+# ===========================================================================
+
+echo "==> M9 P3: the catalog offers the MCP gateway"
+MODS_ID="mcp-gateway"
+mods_read
+mods_card | python3 -c '
+import json, sys
+card = json.load(sys.stdin)
+assert card is not None, "mcp-gateway missing from the module view"
+assert card.get("type") == "plugin", card
+print("OK: mcp-gateway offered as a plugin (state=%s)" % card.get("state"))
+'
+
+echo "==> M9 P3: pre-remove (re-runnable on a persistent disk)"
+mods_pre_code="$(mods_post remove '{"preserve":false,"confirm":"purge"}')"
+case "${mods_pre_code}" in
+  202|409) ;;
+  *) mods_fail "POST mcp-gateway remove" "${mods_pre_code}" ;;
+esac
+mods_wait gone 120
+
+echo "==> M9 P3: install + enable the MCP gateway"
+code="$(mods_post install '{}')"
+[[ "${code}" == "202" ]] || mods_fail "POST mcp-gateway install" "${code}"
+mods_wait enabled 600
+
+echo "==> M9 P3: the bundled tools answer under stable names"
+mcp_handshake_code="$(curl -sS -o /tmp/qemu-mcp-hello.txt -D /tmp/qemu-mcp-h.hdr \
+  --max-time 10 \
+  'http://127.0.0.1:18101/mcp' \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}')"
+[[ "${mcp_handshake_code}" == "200" ]] || {
+  echo "MCP initialize on 127.0.0.1:18101: expected 200, got ${mcp_handshake_code}" >&2
+  head -c 300 /tmp/qemu-mcp-hello.txt >&2 || true; echo "" >&2; exit 1
+}
+grep -q 'lemonseed-mcp-gateway' /tmp/qemu-mcp-hello.txt || {
+  echo "the MCP initialize response did not name the gateway" >&2
+  head -c 300 /tmp/qemu-mcp-hello.txt >&2; echo "" >&2; exit 1
+}
+MCP_SID="$(grep -i '^mcp-session-id:' /tmp/qemu-mcp-h.hdr | sed 's/.*: //' | tr -d '\r')"
+[[ -n "${MCP_SID}" ]] || { echo "no MCP session id in the handshake" >&2; exit 1; }
+curl -sS -o /dev/null --max-time 10 'http://127.0.0.1:18101/mcp' \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H "mcp-session-id: ${MCP_SID}" \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+curl -sS --max-time 10 'http://127.0.0.1:18101/mcp' \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H "mcp-session-id: ${MCP_SID}" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | python3 -c '
+import json, sys
+tools = []
+for line in sys.stdin:
+    line = line.strip()
+    if line.startswith("data:"):
+        payload = json.loads(line[5:])
+        tools += [t["name"] for t in payload.get("result", {}).get("tools", [])]
+for want in ("fetch", "ddg_search", "memory_read_graph", "get_current_time"):
+    assert want in tools, (want, sorted(set(tools)))
+print("OK: %d MCP tools listed under stable names" % len(set(tools)))
+'
+
+echo "==> M9 P3: LiteLLM registered the contribution (serial log)"
+# The control plane writes config.yaml whenever the module layer changes and
+# logs the count; wait for a 1-server write that is NEWER than this block's
+# install. Read from the serial log because :4000 is not published anywhere.
+mcp_serial_deadline=$(( SECONDS + 90 ))
+mcp_registered=""
+while (( SECONDS < mcp_serial_deadline )); do
+  if grep -q 'litellm supervise: wrote config (1 mcp server' "${LOG}"; then
+    mcp_registered=1; break
+  fi
+  sleep 3
+done
+[[ "${mcp_registered}" == "1" ]] || {
+  echo "no 'wrote config (1 mcp server(s))' in the serial log after enable" >&2
+  grep -c 'litellm supervise: wrote config' "${LOG}" || true
+  exit 1
+}
+# Byte offset of the one-server write; the uninstall's zero-write must land
+# after it or it is just an old boot-time line.
+MCP_ONE_OFFSET="$(grep -abo 'litellm supervise: wrote config (1 mcp server' "${LOG}" \
+  | tail -1 | cut -d: -f1)"
+echo "OK: LiteLLM rendered exactly one mcp server for the enabled plugin"
+
+echo "==> M9 P3: uninstall removes the registration"
+code="$(mods_post remove '{"preserve":false,"confirm":"purge"}')"
+[[ "${code}" == "202" ]] || mods_fail "POST mcp-gateway purge" "${code}"
+mods_wait gone 120
+mcp_serial_deadline=$(( SECONDS + 90 ))
+while (( SECONDS < mcp_serial_deadline )); do
+  # The zero line must appear after the one-server write: the registration is
+  # really gone, not just re-rendered identically. Byte offsets make that an
+  # order check on the log file itself.
+  if grep -abo 'litellm supervise: wrote config (0 mcp server' "${LOG}" \
+      | awk -F: -v after="${MCP_ONE_OFFSET}" '$1 > after { found = 1 } END { exit !found }'; then
+    break
+  fi
+  sleep 3
+done
+if ! grep -abo 'litellm supervise: wrote config (0 mcp server' "${LOG}" \
+    | awk -F: -v after="${MCP_ONE_OFFSET}" '$1 > after { found = 1 } END { exit !found }'; then
+  echo "no zero-mcp-server config write after uninstall" >&2; exit 1
+fi
+echo "OK: the uninstall removed the LiteLLM registration"
+
 echo "==> M9 P2: the audit log recorded every action, both remove paths"
 audit_json="$(poll_http "/_lemonseed/api/audit?limit=300" 20 "${COOKIE_JAR}" "${AUTH_HOST}" 2>/dev/null || true)"
 if [[ -z "${audit_json}" ]]; then

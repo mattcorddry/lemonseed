@@ -1,0 +1,50 @@
+# The Lemonseed MCP gateway — M9 P3, the first plugin module.
+#
+# One container bundling four MCP services (fetch, ddg_search, memory, time)
+# behind a single FastMCP streamable-HTTP endpoint. The image is built in-tree
+# from pkgs/mcp-gateway (upstream docker/mcp-gateway spawns one sibling
+# container per server and needs docker.sock — it cannot live inside the
+# one-container module contract; that topology is BACKLOG).
+#
+# LiteLLM reaches the server over the lemon network by container DNS name,
+# NOT through the 127.0.0.1 host port — the published port exists for the
+# control plane's health probe and the smoke test.
+
+spec_version: 1
+id: mcp-gateway
+name: MCP Gateway
+type: plugin
+version: 0.1.0
+maturity: alpha
+license: Apache-2.0
+owners: [wago]
+homepage: https://lemonseed.ai
+description: >-
+  Bundles four MCP tool servers — fetch, ddg_search, memory (file-backed
+  knowledge graph) and time — into one container and registers them with the
+  chat backend under stable names.
+
+docker:
+  image: mcp_gateway
+  container: lemonseed-mcp-gateway
+  network: lemon
+  ports:
+    - "127.0.0.1:18101:7860"
+  volumes:
+    - /var/lib/lemonseed/modules/mcp-gateway:/data
+  probe:
+    port: 18101
+    path: /healthz
+
+hooks:
+  script_timeout: 120
+
+# One contribution: the whole bundle registers as one MCP server entry in
+# LiteLLM's config (MODULES.md §6). The name is the stable handle tools are
+# addressed under; the URL must be reachable from the litellm container, so it
+# uses the lemon network DNS name, not 127.0.0.1.
+platform:
+  litellm:
+    mcp_server:
+      name: mcp_gateway
+      url: http://lemonseed-mcp-gateway:7860/mcp
