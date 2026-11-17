@@ -2846,6 +2846,15 @@ assert d.get("progress") == 100, d
 print("OK: local chat ready model=%s display=%s" % (d.get("model_id"), d.get("display_name")))
 '
 
+  # The model pull outruns the admin session's idle TTL; re-authenticate or
+  # the mcp/call POST is answered with the edge gate's login redirect.
+  echo "==> M9 e2e MCP: SRP re-login"
+  if [[ "$(smoke_srp_signin "${COOKIE_JAR}")" != "200" ]]; then
+    echo "SRP re-login failed before the MCP check" >&2
+    cat /tmp/qemu-verify-body.json >&2 || true
+    exit 1
+  fi
+
   echo "==> M9 e2e MCP: use the time tool through LiteLLM (time-delta proof)"
   # Deterministic MCP usage via the CP's admin proxy onto LiteLLM's REST
   # surface (/mcp-rest): the model is loaded, so the config rendered with the
