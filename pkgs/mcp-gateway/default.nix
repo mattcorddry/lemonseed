@@ -22,6 +22,8 @@
 let
   # The official MCP SDK's FastMCP (mcp.server.fastmcp) + uvicorn for the
   # streamable-HTTP transport; httpx backs the fetch and ddg_search tools.
+  # nixpkgs pins mcp 1.26; server.py uses the 1.x API — migrating to SDK 2.x
+  # (renamed MCPServer) means touching server.py, not just this expression.
   pythonEnv = python3Packages.python.withPackages (
     ps: with ps; [
       mcp
