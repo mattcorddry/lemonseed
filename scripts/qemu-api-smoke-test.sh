@@ -2447,17 +2447,24 @@ mods_post() {  # mods_post <verb> <body> — status on stdout, body in /tmp/qemu
 mods_read() {  # the admin session reads the module view into /tmp/qemu-m7.body
   # Follow the login redirect: without it, the body file carries the OWUI
   # SPA's HTML, not JSON — and the JSON read fails silently.
-  m7_get_follow "${COOKIE_JAR}" "/_lemonseed/api/modules" >/dev/null
+  local mods_status
+  mods_status="$(m7_get_follow "${COOKIE_JAR}" "/_lemonseed/api/modules")"
+  if [[ "${mods_status}" != "200" ]]; then
+    echo "the module view returned HTTP ${mods_status} (body: $(head -c 120 /tmp/qemu-m7.body))" >&2
+  fi
   # The view GET lands in the login redirect unless the admin session's
   # cookie is valid — so assert the body is JSON before the assertions run.
   # If the body is not JSON (e.g. the OWUI SPA's HTML), the session cookie
   # is not valid and the assertions would fail silently — so exit 1.
-  MODS_ID="${MODS_ID}" python3 -c '
+  MODS_ID="${MODS_ID}" MODS_STATUS="${mods_status}" python3 -c '
 import json, sys
 try:
     d = json.load(open("/tmp/qemu-m7.body"))
 except json.JSONDecodeError as e:
-    print("the module view did not return JSON — the admin session cookie is not valid (%s)" % e, file=sys.stderr)
+    import os
+    status = os.environ.get("MODS_STATUS", "?")
+    print("the module view did not return JSON (HTTP %s): %s — body: %r" % (
+        status, e, open("/tmp/qemu-m7.body").read()[:200]), file=sys.stderr)
     sys.exit(1)
 if "installed" not in d:
     print("the module view did not carry an installed list — the admin session cookie is not valid", file=sys.stderr)
