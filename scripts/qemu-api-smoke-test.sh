@@ -2920,14 +2920,17 @@ assert skew < 300, f"tool clock {dt} is {skew:.0f}s off the appliance wall clock
 print("OK: MCP tool used through LiteLLM; gateway clock %ds from ours" % round(skew))
 '
 
-  echo "==> M9 P4 health: a stopped data service flips /api/data to unhealthy and recovers"
-  # The P4 gate, end to end on the appliance: stop Postgres inside the guest
-  # (via the test image's SSH — production has no such channel), then assert:
+  echo "==> M9 P4 health: a wedged daemon is detected, reported and healed by the supervisor"
+  # The P4 gate, end to end on the appliance. The injection is `docker pause`
+  # — a genuinely wedged daemon: the container's port stays open but the
+  # process cannot answer, which is exactly the failure mode a bare liveness
+  # check cannot see. Via the test image's SSH (production has no such
+  # channel), then assert:
   #   1. /api/data reports postgres health.state=ready before the fault,
-  #   2. the downed container shows an unhealthy verdict with last_error and a
-  #      checked_at timestamp — transient, because the supervisor restarts it
-  #      within one tick (that IS the P4 contract: the CP heals the service),
-  #   3. health returns to ready without any manual docker start.
+  #   2. the wedged daemon shows an unhealthy verdict with last_error and a
+  #      checked_at timestamp (the deep probe, not just TCP),
+  #   3. the supervisor recreates it: health returns to ready without any
+  #     manual docker start/unpause.
   smoke_ssh() {
     ssh -i "${ROOT}/keys/qemu/smoke-ssh-ed25519" \
       -p "${QEMU_SSH_HOST_PORT:-19222}" \
@@ -2953,13 +2956,12 @@ assert d["health"]["state"] == "ready", d.get("health")
 print("OK: /api/data postgres health=ready before the fault")
 '
 
-  # The data supervisor restarts a stopped container within one tick, so the
-  # unhealthy verdict is TRANSIENT — exactly what "the CP heals a downed
-  # service" means. Poll fast (1 s) to observe it, then watch it recover.
-  smoke_ssh docker stop lemonseed-postgres >/dev/null
+  smoke_ssh docker pause lemonseed-postgres >/dev/null
 
   unhealthy=""
-  p4_deadline=$(( SECONDS + 180 ))
+  # Grace is already spent by the time this section runs, so the first failed
+  # tick flips the verdict; give it a few ticks of slack.
+  p4_deadline=$(( SECONDS + 120 ))
   while (( SECONDS < p4_deadline )); do
     if api_data 2>/dev/null | python3 -c '
 import json, sys
@@ -2972,11 +2974,11 @@ assert h.get("checked_at"), f"no checked_at: {h}"
     sleep 1
   done
   if [[ -z "${unhealthy}" ]]; then
-    echo "M9 P4: the downed service never showed an unhealthy verdict" >&2
+    echo "M9 P4: the wedged service never showed an unhealthy verdict" >&2
     api_data | head -c 400 >&2 || true; echo "" >&2
     exit 1
   fi
-  echo "OK: /api/data flipped to unhealthy with last_error + checked_at (transient)"
+  echo "OK: wedged postgres showed unhealthy with last_error + checked_at"
 
   recovered=""
   p4_deadline=$(( SECONDS + 240 ))
@@ -2993,8 +2995,9 @@ assert d["health"]["state"] == "ready", f"health={d['"'"'health'"'"']}"
     api_data | head -c 400 >&2 || true; echo "" >&2
     exit 1
   }
-  # The suite never issued docker start: recovery is the supervisor's doing.
-  echo "OK: postgres health recovered to ready via the supervisor (no manual start)"
+  # The suite never started or unpause anything: healing is the
+  # supervisor's recreate, which is the P4 contract under test.
+  echo "OK: postgres health recovered to ready via the supervisor (recreate on a wedged daemon)"
 
   echo "==> M9 P4 telemetry: the toolbar bars carry GPU/net fields"
   curl -fsS --max-time 5 -b "${COOKIE_JAR}" \
