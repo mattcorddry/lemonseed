@@ -140,6 +140,45 @@ class ProbePostgresTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("SELECT 1", detail)
 
+    def test_select1_uses_the_env_file_credentials(self):
+        # The deep probe must authenticate like every other consumer. A
+        # passwordless connect fails against TCP auth (fe_sendauth) and the
+        # supervisor then recreates a perfectly healthy server in a loop.
+        import db
+
+        seen = {}
+
+        class FakeCursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def execute(self, sql):
+                seen["sql"] = sql
+
+            def fetchone(self):
+                return (1,)
+
+        class FakeConn:
+            def cursor(self):
+                return FakeCursor()
+
+            def close(self):
+                pass
+
+        with mock.patch.object(db, "pg_isready", return_value=True), \
+             mock.patch.object(db, "_connect",
+                               side_effect=lambda database: seen.update(
+                                   dbname=database) or FakeConn()) as connect:
+            ok, _ = health.probe_postgres()
+        self.assertTrue(ok)
+        # The credentials come from db's own env-file handling; the probe may
+        # not build its own connection.
+        connect.assert_called_once_with("postgres")
+        self.assertEqual(seen["sql"], "SELECT 1")
+
 
 class ProbeLemondTests(unittest.TestCase):
     def test_missing_key_fails_without_http(self):

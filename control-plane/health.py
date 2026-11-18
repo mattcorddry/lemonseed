@@ -84,19 +84,15 @@ def probe_postgres(
     """pg_isready plus a real SELECT 1 on the app connection. The first catches
     the server wedged before accepting sessions; the second catches a server
     that accepts sessions but cannot answer its own protocol (auth, lockup)."""
-    from db import pg_isready  # lazy: db.py owns env/credential handling
+    from db import pg_isready, _connect  # lazy: db.py owns env/credential handling
 
     if not pg_isready():
         return False, "pg_isready: no response"
     try:
-        import psycopg2  # noqa: PLC0415
-
-        conn = psycopg2.connect(
-            host=host or os.environ.get("LEMONSEED_PG_HOST", "127.0.0.1"),
-            port=port or int(os.environ.get("LEMONSEED_PG_PORT", "5432")),
-            user="postgres",
-            connect_timeout=int(DEFAULT_TIMEOUT_SEC),
-        )
+        # SELECT 1 must authenticate the same way every other consumer does —
+        # a passwordless connect here fails against TCP auth (fe_sendauth) and
+        # the supervisor would then recreate a perfectly healthy server.
+        conn = _connect("postgres")
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
