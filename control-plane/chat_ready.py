@@ -746,7 +746,7 @@ def prepare_local_chat(*, force: bool = False) -> dict[str, Any]:
                 # Coarse milestones around `lemonade pull`. lemond exposes no
                 # download-progress API (every candidate progress route 404s),
                 # so we can only report the size; live rate belongs to the NET
-                # throughput meter in the shell toolbar (DESIGN.md §11 backlog).
+                # throughput meter in the shell toolbar (ARCHITECTURE.md §11 backlog).
                 step_message = f"Downloading {friendly} for your hardware{size_note}…"
                 step_task = f"{model_id} ({float(weights_gb):g} GB)" if weights_gb else model_id
             write_chat_ready(

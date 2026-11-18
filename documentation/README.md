@@ -2,7 +2,7 @@
 
 Lemonseed is a **local home AI appliance**: a NixOS-based, read-only SquashFS image with A/B updates, a web installer, and a small control plane. The goal is private LAN chat and related workloads on ordinary PC hardware (NVIDIA and AMD Strix Halo APUs supported today), without depending on cloud AI for core use.
 
-This repository builds the appliance artifacts, the USB/EFI installer, and the bring-up tooling. Deeper design lives in [DESIGN.md](./DESIGN.md). Agent/process conventions live in [AGENTS.md](../AGENTS.md).
+This repository builds the appliance artifacts, the USB/EFI installer, and the bring-up tooling. Deeper design lives in [ARCHITECTURE.md](./ARCHITECTURE.md). Agent/process conventions live in [AGENTS.md](../AGENTS.md).
 
 ## Getting started
 
@@ -35,7 +35,8 @@ You need [Nix](https://nixos.org/download/) with flakes enabled. See `nix-instal
 ```
 boot/           GRUB config (A/B slot selection)
 control-plane/  Appliance HTTP control plane (setup + status)
-documentation/  DESIGN.md (as-built contract), Security.md, RELEASE.md,
+documentation/  ARCHITECTURE.md (as-built contract), DESIGN.md (the Neon UI design
+   system), Security.md, RELEASE.md,
                 roadmap/ (milestone records + BACKLOG.md)
 installer/      USB installer pipeline + web UI
 nixos/          NixOS modules (appliance + installer)
@@ -64,7 +65,7 @@ Because the transport cannot be trusted, **the password is never sent to the app
 Setup derives a salt and a verifier in your browser; signing in proves you can reproduce a
 value derived from the password, without transmitting it ([SRP-6a](https://datatracker.ietf.org/doc/html/rfc5054)).
 The control plane never holds, and never could send, your password. Details in
-[DESIGN.md](./DESIGN.md) §3.3.
+[ARCHITECTURE.md](./ARCHITECTURE.md) §3.3.
 
 Two honest consequences: sign-in requires JavaScript (there is no server-side fallback), and
 the minimum password length is enforced by the browser, because a server that cannot see the
@@ -76,7 +77,7 @@ If you forget the **admin** password there is no email link and no reset page: y
 USB installer, keep your data, and tick **Reset admin credentials**, which reopens the
 first-boot setup. Forgetting any other account's password is an admin's job — they hand you a
 one-time password, and it makes you choose a new one before you get signed in at all. The
-mechanism is in [DESIGN.md](./DESIGN.md) §9.
+mechanism is in [ARCHITECTURE.md](./ARCHITECTURE.md) §9.
 
 ## Updates
 

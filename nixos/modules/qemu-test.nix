@@ -1,5 +1,5 @@
 # QEMU smoke-test profile: virtio root + user-data disk (see make run-qemu).
-# Production images must NOT use this module (see DESIGN.md).
+# Production images must NOT use this module (see ARCHITECTURE.md).
 
 { lib, pkgs, ... }:
 

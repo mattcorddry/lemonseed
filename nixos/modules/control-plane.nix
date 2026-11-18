@@ -61,7 +61,7 @@ let
   # `redis` is the Valkey client for the M6.6 session store (sessions.py). Keep
   # this list runtime-only; test dependencies belong in scripts/run-unit-tests.sh.
   # There is deliberately no `bcrypt`: sign-in is SRP-6a (srp.py), so the CP
-  # neither stores nor verifies a password hash (DESIGN.md §3.3).
+  # neither stores nor verifies a password hash (ARCHITECTURE.md §3.3).
   pythonEnv = pkgs.python3.withPackages (ps: [ ps.psycopg2 ps.requests ps.redis lemonadePythonSdk ]);
 
   controlPlane = pkgs.writeShellApplication {

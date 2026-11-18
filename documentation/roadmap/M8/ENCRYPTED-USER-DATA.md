@@ -7,7 +7,7 @@ as settled in the plan, amended by this review where marked. New decisions
 continue a phase-scoped **D-E…** series, the pattern [`CHANNELS.md`](./CHANNELS.md)
 used for its D-C… series.
 
-Related: [PLAN.md](./PLAN.md) §P7 · [DESIGN.md](../../DESIGN.md) §6 (root
+Related: [PLAN.md](./PLAN.md) §P7 · [`ARCHITECTURE.md`](../../ARCHITECTURE.md) (née DESIGN.md) §6 (root
 filesystem model), §9 (security posture), §4 (A/B boot protocol) ·
 `installer/install.py`, `scripts/appliance-storage-provision.sh`,
 `scripts/disk-release.sh`, `scripts/lemonseed_update.py`,

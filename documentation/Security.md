@@ -3,7 +3,7 @@
 This document explains, in plain language, what Lemonseed does to keep your
 data safe, what risks remain, and what you can do about them. It is an
 overview, not a design record: the engineering detail lives in
-[DESIGN.md](./DESIGN.md).
+[ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## What Lemonseed protects, and how
 

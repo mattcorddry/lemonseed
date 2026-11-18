@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Eligible install-disk discovery for the Lemonseed USB installer.
 
-Rules (DESIGN.md M4):
+Rules (ARCHITECTURE.md M4):
   - Prefer internal SATA/NVMe disks
   - Disallow USB-attached and eMMC
   - Never target the live installer medium

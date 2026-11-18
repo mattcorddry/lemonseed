@@ -1019,7 +1019,7 @@ def create_admin(
 
     Note what cannot be enforced here any more: a minimum password length. The
     server never sees the password, so that policy now lives in the setup form.
-    That is a real weakening and is recorded as such in DESIGN.md §9 rather than
+    That is a real weakening and is recorded as such in ARCHITECTURE.md §9 rather than
     being papered over.
     """
     username = normalize_username(username)

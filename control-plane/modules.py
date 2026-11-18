@@ -62,7 +62,7 @@ OWUI_TRUSTED_NAME_HEADER = "X-Forwarded-Name"
 OWUI_TRUSTED_GROUPS_HEADER = "X-Forwarded-Groups"
 OWUI_TRUSTED_ROLE_HEADER = "X-Forwarded-Role"
 
-# CP service identity in OWUI (DESIGN.md M6.3b). Signing in first at
+# CP service identity in OWUI (ARCHITECTURE.md M6.3b). Signing in first at
 # first-healthy makes it OWUI's primary admin — the first-created user, which
 # OWUI refuses to let anyone else modify or delete. It cannot be hidden from
 # the admin user list, so the deterrent is the explicit display name. Shares the

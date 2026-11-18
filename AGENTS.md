@@ -1,7 +1,7 @@
 # AGENTS.md — Lemonseed agent guide
 
 Guidance for AI agents (and humans) working in this repository. Prefer this file
-plus `documentation/DESIGN.md` over inventing process. When they conflict, **DESIGN.md** wins
+plus `documentation/ARCHITECTURE.md` over inventing process. When they conflict, **ARCHITECTURE.md** wins
 on product/architecture; **this file** wins on how to change code and close a sprint.
 
 ## Project snapshot
@@ -14,12 +14,12 @@ Lemonseed is a **NixOS appliance** (read-only SquashFS, A/B updates) with:
 - **Data plane** — PostgreSQL (+ pgvector) and Valkey on user-data
 - **Modules** — Docker apps (e.g. Open WebUI) managed by the control plane
 
-Read `documentation/DESIGN.md` before changing milestones, auth, storage, or UX routing.
+Read `documentation/ARCHITECTURE.md` before changing milestones, auth, storage, or UX routing.
 
 ## Operating principles
 
 1. **Small, purposeful diffs** — match existing style; no drive-by refactors or unrelated files.
-2. **DESIGN.md is the product contract** — update it when decisions change; do not silently diverge.
+2. **ARCHITECTURE.md is the product contract** — update it when decisions change; do not silently diverge.
 3. **Flakes only see tracked/staged files** — new paths must be `git add`’d before `nix build` / `make build-*` or Nix will not see them. `make test` and `make build-*` run `scripts/check-untracked.sh` and **fail** if any non-ignored untracked files exist (bypass: `ALLOW_UNTRACKED=1`).
 4. **Do not commit or push** unless the user explicitly asks.
 5. **Do not skip the test lifecycle** at the end of a work sprint (see below).
@@ -119,8 +119,8 @@ When coming back to the user, include briefly:
 |-----|------|
 | `README.md` | End-user entry: install, first boot, using Lemonseed |
 | `documentation/README.md` | Developer docs entry: build + test commands, repo tree |
-| `documentation/DESIGN.md` | Product and architecture decisions **as built**, plus the consolidated backlog |
+| `documentation/ARCHITECTURE.md` | Product and architecture decisions **as built**, plus the consolidated backlog |
 | `AGENTS.md` | How agents should work and close sprints |
 | `documentation/RELEASE.md` | The release runbook: build/sign machine setup, per-release workflow, publish + verify, channel flip, BM drill |
 | `documentation/TESTING.md` | The test strategy: the phase matrix, the reasoning per phase, what each phase must not catch, the cadence |
-| `documentation/roadmap/` | Milestone design records (`M*/`) and `BACKLOG.md` — the reasoning and phase plans behind each milestone. Historical: `DESIGN.md` wins on current behavior |
+| `documentation/roadmap/` | Milestone design records (`M*/`) and `BACKLOG.md` — the reasoning and phase plans behind each milestone. Historical: `ARCHITECTURE.md` wins on current behavior |

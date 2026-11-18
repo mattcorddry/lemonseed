@@ -24,7 +24,7 @@
 
       # Unofficial Python SDK for the lemond HTTP API (not in nixpkgs). The
       # control plane uses it to talk to lemond over HTTP instead of wrapping
-      # the `lemonade` CLI — see DESIGN.md "lemond API over CLI".
+      # the `lemonade` CLI — see ARCHITECTURE.md "lemond API over CLI".
       lemonadePythonSdk = pkgs.callPackage ./pkgs/lemonade-python-sdk.nix {
         buildPythonPackage = pkgs.python3Packages.buildPythonPackage;
         requests = pkgs.python3Packages.requests;
@@ -37,7 +37,7 @@
           inherit system;
           # nix-amd-ai is passed so lemond.nix can consume its llama.cpp
           # builds (must track the same llama.cpp lemonadePackage is built
-          # against — see DESIGN.md "llama.cpp provenance").
+          # against — see ARCHITECTURE.md "llama.cpp provenance").
           specialArgs = { inherit lemonadePackage nix-amd-ai lemonadePythonSdk; };
           modules = [ ./nixos/configuration.nix ] ++ extraModules;
         };

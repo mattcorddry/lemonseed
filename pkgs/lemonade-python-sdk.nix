@@ -3,7 +3,7 @@
 # Not in nixpkgs as of nixos-26.05. Pure-Python wheel; the only runtime
 # dependency is `requests`. The control plane uses it (via a thin subclass in
 # control-plane/lemond_client.py) to talk to lemond over HTTP instead of
-# wrapping the `lemonade` CLI — see DESIGN.md "lemond API over CLI".
+# wrapping the `lemonade` CLI — see ARCHITECTURE.md "lemond API over CLI".
 {
   lib,
   fetchurl,

@@ -1,7 +1,7 @@
 """Thin Open WebUI API client for the Lemonseed control plane (M6.3b).
 
 Purpose-built for the CP's OWUI integration: service-identity provisioning
-now, config/identity reconciliation in later phases (DESIGN.md M6.3b). We
+now, config/identity reconciliation in later phases (ARCHITECTURE.md M6.3b). We
 hand-roll a stdlib (urllib) client instead of adopting a third-party lib:
 the CP is stdlib-first (AGENTS.md), the calls are synchronous and local, and
 ``lemond_client.py`` is the in-tree precedent for a bespoke client.
@@ -27,7 +27,7 @@ Route names and machine auth (M6.3b Phase 3):
 
   - ``client.call("config.export")`` resolves verb+path from the manifest's
     ``api`` map (``api_map=`` ctor arg), falling back to ``DEFAULT_API`` which
-    mirrors the DESIGN.md day-one table. No route strings at call sites: an
+    mirrors the ARCHITECTURE.md day-one table. No route strings at call sites: an
     OWUI pin bump becomes a manifest diff, not a code change.
   - The reconciler authenticates with the CP's ``sk-`` API key (minted once
     over the JWT session, persisted in module secrets). A 401 with the key
@@ -56,7 +56,7 @@ DEFAULT_TIMEOUT_SEC = 10.0
 SIGNIN_TIMEOUT_SEC = 20.0
 _ERROR_MAX_LEN = 300
 
-# Mirrors the owui-policy.json ``api`` map (DESIGN.md day-one table) so the
+# Mirrors the owui-policy.json ``api`` map (ARCHITECTURE.md day-one table) so the
 # client works before/without a manifest (e.g. the version gate). The manifest
 # map wins wherever provided; keeping the two in sync is a manifest concern.
 DEFAULT_API: dict[str, str] = {
@@ -325,7 +325,7 @@ class OwuiClient:
             return bool(self._identity) and bool(self.mint_api_key())
         return bool(self._identity) and bool(self.refresh_session().get("ok"))
 
-    # -- day-one methods (DESIGN.md table; all via the api map) ---------------
+    # -- day-one methods (ARCHITECTURE.md table; all via the api map) ---------------
 
     def app_version(self) -> dict[str, Any]:
         """Unauthenticated app config; carries the installed OWUI version."""

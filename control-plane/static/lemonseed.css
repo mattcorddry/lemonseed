@@ -15,8 +15,8 @@
  *     this text inline, so nothing here may depend on server-side state; put
  *     per-request values in the templates instead.
  *
- * Neon restyle (2026-11): the tokens below are the DESIGN.md palette landed at
- * this repo's root. The appliance is a dark surface, so the Neon spec's
+ * Neon restyle (2026-11): the tokens below are the DESIGN.md palette
+ * (documentation/DESIGN.md). The appliance is a dark surface, so the Neon spec's
  * surface (#FFFFFF) and text (#111827) tokens are the light and dark ends of
  * the same high-contrast pairing, and the primary/secondary pair lands as the
  * accent and a glow. Typography lands STIX Two Text for display, Roboto for

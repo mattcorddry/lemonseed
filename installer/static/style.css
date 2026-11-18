@@ -1,5 +1,5 @@
 /* Lemonseed installer — shares the control-plane portal's design system.
- * The palette below is the same Neon spec (DESIGN.md, pulled from typeui.sh)
+ * The palette below is the same Neon spec (documentation/DESIGN.md)
  * that control-plane/static/lemonseed.css serves; edit both together or drift
  * will creep in. Legacy variable names are kept as aliases because every rule
  * below was written against them.

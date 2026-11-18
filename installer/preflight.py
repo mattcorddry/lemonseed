@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
-# Product floors (see DESIGN.md). Disk raised from the old 16 GiB soft floor.
+# Product floors (see ARCHITECTURE.md). Disk raised from the old 16 GiB soft floor.
 MIN_DISK_BYTES = 20 * 1024**3
 NOMINAL_RAM_GB = 8
 # x86 boxes labeled "8 GB" often report ~7.6–7.8 GiB MemTotal (BIOS/GPU reservations).

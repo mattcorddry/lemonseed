@@ -1,7 +1,7 @@
 """Thin client for the Lemonade (lemond) HTTP API.
 
 The control plane talks to lemond over its HTTP API rather than the
-`lemond`/`lemonade` CLI wherever possible (see DESIGN.md "lemond API over
+`lemond`/`lemonade` CLI wherever possible (see ARCHITECTURE.md "lemond API over
 CLI"). We build on the unofficial `lemonade-python-sdk` (pure-Python, depends
 only on `requests`) and subclass `LemonadeClient` to add the few endpoints it
 lacks:

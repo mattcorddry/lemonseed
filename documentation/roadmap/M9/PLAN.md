@@ -3,7 +3,7 @@
 Draft for approval, revised 2026-11-02. **Revised again 2026-11-12**: P5 is
 redefined as the **Lemonade 2026.46 engine upgrade** with the original
 model-catalog-expansion work absorbed into it (D43), placed ahead of the Hermes
-module work. `DESIGN.md` is the as-built product contract;
+module work. `ARCHITECTURE.md` is the as-built product contract;
 this document is the **sprint pull** from `BACKLOG.md` (items tagged `[M9]`) and from
 M8's close-out. Decisions D32–D44 at the bottom continue the global decision log, so
 nothing gets re-litigated mid-build.
@@ -117,7 +117,7 @@ Valkey — not a module:
 
 ### Gate
 
-Config authority settled (this document + `DESIGN.md` §3.4/§3.5 updates), QEMU green,
+Config authority settled (this document + `ARCHITECTURE.md` §3.4/§3.5 updates), QEMU green,
 BM-1 pass.
 
 > **As built (M9 P1):** design `LITELLM.md` + implementation landed; unit tests
@@ -438,7 +438,7 @@ one with different numbers.
 One tier-D bare-metal run on the RX 7600 (Navi 33, `1002:7480`) already identified on
 the dev host: install from the current release, confirm discovery and backend
 selection, run the model planner against real VRAM, exercise chat, and record the
-planner decisions. Findings feed `DESIGN.md` §9 and the hardware-support matrix.
+planner decisions. Findings feed `ARCHITECTURE.md` §9 and the hardware-support matrix.
 
 ### Tests
 
@@ -458,7 +458,7 @@ checkpoint is BM-4.)*
   settled (LLM catalog is a separate system, outbound ACLs declared-not-enforced),
   the platform-config-contribution requirement added, and the catalog distribution
   model (in-tree, seeded at boot) written down.
-- `DESIGN.md`: §3.4 rewritten around the general module lifecycle (OWUI becomes one
+- `ARCHITECTURE.md`: §3.4 rewritten around the general module lifecycle (OWUI becomes one
   instance of it, LiteLLM joins the core services), §3.5 gains the static MCP config,
   §10 the new catalog tree, and §13 the decision log rows below.
 - Docs mentioning "**OWUI is a module**" are reworded — OWUI is a core component, and

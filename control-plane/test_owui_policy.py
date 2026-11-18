@@ -1406,7 +1406,7 @@ class TestReconcile(unittest.TestCase):
         # These are module-level globals shared with every other test class, so
         # snapshot and restore them; leaving them mutated leaks a "reconciled"
         # status into whichever class runs next (order-dependent failures). See
-        # DESIGN.md "test isolation".
+        # ARCHITECTURE.md "test isolation".
         self.addCleanup(setattr, owui_policy, "_last_good_manifest",
                         owui_policy._last_good_manifest)
         status_snapshot = dict(owui_policy._status)

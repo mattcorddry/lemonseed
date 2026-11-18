@@ -1,7 +1,7 @@
 # Lemonade 2026.46 — engine upgrade and container-backend migration plan
 
 Status: **plan** — nothing here has landed. Not yet a milestone record; when the
-work ships, fold the outcomes back into [`DESIGN.md`](../DESIGN.md) (§3.6 model
+work ships, fold the outcomes back into [`ARCHITECTURE.md`](../ARCHITECTURE.md) (§3.6 model
 management, §3.4, §8 llama.cpp provenance, §13 decision log).
 
 | | |

@@ -13,7 +13,7 @@ immediate subdirectory as one model and order them by directory mtime as a
 coarse LRU signal (lemond exposes no per-model access timestamp).
 
 Where possible we ask lemond for the facts and act through its HTTP API rather
-than touching the cache from underneath a running server (see DESIGN.md
+than touching the cache from underneath a running server (see ARCHITECTURE.md
 "lemond API over CLI"):
 
   - free/total bytes        GET  /v1/system-info → model_storage
