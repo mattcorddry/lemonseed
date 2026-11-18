@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -2870,9 +2871,13 @@ def app_bar(name: str, *, view: str = "chat", metrics: bool = True) -> str:
     gear_active = "active" if view == "settings" else ""
     meter = """
 <div class="metrics" aria-hidden="true">
-  <div class="metric" title="System load (1 min)">
+  <div class="metric" title="System load or GPU use — the busier of the two (1 min)">
     <label>Load</label>
     <div class="bar"><span id="metric-load" style="width:0%"></span></div>
+  </div>
+  <div class="metric" title="Network throughput as a fraction of link rate, max(Tx,Rx), log scale">
+    <label>Net</label>
+    <div class="bar"><span id="metric-net" style="width:0%"></span></div>
   </div>
   <div class="metric" title="Storage used on /var/lib/lemonseed">
     <label>Storage</label>
@@ -3234,8 +3239,10 @@ async function refreshStatus() {{
     const data = await response.json();
     const telemetry = data.telemetry || {{}};
     const loadEl = document.getElementById('metric-load');
+    const netEl = document.getElementById('metric-net');
     const storageEl = document.getElementById('metric-storage');
     if (loadEl && telemetry.load_pct != null) loadEl.style.width = telemetry.load_pct + '%';
+    if (netEl && telemetry.net_pct != null) netEl.style.width = telemetry.net_pct + '%';
     if (storageEl && telemetry.storage_pct != null) storageEl.style.width = telemetry.storage_pct + '%';
 
     const owui = (data.modules || {{}}).open_webui || {{}};
@@ -3351,24 +3358,147 @@ single-use passcodes before transmission to the Lemonseed appliance.</p>
 
 
 def telemetry_snapshot() -> dict[str, Any]:
-    """Lightweight load + storage bars for the app toolbar."""
+    """Lightweight load + storage bars for the app toolbar.
+
+    The LOAD bar is max(cpu 1-minute load, GPU busy) — on an inference
+    appliance the interesting question is "how busy is the box or its GPU",
+    and neither alone answers it. The NET bar is max(Tx,Rx) of the interface
+    holding the primary route as a fraction of its negotiated link rate, on a
+    log scale (at home-link rates a linear bar sits at zero all day), smoothed
+    with an EWMA so a burst does not make it twitch.
+    """
     try:
         load1, load5, load15 = os.getloadavg()
     except OSError:
         load1 = load5 = load15 = 0.0
     cpu = hardware._cpu_info()
     threads = max(1, int(cpu.get("threads") or cpu.get("cores") or 1))
-    load_pct = min(100, round(100 * load1 / threads))
+    gpu_busy = _gpu_busy_pct()
+    cpu_pct = min(100.0, 100 * load1 / threads)
+    load_pct = round(max([cpu_pct] + ([gpu_busy] if gpu_busy is not None else [])), 1)
     storage = hardware._disk_free(Path("/var/lib/lemonseed"))
     total = int(storage.get("total_bytes") or 0)
     used = int(storage.get("used_bytes") or 0)
     storage_pct = round(100 * used / total) if total else 0
+    net_pct, net_frac = _net_bar()
     return {
         "load_pct": load_pct,
+        "cpu_load_1m": round(load1, 2),
+        "gpu_pct": gpu_busy,
+        "net_pct": net_pct,
+        "net_fraction": net_frac,
         "load": {"1m": round(load1, 2), "5m": round(load5, 2), "15m": round(load15, 2)},
         "storage_pct": storage_pct,
         "storage_path": "/var/lib/lemonseed",
     }
+
+
+def _gpu_busy_pct() -> Optional[float]:
+    """amdgpu's gpu_busy_percent for the first card that exposes it; None when
+    there is no GPU (QEMU profiles) or the sysfs file is absent — never a guess."""
+    try:
+        for entry in Path("/sys/class/drm").glob("card[0-9]*"):
+            busy = entry / "device" / "gpu_busy_percent"
+            if busy.is_file():
+                return float(busy.read_text().strip())
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+# NET bar state: the previous counter sample and the EWMA. Module-level on
+# purpose — the CP process is long-lived, and the client polls every few
+# seconds, so deltas between requests are exactly the window we want.
+_net_state: dict[str, Any] = {}
+_NET_IFACE_FALLBACK_LINK_MBPS = 1000.0
+_NET_EWMA_ALPHA = 0.3
+
+
+def _primary_iface() -> Optional[str]:
+    """The interface carrying the default route — the one whose throughput a
+    home admin cares about (`ip route get` mirrors what the box actually uses)."""
+    try:
+        out = subprocess.run(
+            ["ip", "route", "get", "1.1.1.1"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    marker = " dev "
+    idx = out.find(marker)
+    if idx < 0:
+        return None
+    rest = out[idx + len(marker):]
+    return rest.split()[0] or None
+
+
+def _link_mbps(iface: str) -> float:
+    """Negotiated link rate from ethtool --json; a conservative fallback when
+    ethtool is absent or the value is meaningless (unknown/-1, Wi-Fi drivers)."""
+    try:
+        result = subprocess.run(
+            ["ethtool", "--json", iface],
+            capture_output=True, text=True, timeout=2,
+        )
+        entries = json.loads(result.stdout or "[]")
+        speed = float((entries[0] or {}).get("speed") or 0)
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, IndexError,
+            TypeError):
+        return _NET_IFACE_FALLBACK_LINK_MBPS
+    if speed <= 0:  # ethtool reports -1/unknown for several drivers
+        return _NET_IFACE_FALLBACK_LINK_MBPS
+    return speed
+
+
+def _counters(iface: str) -> Optional[tuple[int, int]]:
+    """tx/rx byte counters from sysfs; None when the interface is gone."""
+    try:
+        base = Path(f"/sys/class/net/{iface}/statistics")
+        return (int((base / "tx_bytes").read_text()),
+                int((base / "rx_bytes").read_text()))
+    except OSError:
+        return None
+
+
+def _net_bar() -> tuple[Optional[int], Optional[float]]:
+    """(display pct, raw link fraction) — either may be None when there is no
+    primary interface or the counters are unreadable."""
+    global _net_state  # noqa: PLW0603 — deliberate module-level EWMA state
+
+    iface = _primary_iface()
+    if not iface:
+        return None, None
+    now = time.monotonic()
+    counters = _counters(iface)
+    if counters is None:
+        return None, None
+    tx, rx = counters
+
+    prev = _net_state if _net_state.get("iface") == iface else None
+    mbps = _link_mbps(iface)
+
+    def log_pct(fraction: float) -> int:
+        # log10(1 + 99f)/2 maps [0,1] onto the bar so 10% of link ≈ half full.
+        return round(max(0.0, min(100.0, 50 * math.log10(1 + 99 * max(fraction, 0.0)))))
+
+    if prev is None:
+        # An interface change resets the window: deltas across interfaces are
+        # meaningless (and so is an EWMA over them).
+        _net_state = {"iface": iface, "tx": tx, "rx": rx, "at": now, "ewma": None}
+        return None, None
+    dt = now - float(prev["at"])
+    if dt < 1.0 or tx < int(prev["tx"]) or rx < int(prev["rx"]):
+        # Too soon to differentiate (or the counters wrapped/restarted — a
+        # reboot of an interface): keep the last smoothed value.
+        if _net_state.get("ewma") is None:
+            return None, None
+        return log_pct(_net_state["ewma"]), round(_net_state["ewma"], 4)
+    rate_bps = max(tx - int(prev["tx"]), rx - int(prev["rx"])) * 8.0 / dt
+    fraction = min(rate_bps / (mbps * 1_000_000.0), 1.0)
+    old = _net_state.get("ewma")
+    ewma = fraction if old is None else (1 - _NET_EWMA_ALPHA) * old + _NET_EWMA_ALPHA * fraction
+    _net_state = {"iface": iface, "tx": tx, "rx": rx, "at": now, "ewma": ewma}
+    return log_pct(ewma), round(ewma, 4)
 
 
 # Plain string (not an f-string) on purpose: JS braces stay single.
