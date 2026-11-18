@@ -209,6 +209,13 @@ class Tracker:
         if detail:
             self._last_error = str(detail)[:500]
 
+    def mark_starting(self) -> None:
+        """A start attempt resets the accounting to an honest 'starting' —
+        the old unhealthy verdict described a process that no longer exists.
+        The last error stays visible for one incident's context."""
+        self._state = "starting"
+        self._fails = 0
+
     def snapshot(self) -> dict[str, Any]:
         return {
             "state": self._state,

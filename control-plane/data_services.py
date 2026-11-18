@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import audit
+import health
 from db import pg_isready, provision_data_plane
 from image_pins import digest_ref, tag_ref
 
@@ -75,7 +76,15 @@ def valkey_ready() -> bool:
 def postgres_snapshot() -> dict[str, Any]:
     snap = dict(_containers.get(POSTGRES_CONTAINER) or {})
     ready = pg_isready()
-    snap["state"] = "ready" if ready else (snap.get("state") or "starting")
+    hsnap = _pg_health.snapshot()
+    if hsnap["state"] == "unhealthy":
+        # The gate: /api/data never claims healthy while a live check fails.
+        snap["state"] = "unhealthy"
+    elif ready:
+        snap["state"] = "ready"
+    else:
+        snap["state"] = snap.get("state") or "starting"
+    snap["health"] = hsnap
     snap["host"] = "127.0.0.1:5432"
     snap["container"] = POSTGRES_CONTAINER
     return snap
@@ -84,7 +93,14 @@ def postgres_snapshot() -> dict[str, Any]:
 def valkey_snapshot() -> dict[str, Any]:
     snap = dict(_containers.get(VALKEY_CONTAINER) or {})
     ready = valkey_ready()
-    snap["state"] = "ready" if ready else (snap.get("state") or "starting")
+    hsnap = _valkey_health.snapshot()
+    if hsnap["state"] == "unhealthy":
+        snap["state"] = "unhealthy"
+    elif ready:
+        snap["state"] = "ready"
+    else:
+        snap["state"] = snap.get("state") or "starting"
+    snap["health"] = hsnap
     snap["host"] = "127.0.0.1:6379"
     snap["container"] = VALKEY_CONTAINER
     return snap
@@ -166,7 +182,7 @@ def ensure_provision_worker() -> None:
 # Container supervision (CP-owned, like modules.py for OWUI)
 # ---------------------------------------------------------------------------
 
-SUPERVISE_INTERVAL_SEC = 10
+SUPERVISE_INTERVAL_SEC = 15
 # A container that is running but whose port stays closed this long is
 # considered wedged (crash-loop, half-boot) and gets recreated.
 HEALTH_GRACE_SEC = 90
@@ -176,6 +192,13 @@ _containers: dict[str, dict[str, Any]] = {
     POSTGRES_CONTAINER: {"state": "starting"},
     VALKEY_CONTAINER: {"state": "starting"},
 }
+
+# Deep-probe accounting (M9 P4): the tracker is the health contract for the
+# snapshots — /api/data reports whatever these last saw, never a fabricated
+# healthy verdict. Failures are not recorded during the cold-start grace
+# window above: some daemons are slow, and "starting" is honest there.
+_pg_health = health.Tracker()
+_valkey_health = health.Tracker()
 
 
 def _docker(args: list[str], timeout: float = 120) -> subprocess.CompletedProcess[str]:
@@ -349,7 +372,8 @@ def _valkey_run_args(ref: str) -> list[str]:
 
 def _start_container(
     name: str, image_key: str, label: str, run_args: Callable[[str], list[str]]
-) -> None:
+) -> bool:
+    """Start (or create+run) the container; True iff it reached 'starting'."""
     state = _containers[name]
     # Reuse a stopped container exactly as the boot start scripts do.
     if _container_exists(name):
@@ -357,17 +381,17 @@ def _start_container(
             state["state"] = "starting"
             state["since"] = time.monotonic()
             state.pop("error", None)
-            return
+            return True
         _docker(["rm", "-f", name], timeout=60)
     if not _ensure_lemon_network():
         state["state"] = "error"
         state["error"] = "Docker network 'lemon' unavailable"
-        return
+        return False
     ok, detail = _pull_image(image_key, label)
     if not ok:
         state["state"] = "waiting"
         state["error"] = detail
-        return
+        return False
     if detail == "pulled:tag_fallback":
         state["image_drift"] = True
     ref = _resolve_ref(image_key)
@@ -381,47 +405,89 @@ def _start_container(
                 err = (result.stderr or result.stdout or err).strip()
         state["state"] = "error"
         state["error"] = err[:500]
-        return
+        return False
     state["state"] = "starting"
     state["since"] = time.monotonic()
     state.pop("error", None)
     state["image"] = ref
     print(f"data supervise: {label} container started", flush=True)
+    return True
 
 
 def _supervise_one(
-    name: str, image_key: str, label: str, port: int, run_args: Callable[[str], list[str]]
+    name: str,
+    image_key: str,
+    label: str,
+    port: int,
+    run_args: Callable[[str], list[str]],
+    tracker: Optional[health.Tracker] = None,
+    deep_probe: Optional[Callable[[], tuple[bool, str]]] = None,
 ) -> None:
     state = _containers[name]
     running = _container_running(name)
+    if not running and tracker is not None:
+        # The process is down right now — say so regardless of what happens
+        # next (the start below may fix it before the next tick reports).
+        tracker.note_unhealthy(f"container {name} is not running")
     if running and _port_open("127.0.0.1", port, timeout=2.0):
-        state["state"] = "ready"
-        state.pop("error", None)
+        # Serving TCP — now ask at the service's own protocol (M9 P4). A deep
+        # failure here means a wedged daemon that still accepts connections:
+        # after its fail limit *and* past cold-start grace, recreate it.
+        ok, detail = deep_probe() if deep_probe else (True, "")
+        if tracker is not None:
+            tracker.record(ok, detail)
+        if ok:
+            state["state"] = "ready"
+            state.pop("error", None)
+            return
+        since = float(state.get("since") or 0.0)
+        within_grace = time.monotonic() - since < HEALTH_GRACE_SEC
+        snap = tracker.snapshot() if tracker else {"failed_ticks": 0}
+        if not within_grace and snap["failed_ticks"] >= health.DEFAULT_FAIL_LIMIT:
+            print(
+                f"data supervise: {label} fails its deep probe"
+                f" ({snap['failed_ticks']} ticks); recreating",
+                flush=True,
+            )
+            _docker(["rm", "-f", name], timeout=60)
+        else:
+            state["state"] = "unhealthy"
+            state["error"] = detail or f"{label} is not answering its health probe"
         return
     if running:
         # Tolerate the first minutes of a cold start (Postgres init, TCG).
+        # Deliberately unrecorded: "some daemons are slow" is not unhealthy.
         since = float(state.get("since") or 0.0)
         if time.monotonic() - since < HEALTH_GRACE_SEC:
             state["state"] = "starting"
             return
         print(f"data supervise: {label} not serving after grace; recreating", flush=True)
         _docker(["rm", "-f", name], timeout=60)
+    started = False
     if not _container_exists(name):
-        _start_container(name, image_key, label, run_args)
+        started = _start_container(name, image_key, label, run_args)
     else:
         # Stopped or exited container: start it again.
         if _docker(["start", name], timeout=120).returncode != 0:
             _docker(["rm", "-f", name], timeout=60)
-            _start_container(name, image_key, label, run_args)
+            started = _start_container(name, image_key, label, run_args)
+        else:
+            started = True
+    if tracker is not None and started:
+        # A start attempt resets the accounting to an honest "starting": the
+        # old unhealthy verdict described a process that no longer exists.
+        tracker.mark_starting()
 
 
 def supervise_data_once() -> None:
     """One reconciliation tick: keep postgres + valkey running and serving."""
     _supervise_one(
-        POSTGRES_CONTAINER, POSTGRES_IMAGE_KEY, "postgres", 5432, _postgres_run_args
+        POSTGRES_CONTAINER, POSTGRES_IMAGE_KEY, "postgres", 5432,
+        _postgres_run_args, tracker=_pg_health, deep_probe=health.probe_postgres,
     )
     _supervise_one(
-        VALKEY_CONTAINER, VALKEY_IMAGE_KEY, "valkey", 6379, _valkey_run_args
+        VALKEY_CONTAINER, VALKEY_IMAGE_KEY, "valkey", 6379,
+        _valkey_run_args, tracker=_valkey_health, deep_probe=health.probe_valkey,
     )
     # LiteLLM rides the same worker (lazy import: litellm.py imports this
     # module's docker helpers, so the cycle is cut here, not at module load).

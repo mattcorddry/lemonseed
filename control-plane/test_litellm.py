@@ -14,6 +14,7 @@ from unittest import mock
 CP = Path(__file__).resolve().parent
 sys.path.insert(0, str(CP))
 
+import health
 import litellm  # noqa: E402
 from image_pins import digest_ref, tag_ref  # noqa: E402
 
@@ -217,6 +218,8 @@ class SupervisorTests(unittest.TestCase):
             mock.patch.object(litellm, "_container_running", return_value=True),
             mock.patch.object(litellm, "_container_exists", return_value=True),
             mock.patch.object(litellm, "_port_open", return_value=True),
+            mock.patch.object(health, "probe_http",
+                              side_effect=lambda *a, **k: (True, "")),
             mock.patch.object(litellm, "_docker") as docker,
         ):
             litellm.write_config(litellm.render_config("m1", filtered_enabled=True))

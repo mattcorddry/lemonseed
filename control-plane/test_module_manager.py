@@ -68,6 +68,9 @@ def spec_for(module_id: str, **overrides: object) -> dict:
         "docker": {
             "image": "hello_world",
             "container": f"lemonseed-{module_id}",
+            # M9 P4: a module spec declares its health signal; there is no
+            # TCP fallback.
+            "probe": {"port": 18100, "path": "/"},
         },
     }
     spec.update(overrides)
@@ -206,6 +209,9 @@ class ModuleCase(unittest.TestCase):
         self.data_root = self.root / "modules-data"
         self.db = FakeDb()
         self.docker = FakeDocker()
+        # The deep-probe verdict, controllable per test (M9 P4). Default
+        # healthy: install/enable flows must not depend on real network.
+        self.probe_result = (True, "")
         self.hooks: list[tuple[str, str]] = []
         self.catalog = {"modules": {}, "problems": [], "catalog_version": 1}
 
@@ -236,6 +242,8 @@ class ModuleCase(unittest.TestCase):
             mock.patch.object(db_mod(), "write_module_env", self.db.write_module_env),
             mock.patch.object(db_mod(), "drop_module_row", self.db.drop_module_row),
             mock.patch.object(db_mod(), "drop_module_db", self.db.drop_module_db),
+            mock.patch.object(mm, "_deep_probe",
+                              lambda spec, name=None: self.probe_result),
         ]
         for patcher in patches:
             patcher.start()
@@ -761,11 +769,12 @@ class SupervisionTests(ModuleCase):
         env_path = mm._container_env_path("demo")
         self.db.rows["demo"]["run_hash"] = mm.run_fingerprint(spec, env_path)
         self.docker.running = True
-        with mock.patch.object(mm, "_probe_ok", lambda spec, timeout=2.0: False):
-            for _ in range(mm.HEALTH_FAIL_LIMIT):
-                mm.supervise_once()
+        self.probe_result = (False, "http 503 from the declared probe")
+        for _ in range(mm.HEALTH_FAIL_LIMIT):
+            mm.supervise_once()
         self.assert_state("demo", BROKEN)
-        self.assertIn("health checks", self.row("demo")["error"])
+        # The broken row explains itself with the last probe verdict (M9 P4).
+        self.assertIn("http 503", self.row("demo")["error"])
         # Broken rows are not auto-healed.
         before = len(self.docker.calls)
         mm.supervise_once()

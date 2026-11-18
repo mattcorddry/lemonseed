@@ -23,6 +23,7 @@ from typing import Any, Optional
 
 import chat_ready
 import hardware
+import health
 import image_pins
 from data_services import (
     LEMON_NETWORK,
@@ -62,8 +63,13 @@ GUARDRAIL_CATEGORY = "harmful_child_safety"
 # introduces no new host port and no new exposure.
 LEMOND_BASE = "http://host.docker.internal/_lemonseed/lemond/v1"
 
-SUPERVISE_INTERVAL_SEC = 10
+SUPERVISE_INTERVAL_SEC = 15
+LITELLM_GRACE_SEC = 90
 PULL_TIMEOUT_SEC_LITELLM = 900
+
+# Deep-probe accounting (M9 P4): readiness is the health contract for the
+# snapshot, and 4 contiguous failures past grace recreate a wedged proxy.
+_litellm_health = health.Tracker()
 
 _key_lock = threading.Lock()
 
@@ -237,6 +243,11 @@ _lock = threading.Lock()
 
 def _snapshot_locked() -> dict[str, Any]:
     snap = dict(_state[LITELLM_CONTAINER])
+    # The gate: never claim healthy while the readiness probe fails (M9 P4).
+    hsnap = _litellm_health.snapshot()
+    if hsnap["state"] == "unhealthy":
+        snap["state"] = "unhealthy"
+    snap["health"] = hsnap
     snap["container"] = LITELLM_CONTAINER
     snap["endpoint"] = LITELLM_BASE
     return snap
@@ -301,6 +312,7 @@ def _start_litellm() -> None:
     state["image"] = ref
     state.pop("error", None)
     _set_applied_hash(config_fingerprint())
+    _litellm_health.mark_starting()
     print("litellm supervise: proxy container started", flush=True)
 
 
@@ -360,19 +372,42 @@ def supervise_litellm_once() -> None:
 
         running = _container_running()
         if running and _port_open():
-            state["state"] = "ready"
-            state.pop("error", None)
+            # Deep check past the socket (M9 P4): LiteLLM's own readiness
+            # route reports its database wiring; a 503 here is real.
+            ok, detail = health.probe_http(
+                f"http://127.0.0.1:{LITELLM_PORT}/health/readiness",
+            )
+            _litellm_health.record(ok, detail)
+            snap = _litellm_health.snapshot()
+            since = float(state.get("since") or 0.0)
+            within_grace = time.monotonic() - since < LITELLM_GRACE_SEC
+            if ok:
+                state["state"] = "ready"
+                state.pop("error", None)
+                return
+            if not within_grace and snap["failed_ticks"] >= health.DEFAULT_FAIL_LIMIT:
+                print(
+                    "litellm supervise: readiness keeps failing ("
+                    f"{snap['failed_ticks']} ticks); recreating",
+                    flush=True,
+                )
+                _docker(["rm", "-f", LITELLM_CONTAINER], timeout=60)
+            else:
+                state["state"] = "unhealthy"
+                state["error"] = detail or "readiness probe failing"
             return
         if running:
             # Tolerate the first minutes of a cold start (TCG, first boot).
             since = float(state.get("since") or 0.0)
-            if time.monotonic() - since < 90:
+            if time.monotonic() - since < LITELLM_GRACE_SEC:
                 state["state"] = "starting"
                 return
             print("litellm supervise: not serving after grace; recreating", flush=True)
             _docker(["rm", "-f", LITELLM_CONTAINER], timeout=60)
         if _container_exists():
-            if _docker(["start", LITELLM_CONTAINER], timeout=120).returncode != 0:
+            if _docker(["start", LITELLM_CONTAINER], timeout=120).returncode == 0:
+                _litellm_health.mark_starting()
+            else:
                 _docker(["rm", "-f", LITELLM_CONTAINER], timeout=60)
                 _start_litellm()
         else:

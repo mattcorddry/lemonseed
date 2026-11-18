@@ -42,6 +42,7 @@ from typing import Any, Callable, Optional
 
 import audit
 import db
+import health
 import image_pins
 import modules_catalog
 from data_services import (
@@ -61,7 +62,7 @@ ENABLED = "enabled"
 BROKEN = "broken"
 
 DATA_ROOT = Path("/var/lib/lemonseed/modules")
-SUPERVISE_INTERVAL_SEC = 10
+SUPERVISE_INTERVAL_SEC = 15
 # Contiguous failing ticks before the supervisor stops trying and marks the
 # module broken (the same heal budget Open WebUI's supervisor uses).
 HEALTH_FAIL_LIMIT = 5
@@ -177,25 +178,69 @@ def probe_url(spec: dict[str, Any]) -> Optional[str]:
     return f"http://127.0.0.1:{probe['port']}{probe.get('path', '/')}"
 
 
-def _probe_ok(spec: dict[str, Any], timeout: float = 2.0) -> bool:
+def _image_has_healthcheck(ref: str) -> bool:
+    """True iff the image ships a Docker HEALTHCHECK we can lean on (M9 P4)."""
+    result = _docker(["inspect", "-f", "{{.Config.Healthcheck}}", ref], timeout=15)
+    out = (result.stdout or "").strip()
+    return result.returncode == 0 and bool(out) and out != "<no value>"
+
+
+def _deep_probe(
+    spec: dict[str, Any], name: Optional[str] = None
+) -> tuple[bool, str]:
+    """One trustworthy health answer for a module container — never TCP.
+
+    Preference order per the P4 rule ("required unless the container defines
+    one we can use; do not guess"): the image's own HEALTHCHECK verdict when
+    it publishes one, else the spec's declared HTTP probe. A spec with neither
+    is refused at bring-up (_require_health_signal), so this never has to
+    pretend a bare docker run proves health.
+    """
+    if name:
+        verdict = health.probe_docker_health(name)
+        if verdict is not None:
+            return (verdict, "" if verdict else "container HEALTHCHECK reports unhealthy")
     url = probe_url(spec)
     if url is None:
-        return True  # a module with no probe is "running" once docker says so
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
-            return 200 <= response.status < 400
-    except (urllib.error.URLError, OSError, ValueError):
-        return False
+        return False, (
+            "module declares no health signal: docker.probe or an image"
+            " HEALTHCHECK is required"
+        )
+    return health.probe_http(url)
 
 
-def _wait_probe(spec: dict[str, Any]) -> bool:
+def _probe_ok(spec: dict[str, Any], name: Optional[str] = None) -> bool:
+    ok, _detail = _deep_probe(spec, name)
+    return ok
+
+
+def _wait_probe(spec: dict[str, Any], name: Optional[str] = None) -> bool:
     budget = int(os.environ.get(READY_SECONDS, "240") or "240")
     deadline = time.monotonic() + max(10, budget)
     while time.monotonic() < deadline:
-        if _probe_ok(spec):
+        if _probe_ok(spec, name):
             return True
         time.sleep(2)
     return False
+
+
+def _require_health_signal(
+    module_id: str, spec: dict[str, Any], ref: str
+) -> Optional[tuple[str, str]]:
+    """The P4 rule at bring-up: a module must either declare docker.probe or
+    ship its own HEALTHCHECK. Called after the pull (the image is present),
+    before the container runs — a module we cannot health-check never starts.
+    Returns None when acceptable, else a ("fail", reason) pair."""
+    if probe_url(spec) is not None:
+        return None
+    if _image_has_healthcheck(ref):
+        return None
+    return (
+        "fail",
+        f"{module_id}: no health signal — the module spec must declare"
+        " docker.probe (port + path), or its image must define a Docker"
+        " HEALTHCHECK. Bare TCP checks are not accepted.",
+    )
 
 
 def _stop_container(name: str) -> None:
@@ -325,6 +370,18 @@ _op_progress: Optional[dict[str, str]] = None
 _op_progress_lock = threading.Lock()
 _health_fail_count: dict[str, int] = {}
 _health_fail_error: dict[str, str] = {}
+
+# Per-module deep-probe accounting (M9 P4): surfaced in the snapshot so
+# /api/modules can never claim healthy while a live check fails.
+_health_trackers: dict[str, health.Tracker] = {}
+
+
+def _module_tracker(module_id: str) -> health.Tracker:
+    tracker = _health_trackers.get(module_id)
+    if tracker is None:
+        tracker = health.Tracker()
+        _health_trackers[module_id] = tracker
+    return tracker
 _sup_worker: Optional[threading.Thread] = None
 
 
@@ -527,10 +584,15 @@ def _bring_up_fresh(
         return "fail", "Docker network 'lemon' unavailable"
     if _pull_step(module_id, spec, keep_state=keep_state) != "ok":
         return "wait", "waiting for the container registry"
+    gate = _require_health_signal(
+        module_id, spec, image_pins.tag_ref((spec.get("docker") or {}).get("image", ""))
+    )
+    if gate is not None:
+        return gate
     ok, detail = _run_container(spec, env_path)
     if not ok:
         return "fail", f"could not start the module container: {detail}"
-    if not _wait_probe(spec):
+    if not _wait_probe(spec, _container_name(module_id)):
         return "fail", "the module's health probe did not pass"
     ok, detail = run_hook(module_id, "start", spec)
     if not ok:
@@ -966,7 +1028,13 @@ def _supervise_row(row: dict[str, Any]) -> None:
     fingerprint = run_fingerprint(spec, env_path)
     drifted = bool(row.get("run_hash")) and row["run_hash"] != fingerprint
 
-    if not _container_running(name):
+    running = _container_running(name)
+    tracker = _module_tracker(module_id)
+    if not running:
+        # The process is down right now — an honest verdict regardless of
+        # whether the bring-up below fixes it before the next tick reports.
+        tracker.note_unhealthy(f"container {name} is not running")
+    if not running:
         if drifted:
             # The env/image already moved: reviving the old container would
             # only serve stale settings before another recreate.
@@ -988,7 +1056,9 @@ def _supervise_row(row: dict[str, Any]) -> None:
             _count_health_failure(module_id, detail)
         return
 
-    if _probe_ok(spec):
+    ok, detail = _deep_probe(spec, name)
+    tracker.record(ok, detail)
+    if ok:
         _clear_health_fail(module_id)
         if drifted:
             print(
@@ -998,7 +1068,7 @@ def _supervise_row(row: dict[str, Any]) -> None:
             _recreate(module_id, spec, env_path)
         return
 
-    _count_health_failure(module_id)
+    _count_health_failure(module_id, detail)
 
 
 def _clear_health_fail(module_id: str) -> None:
@@ -1053,7 +1123,7 @@ def _bring_up(module_id: str, spec: dict[str, Any], env_path: Path) -> tuple[str
     name = _container_name(module_id)
     if _container_exists(name) and _docker(["start", name], timeout=120).returncode == 0:
         run_hook(module_id, "start", spec)
-        if not _wait_probe(spec):
+        if not _wait_probe(spec, name):
             return "fail", "the module's health probe did not pass"
         _record_enabled(module_id, spec, env_path)
         return "ok", ""
@@ -1249,6 +1319,7 @@ def snapshot() -> dict[str, Any]:
                 "state": row["state"],
                 "version": row["version"],
                 "error": row["error"],
+                "health": _module_tracker(row["id"]).snapshot(),
             }
             for row in rows
         ],
