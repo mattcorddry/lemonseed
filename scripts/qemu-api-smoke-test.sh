@@ -359,7 +359,7 @@ for arg in \
   -cpu host \
   -serial "${SERIAL}" \
   -no-reboot \
-  -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${HOST_PORT}-:80" \
+  -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${HOST_PORT}-:80,hostfwd=tcp:127.0.0.1:${QEMU_SSH_HOST_PORT:-19222}-:22" \
   -device virtio-net-pci,netdev=net0 \
   -kernel "${VMLINUZ}" \
   -initrd "${INITRD}" \
@@ -2911,6 +2911,93 @@ dt = datetime.fromisoformat(d["result"]["datetime"])
 skew = abs(dt.timestamp() - (before_s + after_s) / 2)
 assert skew < 300, f"tool clock {dt} is {skew:.0f}s off the appliance wall clock"
 print("OK: MCP tool used through LiteLLM; gateway clock %ds from ours" % round(skew))
+'
+
+  echo "==> M9 P4 health: a stopped data service flips /api/data to unhealthy and recovers"
+  # The P4 gate, end to end on the appliance: stop Postgres inside the guest
+  # (via the test image's SSH — production has no such channel), then assert:
+  #   1. /api/data reports postgres health.state=ready before the fault,
+  #   2. within the fail budget (4 x 15 s ticks + slack) it reads unhealthy
+  #      with a last_error and a checked_at timestamp, and the top-level state
+  #      agrees — no status field may claim healthy while a live check fails,
+  #   3. after docker start the tracker returns to ready.
+  smoke_ssh() {
+    ssh -i "${ROOT}/keys/qemu/smoke-ssh-ed25519" \
+      -p "${QEMU_SSH_HOST_PORT:-19222}" \
+      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=5 -o LogLevel=ERROR root@127.0.0.1 "$@"
+  }
+  ssh_up=""
+  for _ in $(seq 1 12); do
+    if smoke_ssh true 2>/dev/null; then ssh_up=1; break; fi
+    sleep 10
+  done
+  [[ -n "${ssh_up}" ]] || { echo "smoke SSH never came up (test image only)" >&2; exit 1; }
+
+  api_data() {
+    curl -fsS --max-time 5 -b "${COOKIE_JAR}" \
+      --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
+      "http://${AUTH_HOST}:${HOST_PORT}/api/data"
+  }
+  api_data | python3 -c '
+import json, sys
+d = json.load(sys.stdin)["postgres"]
+assert d["health"]["state"] == "ready", d.get("health")
+print("OK: /api/data postgres health=ready before the fault")
+'
+
+  smoke_ssh docker stop lemonseed-postgres >/dev/null
+
+  unhealthy=""
+  p4_deadline=$(( SECONDS + 300 ))
+  while (( SECONDS < p4_deadline )); do
+    if api_data 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)["postgres"]
+h = d["health"]
+assert h["state"] == "unhealthy", f"health={h}"
+assert (h.get("last_error") or "") != "", f"no last_error: {h}"
+assert h.get("checked_at"), f"no checked_at: {h}"
+'; then unhealthy=1; break; fi
+    sleep 10
+  done
+  if [[ -z "${unhealthy}" ]]; then
+    echo "M9 P4: postgres never went unhealthy within the fail budget" >&2
+    api_data | head -c 400 >&2 || true; echo "" >&2
+    exit 1
+  fi
+  echo "OK: /api/data flipped to unhealthy with last_error + checked_at"
+
+  smoke_ssh docker start lemonseed-postgres >/dev/null
+  recovered=""
+  p4_deadline=$(( SECONDS + 240 ))
+  while (( SECONDS < p4_deadline )); do
+    if api_data 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)["postgres"]
+assert d["health"]["state"] == "ready", f"health={d['"'"'health'"'"']}"
+'; then recovered=1; break; fi
+    sleep 10
+  done
+  [[ -n "${recovered}" ]] || {
+    echo "M9 P4: postgres health never recovered after start" >&2
+    api_data | head -c 400 >&2 || true; echo "" >&2
+    exit 1
+  }
+  echo "OK: postgres health recovered to ready after the restart"
+
+  echo "==> M9 P4 telemetry: the toolbar bars carry GPU/net fields"
+  curl -fsS --max-time 5 -b "${COOKIE_JAR}" \
+    --resolve "${AUTH_HOST}:${HOST_PORT}:127.0.0.1" \
+    "http://${AUTH_HOST}:${HOST_PORT}/api/system" | python3 -c '
+import json, sys
+t = (json.load(sys.stdin).get("telemetry") or {})
+assert isinstance(t.get("load_pct"), (int, float)), t
+for key in ("gpu_pct", "net_pct", "storage_pct"):
+    assert key in t, f"telemetry missing {key}: {t}"
+# No GPU in the QEMU profile: the field must be explicitly absent-healthy.
+assert t["gpu_pct"] is None, t.get("gpu_pct")
+print("OK: telemetry carries load/gpu/net/storage; gpu=absent (qemu), net=%s" % t.get("net_pct"))
 '
 
   echo "==> M6.5 e2e GC: fill the model volume, pull a second model, expect eviction"

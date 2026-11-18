@@ -138,6 +138,25 @@ in
   services.getty.autologinUser = "root";
   users.users.root.hashedPassword = lib.mkForce ""; # empty password in qemu only
 
+  # M9 P4: the smoke needs to inject faults into the guest (stop a data
+  # service and watch the CP's live health flip) — there is no product API
+  # for that, and there must not be. The test image therefore ships an SSH
+  # server whose only key is this repo's tracked throwaway pair
+  # (keys/qemu/smoke-ssh-ed25519); production images never see this module.
+  services.openssh = {
+    enable = true;
+    settings = {
+      PermitRootLogin = "prohibit-password";
+      PasswordAuthentication = false;
+    };
+  };
+  users.users.root.openssh.authorizedKeys.keys = [
+    (lib.fileContents ../../keys/qemu/smoke-ssh-ed25519.pub)
+  ];
+  # QEMU user-net reaches the guest directly; NixOS's default deny-all
+  # firewall would drop the forwarded port.
+  networking.firewall.allowedTCPPorts = [ 22 ];
+
   # Console logging for the smoke-test serial log (see journaldConf).
   environment.etc."systemd/journald.conf.d/lemonseed-console.conf".source = journaldConf;
 
