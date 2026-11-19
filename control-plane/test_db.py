@@ -439,9 +439,11 @@ class OwuiConfigResetTests(unittest.TestCase):
 
 
 class DataServicesTests(unittest.TestCase):
-    @mock.patch.object(data_services, "valkey_ready", return_value=True)
+    @mock.patch.object(data_services._valkey_health, "snapshot")
     @mock.patch.object(data_services, "postgres_snapshot", return_value={"state": "ready"})
     def test_data_snapshot(self, _pg: mock.Mock, _vk: mock.Mock) -> None:
+        _vk.return_value = {"state": "ready", "last_error": None,
+                            "checked_at": None, "failed_ticks": 0}
         snap = data_services.data_snapshot()
         self.assertEqual(snap["postgres"]["state"], "ready")
         self.assertEqual(snap["valkey"]["state"], "ready")
@@ -800,9 +802,10 @@ class DataSuperviseTests(unittest.TestCase):
             [data_services.POSTGRES_CONTAINER, data_services.VALKEY_CONTAINER],
         )
 
-    @mock.patch.object(data_services, "_port_open", return_value=True)
-    @mock.patch.object(data_services, "pg_isready", return_value=True)
-    def test_snapshot_ready_state(self, _ready: mock.Mock, _port: mock.Mock) -> None:
+    @mock.patch.object(data_services._pg_health, "snapshot")
+    def test_snapshot_ready_state(self, _ready: mock.Mock) -> None:
+        _ready.return_value = {"state": "ready", "last_error": None,
+                               "checked_at": None, "failed_ticks": 0}
         data_services._containers[data_services.POSTGRES_CONTAINER] = {
             "state": "ready",
         }
@@ -810,9 +813,12 @@ class DataSuperviseTests(unittest.TestCase):
         self.assertEqual(snap["state"], "ready")
         self.assertEqual(snap["container"], data_services.POSTGRES_CONTAINER)
 
-    @mock.patch.object(data_services, "_port_open", return_value=False)
-    @mock.patch.object(data_services, "pg_isready", return_value=False)
-    def test_snapshot_keeps_error_while_not_ready(self, _ready: mock.Mock, _port: mock.Mock) -> None:
+    @mock.patch.object(data_services._pg_health, "snapshot")
+    def test_snapshot_keeps_error_while_not_ready(self, _ready: mock.Mock) -> None:
+        # The tracker has not reached a verdict yet; the dict's own state
+        # (e.g. an image pull that is still failing) must survive.
+        _ready.return_value = {"state": "starting", "last_error": None,
+                               "checked_at": None, "failed_ticks": 0}
         data_services._containers[data_services.POSTGRES_CONTAINER] = {
             "state": "waiting",
             "error": "Cannot reach the container registry",
@@ -821,9 +827,13 @@ class DataSuperviseTests(unittest.TestCase):
         self.assertEqual(snap["state"], "waiting")
         self.assertEqual(snap["error"], "Cannot reach the container registry")
 
-    @mock.patch.object(data_services, "_port_open", return_value=True)
-    @mock.patch.object(data_services, "pg_isready", return_value=True)
-    def test_data_snapshot_shape(self, _ready: mock.Mock, _port: mock.Mock) -> None:
+    @mock.patch.object(data_services._pg_health, "snapshot")
+    @mock.patch.object(data_services._valkey_health, "snapshot")
+    def test_data_snapshot_shape(self, _vready: mock.Mock, _pread: mock.Mock) -> None:
+        ready = {"state": "ready", "last_error": None, "checked_at": None,
+                 "failed_ticks": 0}
+        _vready.return_value = dict(ready)
+        _pread.return_value = dict(ready)
         snap = data_services.data_snapshot()
         self.assertEqual(set(snap), {"postgres", "valkey", "litellm", "provisioning"})
         self.assertEqual(snap["postgres"]["state"], "ready")

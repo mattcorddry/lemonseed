@@ -75,12 +75,15 @@ def valkey_ready() -> bool:
 
 def postgres_snapshot() -> dict[str, Any]:
     snap = dict(_containers.get(POSTGRES_CONTAINER) or {})
-    ready = pg_isready()
     hsnap = _pg_health.snapshot()
+    # No live probe here on purpose: the supervisor deep-probes every tick
+    # and this endpoint is read at portal polling frequency — running a
+    # subprocess per request put a multi-second floor under /api/data for
+    # as long as Postgres stayed wedged. The tracker's verdict is already
+    # at most one tick behind reality.
     if hsnap["state"] == "unhealthy":
-        # The gate: /api/data never claims healthy while a live check fails.
         snap["state"] = "unhealthy"
-    elif ready:
+    elif hsnap["state"] == "ready":
         snap["state"] = "ready"
     else:
         snap["state"] = snap.get("state") or "starting"
@@ -92,11 +95,11 @@ def postgres_snapshot() -> dict[str, Any]:
 
 def valkey_snapshot() -> dict[str, Any]:
     snap = dict(_containers.get(VALKEY_CONTAINER) or {})
-    ready = valkey_ready()
     hsnap = _valkey_health.snapshot()
+    # Same rationale as postgres_snapshot: no per-request probe.
     if hsnap["state"] == "unhealthy":
         snap["state"] = "unhealthy"
-    elif ready:
+    elif hsnap["state"] == "ready":
         snap["state"] = "ready"
     else:
         snap["state"] = snap.get("state") or "starting"
