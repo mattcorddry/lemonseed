@@ -119,6 +119,13 @@ def _connect(database: str = "postgres"):
         # completes no handshake: without this the supervisor thread blocks
         # forever inside its own probe and health updates freeze silently.
         connect_timeout=int(os.environ.get("LEMONSEED_PG_CONNECT_TIMEOUT", "3")),
+        # Dead-peer detection for connections that ARE established when the
+        # backend wedges mid-transaction: a query must surface as an error in
+        # seconds, not hang the request thread.
+        keepalives=1,
+        keepalives_idle=5,
+        keepalives_interval=2,
+        keepalives_count=3,
     )
     conn.autocommit = True
     return conn

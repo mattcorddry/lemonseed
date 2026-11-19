@@ -260,8 +260,10 @@ def litellm_ready() -> bool:
 
 
 def litellm_snapshot() -> dict[str, Any]:
-    with _lock:
-        return _snapshot_locked()
+    # Deliberately lock-free: /api/data must never block behind the
+    # supervisor's docker work. The single writer is the worker thread; a
+    # torn read shows at most one stale field for an instant.
+    return _snapshot_locked()
 
 
 def _container_running() -> bool:

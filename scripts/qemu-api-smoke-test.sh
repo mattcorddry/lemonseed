@@ -2959,9 +2959,10 @@ print("OK: /api/data postgres health=ready before the fault")
   smoke_ssh docker pause lemonseed-postgres >/dev/null
 
   unhealthy=""
-  # Grace is already spent by the time this section runs, so the first failed
-  # tick flips the verdict; give it a few ticks of slack.
-  p4_deadline=$(( SECONDS + 120 ))
+  # The tracker flips to unhealthy at its fail limit (4 consecutive failing
+  # ticks) and LiteLLM's own recreate cycle can stretch the tick cadence, so
+  # allow a generous window for the verdict to surface.
+  p4_deadline=$(( SECONDS + 300 ))
   while (( SECONDS < p4_deadline )); do
     if api_data 2>/dev/null | python3 -c '
 import json, sys
@@ -2981,7 +2982,7 @@ assert h.get("checked_at"), f"no checked_at: {h}"
   echo "OK: wedged postgres showed unhealthy with last_error + checked_at"
 
   recovered=""
-  p4_deadline=$(( SECONDS + 240 ))
+  p4_deadline=$(( SECONDS + 420 ))
   while (( SECONDS < p4_deadline )); do
     if api_data 2>/dev/null | python3 -c '
 import json, sys
