@@ -115,6 +115,10 @@ def _connect(database: str = "postgres"):
         user=user,
         password=password,
         dbname=database,
+        # A wedged backend (paused/frozen process behind an accepting proxy)
+        # completes no handshake: without this the supervisor thread blocks
+        # forever inside its own probe and health updates freeze silently.
+        connect_timeout=int(os.environ.get("LEMONSEED_PG_CONNECT_TIMEOUT", "3")),
     )
     conn.autocommit = True
     return conn

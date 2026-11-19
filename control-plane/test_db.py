@@ -32,6 +32,36 @@ class DbProvisioningTests(unittest.TestCase):
         finally:
             path.unlink()
 
+    def test_connect_passes_a_finite_timeout(self) -> None:
+        # The supervisor probes through this connection; a wedged backend that
+        # completes no handshake must fail the probe, not block its thread
+        # forever (health updates would otherwise freeze silently).
+        sent: dict = {}
+
+        class FakePsycopg2:
+            def connect(self, **kwargs):
+                sent.update(kwargs)
+
+                class Conn:
+                    autocommit = False
+
+                return Conn()
+
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+            tmp.write("POSTGRES_PASSWORD=secret\n")
+            env_path = Path(tmp.name)
+        try:
+            with mock.patch.dict("sys.modules", {"psycopg2": FakePsycopg2()}), \
+                 mock.patch.object(db, "POSTGRES_ENV", env_path):
+                conn = db._connect("postgres")
+            self.assertTrue(conn.autocommit)
+            self.assertEqual(sent["dbname"], "postgres")
+            timeout = sent.get("connect_timeout")
+            self.assertIsInstance(timeout, int)
+            self.assertGreater(timeout, 0)  # type: ignore[arg-type]
+        finally:
+            env_path.unlink()
+
     @mock.patch.object(db, "pg_isready", return_value=False)
     @mock.patch.object(db, "postgres_admin_dsn", return_value="postgresql://u:p@127.0.0.1/postgres")
     def test_provision_waiting_for_postgres(self, _dsn: mock.Mock, _ready: mock.Mock) -> None:
