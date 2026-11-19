@@ -237,6 +237,18 @@ class TrackerTests(unittest.TestCase):
         self.assertTrue(snap["checked_at"])
         self.assertEqual(snap["failed_ticks"], 4)
 
+    def test_a_failure_right_after_ready_is_visible_immediately(self):
+        # The ready streak's masking (failed_ticks only counts while not
+        # ready) must not hide early failures of an incident: one failed
+        # probe drops the state out of "ready" at once.
+        t = health.Tracker()
+        t.record(True)
+        self.assertEqual(t.snapshot()["state"], "ready")
+        t.record(False, "pg_isreadY: no response")
+        snap = t.snapshot()
+        self.assertEqual(snap["state"], "starting")
+        self.assertEqual(snap["failed_ticks"], 1)
+
     def test_one_success_recovers(self):
         t = health.Tracker(fail_limit=2)
         t.record(False, "x")

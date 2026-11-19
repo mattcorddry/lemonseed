@@ -194,8 +194,14 @@ class Tracker:
         self._fails += 1
         if detail:
             self._last_error = str(detail)[:500]
-        if self._fails >= self._fail_limit or self._state == "unhealthy":
-            self._state = "unhealthy"
+        if self._state != "unhealthy":
+            # A failure ends the ready streak immediately. Keeping "ready"
+            # here hid the first failures behind snapshot()'s masking (a
+            # wedged service reported itself healthy with a stale error for
+            # fail_limit ticks) — "starting" is honest: not confirmed well.
+            self._state = (
+                "unhealthy" if self._fails >= self._fail_limit else "starting"
+            )
 
     def note_unhealthy(self, detail: str) -> None:
         """Forced verdict for a service the supervisor knows is down (a
