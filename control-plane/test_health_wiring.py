@@ -74,11 +74,20 @@ class DataServicesWiringTests(unittest.TestCase):
         ))
 
     def test_deep_failures_past_limit_and_grace_recreate(self) -> None:
-        # Past cold-start grace: a wedged daemon gets its container recreated.
+        # Past cold-start grace a wedged daemon is recreated — on the pass
+        # AFTER its verdict surfaced (two-phase healing: the unhealthy state
+        # must be observable in /api/data before anything restarts).
         ds._containers[ds.POSTGRES_CONTAINER]["since"] = time.monotonic() - 10_000
         calls: list[list[str]] = []
         for _ in range(4):
             calls = self._tick(deep_ok=False)
+        self.assertFalse(any(
+            c[:2] == ["rm", "-f"] and ds.POSTGRES_CONTAINER in c for c in calls
+        ))
+        snap = ds.postgres_snapshot()
+        self.assertEqual(snap["health"]["state"], "unhealthy")
+        # The next pass heals it.
+        calls = self._tick(deep_ok=False)
         self.assertTrue(any(
             c[:2] == ["rm", "-f"] and ds.POSTGRES_CONTAINER in c for c in calls
         ))
@@ -108,11 +117,19 @@ class DataServicesWiringTests(unittest.TestCase):
             mock.patch.object(ds, "_container_running", return_value=False),
             mock.patch.object(ds, "_container_exists", return_value=True),
         ):
+            # First pass: the outage surfaces (unhealthy + last_error), no heal.
+            ds.supervise_data_once()
+            self.assertEqual(
+                ds._pg_health.snapshot()["state"], "unhealthy"
+            )
+            self.assertIn("not running", self.pg.snapshot()["last_error"] or "")
+            self.assertFalse(any(c[0] == "start" for c in calls))
+            # Second pass heals: a start is attempted and accounting resets.
             ds.supervise_data_once()
         self.assertEqual(
             ds._pg_health.snapshot()["state"], "starting"
-        )  # a start was attempted; the unhealthy verdict described the dead proc
-        self.assertIn("not running", self.pg.snapshot()["last_error"] or "")
+        )  # the unhealthy verdict described the dead proc, now restarted
+        self.assertTrue(any(c[0] == "start" for c in calls))
 
 
 class LiteLLMWiringTests(unittest.TestCase):

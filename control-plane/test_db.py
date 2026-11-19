@@ -476,6 +476,85 @@ class DataSuperviseTests(unittest.TestCase):
 
     @mock.patch.object(data_services, "_port_open", return_value=True)
     @mock.patch.object(data_services, "_container_running", return_value=True)
+    def test_wedged_deep_probe_surfaces_then_heals(self, _running: mock.Mock, _port: mock.Mock) -> None:
+        # M9 P4 two-phase healing: the failing service is UNHEALTHY on the
+        # surface (with last_error) for at least one tick before the recreate
+        # fires — a same-pass heal would erase the verdict before any client
+        # could observe it.
+        import health as health_mod
+
+        data_services._containers[data_services.POSTGRES_CONTAINER] = {
+            "state": "ready",
+            "since": time.monotonic() - data_services.HEALTH_GRACE_SEC - 1,
+        }
+        tracker = health_mod.Tracker()
+        probe = mock.Mock(return_value=(False, "pg_isready: no response"))
+        with mock.patch.object(data_services, "_docker") as m_docker, \
+             mock.patch.object(data_services, "_start_container") as m_start:
+            for _ in range(health_mod.DEFAULT_FAIL_LIMIT):
+                data_services._supervise_one(
+                    data_services.POSTGRES_CONTAINER,
+                    data_services.POSTGRES_IMAGE_KEY,
+                    "postgres", 5432, lambda _ref: ["run"],
+                    tracker=tracker, deep_probe=probe,
+                )
+                m_docker.assert_not_called()  # no recreate before the verdict surfaced
+            self.assertEqual(
+                data_services._containers[data_services.POSTGRES_CONTAINER]["state"],
+                "unhealthy",
+            )
+            self.assertEqual(tracker.snapshot()["failed_ticks"], health_mod.DEFAULT_FAIL_LIMIT)
+
+            # The next pass heals: force-remove + start, accounting reset.
+            data_services._supervise_one(
+                data_services.POSTGRES_CONTAINER,
+                data_services.POSTGRES_IMAGE_KEY,
+                "postgres", 5432, lambda _ref: ["run"],
+                tracker=tracker, deep_probe=probe,
+            )
+        self.assertTrue(
+            any(
+                call.args and call.args[0] == ["rm", "-f", data_services.POSTGRES_CONTAINER]
+                for call in m_docker.call_args_list
+            )
+        )
+        m_start.assert_called_once()
+        self.assertEqual(tracker.snapshot()["state"], "starting")
+
+    @mock.patch.object(data_services, "_port_open", return_value=True)
+    @mock.patch.object(data_services, "_container_running", return_value=False)
+    @mock.patch.object(data_services, "_container_exists", return_value=True)
+    def test_stopped_container_surfaces_verdict_then_heals(self, _exists: mock.Mock, _running: mock.Mock, _port: mock.Mock) -> None:
+        import health as health_mod
+
+        data_services._containers[data_services.POSTGRES_CONTAINER] = {"state": "ready"}
+        tracker = health_mod.Tracker()
+        with mock.patch.object(data_services, "_docker") as m_docker:
+            # First sighting: the outage is reported; nothing is healed yet.
+            data_services._supervise_one(
+                data_services.POSTGRES_CONTAINER,
+                data_services.POSTGRES_IMAGE_KEY,
+                "postgres", 5432, lambda _ref: ["run"], tracker=tracker,
+            )
+            m_docker.assert_not_called()
+            self.assertEqual(tracker.snapshot()["state"], "unhealthy")
+            self.assertIn("not running", tracker.snapshot()["last_error"] or "")
+
+            # Second sighting heals the service.
+            data_services._supervise_one(
+                data_services.POSTGRES_CONTAINER,
+                data_services.POSTGRES_IMAGE_KEY,
+                "postgres", 5432, lambda _ref: ["run"], tracker=tracker,
+            )
+        self.assertTrue(
+            any(
+                call.args and call.args[0] == ["start", data_services.POSTGRES_CONTAINER]
+                for call in m_docker.call_args_list
+            )
+        )
+
+    @mock.patch.object(data_services, "_port_open", return_value=True)
+    @mock.patch.object(data_services, "_container_running", return_value=True)
     def test_ready_container_untouched(self, _running: mock.Mock, _port: mock.Mock) -> None:
         with mock.patch.object(data_services, "_docker") as m_docker:
             data_services._supervise_one(

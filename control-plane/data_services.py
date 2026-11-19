@@ -423,38 +423,63 @@ def _supervise_one(
     tracker: Optional[health.Tracker] = None,
     deep_probe: Optional[Callable[[], tuple[bool, str]]] = None,
 ) -> None:
+    """Two-phase healing (M9 P4): a failing service first SURFACES its verdict
+    in /api/data for one tick — unhealthy with the probe's last_error — and is
+    healed on the following pass. Healing inside the same pass that detects
+    the failure erases the verdict before any client can observe it, so the
+    panel would only ever show 'starting' during an incident."""
     state = _containers[name]
+    heal_pending = bool(state.get("heal_pending"))
     running = _container_running(name)
-    if not running and tracker is not None:
-        # The process is down right now — say so regardless of what happens
-        # next (the start below may fix it before the next tick reports).
-        tracker.note_unhealthy(f"container {name} is not running")
-    if running and _port_open("127.0.0.1", port, timeout=2.0):
+    if not running:
+        # The process is down right now. First sighting: surface it and wait.
+        if tracker is not None and not heal_pending:
+            tracker.note_unhealthy(f"container {name} is not running")
+            state["state"] = "unhealthy"
+            state["error"] = f"container {name} is not running"
+            state["heal_pending"] = True
+            return
+    elif _port_open("127.0.0.1", port, timeout=2.0):
         # Serving TCP — now ask at the service's own protocol (M9 P4). A deep
-        # failure here means a wedged daemon that still accepts connections:
-        # after its fail limit *and* past cold-start grace, recreate it.
+        # failure here means a wedged daemon that still accepts connections.
         ok, detail = deep_probe() if deep_probe else (True, "")
         if tracker is not None:
             tracker.record(ok, detail)
         if ok:
             state["state"] = "ready"
             state.pop("error", None)
+            state.pop("heal_pending", None)
             return
         since = float(state.get("since") or 0.0)
         within_grace = time.monotonic() - since < HEALTH_GRACE_SEC
         snap = tracker.snapshot() if tracker else {"failed_ticks": 0}
-        if not within_grace and snap["failed_ticks"] >= health.DEFAULT_FAIL_LIMIT:
+        at_limit = (
+            not within_grace
+            and snap["failed_ticks"] >= health.DEFAULT_FAIL_LIMIT
+        )
+        state["state"] = "unhealthy"
+        state["error"] = detail or f"{label} is not answering its health probe"
+        if not at_limit:
+            return
+        if heal_pending:
+            # The verdict had a full tick on the surface; heal it now.
             print(
                 f"data supervise: {label} fails its deep probe"
                 f" ({snap['failed_ticks']} ticks); recreating",
                 flush=True,
             )
+            state.pop("heal_pending", None)
             _docker(["rm", "-f", name], timeout=60)
+            # fall through to the (re)start path below
         else:
-            state["state"] = "unhealthy"
-            state["error"] = detail or f"{label} is not answering its health probe"
-        return
-    if running:
+            print(
+                f"data supervise: {label} fails its deep probe"
+                f" ({snap['failed_ticks']} ticks); reporting, heal next tick",
+                flush=True,
+            )
+            state["heal_pending"] = True
+            return
+    elif running:
         # Tolerate the first minutes of a cold start (Postgres init, TCG).
         # Deliberately unrecorded: "some daemons are slow" is not unhealthy.
         since = float(state.get("since") or 0.0)
@@ -467,7 +492,7 @@ def _supervise_one(
     if not _container_exists(name):
         started = _start_container(name, image_key, label, run_args)
     else:
-        # Stopped or exited container: start it again.
+        # Stopped, exited, or just force-removed for healing: start it again.
         if _docker(["start", name], timeout=120).returncode != 0:
             _docker(["rm", "-f", name], timeout=60)
             started = _start_container(name, image_key, label, run_args)
@@ -477,6 +502,7 @@ def _supervise_one(
         # A start attempt resets the accounting to an honest "starting": the
         # old unhealthy verdict described a process that no longer exists.
         tracker.mark_starting()
+        state.pop("heal_pending", None)
 
 
 def supervise_data_once() -> None:
