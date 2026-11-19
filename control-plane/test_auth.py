@@ -362,6 +362,7 @@ class SessionGenerationDbTests(unittest.TestCase):
         ]
         for patch in self._patches:
             patch.start()
+        auth._pg_last_fail_at = None
 
     def tearDown(self) -> None:
         for patch in self._patches:
@@ -380,11 +381,54 @@ class SessionGenerationDbTests(unittest.TestCase):
         with mock.patch.object(db, "cp_connect", return_value=conn):
             self.assertIsNone(auth.user_generation("matt"))
 
-    @mock.patch.object(db, "pg_isready", return_value=False)
-    def test_user_generation_is_none_when_pg_is_not_ready(self, _ready: mock.Mock) -> None:
-        with mock.patch.object(db, "cp_connect") as connect:
+    def test_user_generation_serves_the_cached_value_when_pg_never_answers(self) -> None:
+        # The M6.6 contract for the session store applies here too: a data
+        # service blip must not sign the household out at the edge. With a
+        # last-known generation cached, an unreachable Postgres serves it.
+        with (
+            mock.patch.object(db, "cp_connect", side_effect=RuntimeError("pg down")) as connect,
+            mock.patch.object(auth.sessions, "kv_get", return_value="7"),
+            mock.patch.object(auth.sessions, "kv_set", return_value=True) as kvset,
+        ):
+            self.assertEqual(auth.user_generation("matt"), 7)
+            # The retry cooldown keeps later requests off the dead backend.
+            self.assertEqual(auth.user_generation("matt"), 7)
+        connect.assert_called_once()
+        kvset.assert_not_called()
+
+    def test_user_generation_falls_back_to_the_cache_after_a_pg_error(self) -> None:
+        conn, cur = _conn_with_cur()
+        cur.execute.side_effect = RuntimeError("boom")
+        with (
+            mock.patch.object(db, "cp_connect", return_value=conn),
+            mock.patch.object(auth.sessions, "kv_get", side_effect=[None, "5"]),
+        ):
+            # No cache yet: fail closed exactly as before.
             self.assertIsNone(auth.user_generation("matt"))
-        connect.assert_not_called()
+            # The very next request within the cooldown is cheap and serves
+            # the last known value instead of paying another connect timeout.
+            self.assertEqual(auth.user_generation("matt"), 5)
+
+    def test_user_generation_refreshes_the_cache_on_a_successful_read(self) -> None:
+        conn, cur = _conn_with_cur()
+        cur.fetchone.return_value = (9,)
+        with (
+            mock.patch.object(db, "cp_connect", return_value=conn),
+            mock.patch.object(auth.sessions, "kv_set", return_value=True) as kvset,
+        ):
+            self.assertEqual(auth.user_generation("matt"), 9)
+        kvset.assert_called_once_with("gen:matt", "9", auth._GEN_CACHE_TTL_SEC)
+
+    def test_user_generation_fails_closed_with_no_cache_and_pg_down(self) -> None:
+        # No last-known generation (first boot, or the cache expired) and an
+        # unreachable Postgres: fail closed exactly as before — there is
+        # nothing trustworthy to serve.
+        with (
+            mock.patch.object(db, "cp_connect", side_effect=RuntimeError("pg down")) as connect,
+            mock.patch.object(auth.sessions, "kv_get", return_value=None),
+        ):
+            self.assertIsNone(auth.user_generation("matt"))
+        connect.assert_called_once()
 
     def test_user_generation_fails_closed_on_a_db_error(self) -> None:
         conn, cur = _conn_with_cur()

@@ -196,8 +196,39 @@ def drop_quietly(sid: str) -> bool:
         return False
 
 
+def kv_get(name: str) -> Optional[str]:
+    """Best-effort read of one boot-independent ``lemonseed:<name>`` value.
+
+    For caches whose loss is allowed (see :func:`kv_set`); a store outage
+    answers None rather than raising, so callers degrade instead of failing.
+    """
+    try:
+        raw = _get_client().get(f"lemonseed:{name}")
+    except Exception:  # noqa: BLE001 — best effort by design
+        _forget_client()
+        return None
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", "replace")
+    return raw if isinstance(raw, str) else None
+
+
+def kv_set(name: str, value: str, ttl: int) -> bool:
+    """Best-effort write with a TTL; False when the store is unreachable.
+
+    These keys are caches of facts Postgres owns. Losing one must degrade
+    gracefully (the caller falls back), never fail an operation.
+    """
+    try:
+        _get_client().set(f"lemonseed:{name}", value, ex=ttl)
+        return True
+    except Exception:  # noqa: BLE001 — best effort by design
+        _forget_client()
+        return False
+
+
 def ping() -> bool:
     """Whether the store is reachable. For status reporting only."""
+
     try:
         return bool(_get_client().ping())
     except Exception:  # noqa: BLE001 — reporting must not fail the caller

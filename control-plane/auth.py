@@ -402,30 +402,66 @@ def _as_int(value: Any, default: int = -1) -> int:
         return default
 
 
+_PG_RETRY_COOLDOWN_SEC = 10.0
+_GEN_CACHE_TTL_SEC = 60
+_pg_last_fail_at: Optional[float] = None
+
+
 def user_generation(username: str) -> Optional[int]:
     """Current session generation for an account; None if missing or disabled.
 
-    None fails closed: ``verify_session`` reads it as "no live session", so a
-    Postgres outage cannot leave stale sessions authenticating. The portal is
-    already unusable without the data plane, and login has always required it.
+    Postgres owns this fact, but it is read on **every** request (nginx's
+    auth_request path), so a data-service blip must not sign the household out:
+
+    * when Postgres answers, the fresh value is served and cached in Valkey
+      (``GEN_CACHE_TTL_SEC``);
+    * when Postgres is unreachable — bounded by ``connect_timeout``, with an
+      in-process retry cooldown so requests stay cheap — the **last known**
+      generation is served from that cache. Revocation during an outage lands
+      within the TTL instead of instantly;
+    * only a reachable Postgres may revoke: a missing or disabled account
+      clears the cache and returns None, exactly as before.
+
+    This mirrors the M6.6 contract for the session store itself: degraded data
+    services surface as status, never as silent sign-out.
     """
-    if not _pg_ready():
+    global _pg_last_fail_at
+    now = time.monotonic()
+    recently_failed = (
+        _pg_last_fail_at is not None
+        and now - _pg_last_fail_at < _PG_RETRY_COOLDOWN_SEC
+    )
+    if not recently_failed:
+        try:
+            conn = db.cp_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT token_generation FROM users"
+                        " WHERE username = %s AND disabled = FALSE",
+                        (username,),
+                    )
+                    row = cur.fetchone()
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001 — degraded, fall back to the cache
+            _pg_last_fail_at = now
+        else:
+            if row is None:
+                # An authoritative revocation: never serve a stale generation.
+                sessions.kv_set(f"gen:{username}", "", _GEN_CACHE_TTL_SEC)
+                return None
+            generation = int(row[0])
+            sessions.kv_set(f"gen:{username}", str(generation), _GEN_CACHE_TTL_SEC)
+            return generation
+    cached = sessions.kv_get(f"gen:{username}")
+    if not cached:
+        # Never seen a value (or the cache expired): fail closed, as before.
         return None
     try:
-        conn = db.cp_connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT token_generation FROM users"
-                    " WHERE username = %s AND disabled = FALSE",
-                    (username,),
-                )
-                row = cur.fetchone()
-        finally:
-            conn.close()
-    except Exception:  # noqa: BLE001 — fail closed, same as a missing account
+        return int(cached)
+    except ValueError:
         return None
-    return None if row is None else _as_int(row[0], 0)
 
 
 def revoke_sessions(username: str) -> bool:
