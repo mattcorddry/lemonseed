@@ -212,14 +212,17 @@ def kv_get(name: str) -> Optional[str]:
     return raw if isinstance(raw, str) else None
 
 
-def kv_set(name: str, value: str, ttl: int) -> bool:
-    """Best-effort write with a TTL; False when the store is unreachable.
+def kv_set(name: str, value: str, ttl: Optional[int] = None) -> bool:
+    """Best-effort write, optional TTL; False when the store is unreachable.
 
     These keys are caches of facts Postgres owns. Losing one must degrade
     gracefully (the caller falls back), never fail an operation.
     """
     try:
-        _get_client().set(f"lemonseed:{name}", value, ex=ttl)
+        if ttl is None:
+            _get_client().set(f"lemonseed:{name}", value)
+        else:
+            _get_client().set(f"lemonseed:{name}", value, ex=ttl)
         return True
     except Exception:  # noqa: BLE001 — best effort by design
         _forget_client()

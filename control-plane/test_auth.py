@@ -417,7 +417,10 @@ class SessionGenerationDbTests(unittest.TestCase):
             mock.patch.object(auth.sessions, "kv_set", return_value=True) as kvset,
         ):
             self.assertEqual(auth.user_generation("matt"), 9)
-        kvset.assert_called_once_with("gen:matt", "9", auth._GEN_CACHE_TTL_SEC)
+        # No TTL on purpose: the cache is refreshed on every successful read
+        # and only matters while Postgres cannot answer (an expiring cache
+        # signed the household out one minute into an outage).
+        kvset.assert_called_once_with("gen:matt", "9")
 
     def test_user_generation_fails_closed_with_no_cache_and_pg_down(self) -> None:
         # No last-known generation (first boot, or the cache expired) and an

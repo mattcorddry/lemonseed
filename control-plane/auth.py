@@ -403,7 +403,6 @@ def _as_int(value: Any, default: int = -1) -> int:
 
 
 _PG_RETRY_COOLDOWN_SEC = 10.0
-_GEN_CACHE_TTL_SEC = 60
 _pg_last_fail_at: Optional[float] = None
 
 
@@ -413,14 +412,17 @@ def user_generation(username: str) -> Optional[int]:
     Postgres owns this fact, but it is read on **every** request (nginx's
     auth_request path), so a data-service blip must not sign the household out:
 
-    * when Postgres answers, the fresh value is served and cached in Valkey
-      (``GEN_CACHE_TTL_SEC``);
+    * when Postgres answers, the fresh value is served and cached in Valkey —
+      with NO TTL: every successful read refreshes it, and the cache only
+      matters while Postgres cannot answer;
     * when Postgres is unreachable — bounded by ``connect_timeout``, with an
       in-process retry cooldown so requests stay cheap — the **last known**
-      generation is served from that cache. Revocation during an outage lands
-      within the TTL instead of instantly;
+      generation is served from that cache for the whole outage. The sessions
+      themselves live (with their own TTLs) in the same store, so this is
+      exactly "no revocation information available": nobody is signed out;
     * only a reachable Postgres may revoke: a missing or disabled account
-      clears the cache and returns None, exactly as before.
+      writes an empty tombstone and returns None — a revocation that happened
+      while Postgres was up survives even a long outage.
 
     This mirrors the M6.6 contract for the session store itself: degraded data
     services surface as status, never as silent sign-out.
@@ -449,10 +451,10 @@ def user_generation(username: str) -> Optional[int]:
         else:
             if row is None:
                 # An authoritative revocation: never serve a stale generation.
-                sessions.kv_set(f"gen:{username}", "", _GEN_CACHE_TTL_SEC)
+                sessions.kv_set(f"gen:{username}", "")
                 return None
             generation = int(row[0])
-            sessions.kv_set(f"gen:{username}", str(generation), _GEN_CACHE_TTL_SEC)
+            sessions.kv_set(f"gen:{username}", str(generation))
             return generation
     cached = sessions.kv_get(f"gen:{username}")
     if not cached:
